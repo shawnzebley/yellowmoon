@@ -4,7 +4,7 @@ import App from "./App";
 import { getApi } from "./api";
 import { mockApi } from "./api.mock";
 import { installDesktopFeel } from "./desktopFeel";
-import { isTauri } from "./env";
+import { isTauri, isWindows } from "./env";
 import { installPerf } from "./perf";
 import { installTestHooks } from "./testHooks";
 import { updater } from "./updater";
@@ -20,9 +20,13 @@ installPerf();
 // The core mirrors its own updater messages (for example from the app menu) as events; the mock
 // sends them too, so a browser can show every state of the update cell.
 getApi().on("update_state", (state) => updater.applyExternal(state));
-// Quiet update checks run only inside the app; in a browser there is nothing to update.
-if (isTauri()) updater.start();
-else installTestHooks({ mockApi, updater });
+// Quiet update checks run only inside the app; in a browser there is nothing to update. The
+// Windows port has no updater: its releases are downloaded by hand.
+if (isTauri()) {
+  if (!isWindows()) updater.start();
+} else installTestHooks({ mockApi, updater });
+// The Windows window has a native title bar, so the header needs no room for traffic lights.
+if (isWindows()) document.documentElement.dataset.platform = "windows";
 
 const root = document.getElementById("root");
 if (!root) throw new Error("index.html has no #root element");

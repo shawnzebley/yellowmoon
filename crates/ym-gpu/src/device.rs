@@ -276,8 +276,13 @@ impl Default for GpuConfig {
 
 /// `~/Library/Caches/app.yellowmoon/` on macOS (the only place the pipeline cache may live,
 /// `docs/01` section Persistence), `$XDG_CACHE_HOME/app.yellowmoon` or `~/.cache/app.yellowmoon`
-/// elsewhere. `None` when no home folder is known.
+/// elsewhere, and `%LOCALAPPDATA%\app.yellowmoon\cache` on Windows. `None` when no home folder is known.
 pub fn default_pipeline_cache_dir() -> Option<PathBuf> {
+    if cfg!(windows) {
+        return std::env::var_os("LOCALAPPDATA")
+            .filter(|v| !v.is_empty())
+            .map(|v| PathBuf::from(v).join("app.yellowmoon").join("cache"));
+    }
     let home = std::env::var_os("HOME").map(PathBuf::from)?;
     if cfg!(target_os = "macos") {
         Some(home.join("Library/Caches/app.yellowmoon"))

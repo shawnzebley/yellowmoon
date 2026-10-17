@@ -400,6 +400,13 @@ fn on_this_platform(which: Standard) -> bool {
         )
 }
 
+/// Whether one of our items is offered on this platform. The Windows port has no in-app updater
+/// (new versions come from the fork's GitHub Releases) and no command-line link (the installer's
+/// folder holds `ym.exe`; the README says how to put it on the PATH).
+fn item_on_this_platform(id: &str) -> bool {
+    !(cfg!(windows) && matches!(id, "check_for_updates" | "install_cli"))
+}
+
 /// Builds the system's menu bar from [`spec`].
 ///
 /// # Errors
@@ -418,6 +425,9 @@ pub fn build<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
                     shortcut,
                     ..
                 } => {
+                    if !item_on_this_platform(id) {
+                        continue;
+                    }
                     // The items that follow what is open start off: Start has nothing to copy.
                     let on = !STATE_ITEMS.contains(&id);
                     let item = MenuItem::with_id(app, id, label, on, shortcut)?;

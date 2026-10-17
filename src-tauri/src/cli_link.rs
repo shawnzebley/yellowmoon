@@ -143,7 +143,10 @@ impl CliLink {
                 "Yellowmoon could not find your home folder.",
             )
         })?;
-        Ok(Self::new(dir.join("ym"), &home))
+        Ok(Self::new(
+            dir.join(format!("ym{}", std::env::consts::EXE_SUFFIX)),
+            &home,
+        ))
     }
 
     /// The places for a tool at `source` and a home folder.
@@ -280,7 +283,9 @@ fn works(link: &Path) -> bool {
 }
 
 enum Claim {
-    /// The link is there and leads to the tool.
+    /// The link is there and leads to the tool. Never made where there are no symbolic links for
+    /// it (Windows, which has no menu item for the link).
+    #[cfg_attr(not(unix), allow(dead_code))]
     Done,
     /// A file that is not a link to a working file is in the way.
     InTheWay,
@@ -319,7 +324,8 @@ fn claim(source: &Path, target: &Path) -> Claim {
     }
 }
 
-#[cfg(test)]
+// The link is a symbolic link, which these tests make and read the Unix way.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 

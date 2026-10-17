@@ -30,6 +30,8 @@ concurrency:
 
 jobs:
   release:
+    # Only in the upstream repository: the Windows port's fork releases with windows.yml instead.
+    if: github.repository == 'ngriaznov/yellowmoon'
     runs-on: macos-15
     timeout-minutes: 120
     steps:

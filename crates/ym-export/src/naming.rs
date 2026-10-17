@@ -171,12 +171,20 @@ pub fn fallback_destination(home: &Path) -> PathBuf {
     home.join("Pictures").join("Yellowmoon export")
 }
 
-/// The user's home folder from `$HOME`.
+/// The user's home folder from `$HOME`, or on Windows (where `HOME` is usually not set)
+/// `%USERPROFILE%`.
 #[must_use]
 pub fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .filter(|p| !p.as_os_str().is_empty())
+    let from = |name: &str| {
+        std::env::var_os(name)
+            .map(PathBuf::from)
+            .filter(|p| !p.as_os_str().is_empty())
+    };
+    if cfg!(windows) {
+        from("USERPROFILE").or_else(|| from("HOME"))
+    } else {
+        from("HOME")
+    }
 }
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);

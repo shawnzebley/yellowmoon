@@ -1,5 +1,10 @@
 # Yellowmoon
 
+> **This is the Windows port of [Yellowmoon](https://github.com/ngriaznov/yellowmoon)**, by Mykyta Hriaznov.
+> Same app, same colour, built for Windows 10 and 11 (64-bit). Download the installer from
+> [Releases](https://github.com/shawnzebley/yellowmoon/releases/latest), and see [Windows](#windows) below.
+> Mac users should use the original.
+
 **Cinema colour for Sony raw files.**
 
 Yellowmoon is a free, open-source raw processor for macOS. Drop in ARW files from any Sony camera and every photo comes out developed, with the colour of a cinema camera: exposure, white balance, noise and colour are handled automatically. Pick a look, adjust a little if you want, export. Done. It's fast: everything after decoding runs on the Mac's graphics card through Metal, in the app and in the `ym` command-line tool, exports included.
@@ -86,6 +91,21 @@ Yellowmoon is free and is not signed with an Apple Developer ID, so the first ti
   ```
 
 You only do this once. After that Yellowmoon opens like any other app, and the updates it installs itself don't ask again. A new `.dmg` downloaded by hand needs the same step.
+
+## Windows
+
+Download `Yellowmoon_<version>_x64-setup.exe` from [Releases](https://github.com/shawnzebley/yellowmoon/releases/latest) and run it. It installs for your user only, so it doesn't need admin rights. Windows 10 and 11 (64-bit) are supported; the installer gets Microsoft's WebView2 runtime if it's missing.
+
+The installer isn't code-signed, so SmartScreen may say "Windows protected your PC". Click **More info**, then **Run anyway**. You only do this once per version.
+
+What's different from the Mac version:
+
+- The photo is drawn in the app window through the webview instead of a native Metal layer. Processing and exports still run on your graphics card (DirectX 12 or Vulkan through wgpu), and fall back to the CPU when there's no usable GPU.
+- No auto-update. Check [Releases](https://github.com/shawnzebley/yellowmoon/releases) for new versions and run the new installer over the old one.
+- No "Install Command-Line Tool" menu item. `ym.exe` is in the install folder (`%LOCALAPPDATA%\Yellowmoon`); add that folder to your PATH, or use the standalone `ym-<version>-windows-x64.zip` from Releases.
+- Imported looks live in `%APPDATA%\app.yellowmoon`.
+
+Bugs in the Windows build go to [this fork's issues](https://github.com/shawnzebley/yellowmoon/issues). Colour and processing questions belong upstream.
 
 ## Command line
 

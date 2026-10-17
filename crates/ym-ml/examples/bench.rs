@@ -91,7 +91,15 @@ fn parse_args() -> Result<Args, String> {
     Ok(a)
 }
 
+/// Peak resident set size of this process in bytes. Not measured on Windows (0), which has no
+/// `getrusage`; the benchmark is a development tool.
+#[cfg(not(unix))]
+fn peak_rss_bytes() -> u64 {
+    0
+}
+
 /// Peak resident set size of this process in bytes.
+#[cfg(unix)]
 fn peak_rss_bytes() -> u64 {
     // SAFETY: `getrusage` only writes into the zero-initialised struct we pass.
     let mut ru: libc::rusage = unsafe { std::mem::zeroed() };

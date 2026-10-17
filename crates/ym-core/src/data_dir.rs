@@ -94,10 +94,14 @@ pub fn resolve_data_dir(
 
 /// Maps an executable path inside an app bundle to the bundle's `Resources/data` folder.
 ///
-/// Returns `None` when the (canonicalized) path is not `<bundle>/Contents/MacOS/<exe>`.
+/// Returns `None` when the (canonicalized) path is not `<bundle>/Contents/MacOS/<exe>`. On Windows
+/// the installer puts the resources next to the executables, so there it is `<exe folder>/data`.
 fn bundle_data_dir(exe: &Path) -> Option<PathBuf> {
     let exe = exe.canonicalize().unwrap_or_else(|_| exe.to_path_buf());
     let macos_dir = exe.parent()?;
+    if cfg!(windows) {
+        return Some(macos_dir.join("data"));
+    }
     if macos_dir.file_name()? != "MacOS" {
         return None;
     }
@@ -112,6 +116,7 @@ fn bundle_data_dir(exe: &Path) -> Option<PathBuf> {
 mod tests {
     use super::*;
     use std::fs;
+    #[cfg(unix)]
     use std::os::unix::ffi::OsStrExt;
 
     /// Creates `<root>/<relative>` as a directory and returns its path.
@@ -123,6 +128,17 @@ mod tests {
 
     /// Creates a fake bundle with an executable and a `Resources/data` folder.
     /// Returns `(executable, data folder)`.
+    /// On Windows the "bundle" is the install folder: `<name>/Yellowmoon.exe` next to `<name>/data`.
+    #[cfg(windows)]
+    fn make_bundle(root: &Path, name: &str) -> (PathBuf, PathBuf) {
+        let folder = make_dir(root, name);
+        let data = make_dir(&folder, "data");
+        let exe = folder.join("Yellowmoon.exe");
+        fs::write(&exe, b"MZ").expect("create test executable");
+        (exe, data)
+    }
+
+    #[cfg(not(windows))]
     fn make_bundle(root: &Path, name: &str) -> (PathBuf, PathBuf) {
         let macos = make_dir(root, &format!("{name}.app/Contents/MacOS"));
         let data = make_dir(root, &format!("{name}.app/Contents/Resources/data"));
@@ -190,6 +206,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn symlink_to_the_bundled_executable_is_canonicalized() {
         // The CLI on PATH is a symlink into the bundle.
         let dir = tempfile::tempdir().expect("tempdir");
@@ -231,6 +248,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(windows))]
     fn unresolvable_executable_path_is_used_as_given() {
         // A path that does not exist cannot be canonicalized; it is not an error.
         let dir = tempfile::tempdir().expect("tempdir");
@@ -263,6 +281,7 @@ mod tests {
     // marked ignored there, with the reason, instead of passing without checking anything; the
     // test after it covers what can be covered on every platform.
     #[test]
+    #[cfg(unix)]
     #[cfg_attr(
         target_os = "macos",
         ignore = "APFS cannot hold a directory whose name is not UTF-8 (EILSEQ), so the case cannot be set up"
@@ -278,6 +297,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn non_utf8_env_value_that_names_nothing_falls_through() {
         // No directory with such a name is made, so this runs on every platform (APFS included):
         // a value that is not UTF-8 is a path like any other, not an error and not a panic, and an

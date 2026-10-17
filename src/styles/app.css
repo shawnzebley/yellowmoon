@@ -32,6 +32,11 @@
   border-right: var(--rule) solid var(--ink);
 }
 
+/* Windows has a native title bar: no traffic lights to keep clear of. */
+:root[data-platform="windows"] .ym-brand {
+  padding-left: 20px;
+}
+
 .ym-brand-title {
   display: flex;
   align-items: center;

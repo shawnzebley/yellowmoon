@@ -3,6 +3,11 @@ Copyright 2026 Mykyta Hriaznov and Yellowmoon contributors
 
 Licensed under the Apache License, Version 2.0 (see LICENSE).
 
+The Windows port (github.com/shawnzebley/yellowmoon) modifies the original to
+build and run on Windows: the Windows window and installer configuration, the
+desktop helpers (Explorer, clipboard), the home, cache and data folder lookups,
+and the Windows build workflow. Its changes are under the same licence.
+
 Yellowmoon is not affiliated with, endorsed by or sponsored by ARRI or Sony.
 ARRI and ALEXA are trademarks of ARRI AG. Sony is a trademark of Sony Group
 Corporation. These names are used only to describe compatibility and data

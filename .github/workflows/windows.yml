@@ -1,0 +1,191 @@
+# Windows: the Windows port of Yellowmoon (this fork). Builds the app installer and the `ym` command-line tool on a
+# hosted Windows runner, checks that `ym` develops a real Sony raw file, and on every new version publishes a GitHub
+# release with the installer and a zip of the command-line tool.
+#
+# The version is the root Cargo.toml [workspace.package] version, as upstream. A Windows release is tagged
+# `v<version>-windows`; a push whose version already has that tag builds and checks but releases nothing. Run it by
+# hand (Actions > Windows > Run workflow) to rebuild or to retry a failed release.
+#
+# The Windows build has no in-app updater and is not code-signed: Windows SmartScreen asks once before the installer
+# runs (README, "Windows").
+name: Windows
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: windows-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 120
+    env:
+      TRIPLE: x86_64-pc-windows-msvc
+      # The repository's Python tools read and write UTF-8; Windows' default is the ANSI code page.
+      PYTHONUTF8: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read version
+        id: version
+        run: |
+          VERSION=$(sed -n '/^\[workspace.package\]/,/^\[/{s/^version = "\(.*\)"/\1/p;}' Cargo.toml | head -n 1)
+          if [ -z "$VERSION" ]; then
+            echo "::error title=No version::Cargo.toml has no [workspace.package] version"
+            exit 1
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=v${VERSION}-windows" >> "$GITHUB_OUTPUT"
+
+      - name: Check if this version is released
+        id: check_tag
+        run: |
+          if git ls-remote --exit-code --tags origin "refs/tags/${{ steps.version.outputs.tag }}"; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Rust toolchain from rust-toolchain.toml
+        run: rustup toolchain install
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: windows-x64
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build the command-line tool (the app's sidecar `ym`)
+        run: |
+          cargo build -p ym-cli --release
+          mkdir -p src-tauri/binaries
+          cp target/release/ym.exe "src-tauri/binaries/ym-${TRIPLE}.exe"
+          target/release/ym.exe --version
+
+      # NOTICE item 9 and the About dialog promise the licence texts of every dependency, and a binary release must carry
+      # them (as release.yml does for macOS).
+      - name: cargo-about
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-about@0.9.2
+
+      - name: Licence texts of the dependencies (THIRD-PARTY.md, bundled next to NOTICE)
+        run: |
+          python tools/licences/generate.py
+          python tools/licences/check_bundle.py
+
+      - name: Build the installer
+        # src-tauri/tauri.windows.conf.json is merged in by the Tauri CLI on Windows: NSIS installer, native title bar,
+        # no updater artefacts.
+        run: npm run tauri build -- --bundles nsis
+
+      - name: Check the installer and the tool
+        id: bundle
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          ls -la target/release/bundle/nsis/
+          INSTALLER=$(ls target/release/bundle/nsis/*-setup.exe | head -n 1)
+          test -s "$INSTALLER"
+          echo "installer=${INSTALLER}" >> "$GITHUB_OUTPUT"
+          target/release/ym.exe --version | tee "$RUNNER_TEMP/ym-version.txt"
+          grep -q "^ym ${VERSION} " "$RUNNER_TEMP/ym-version.txt"
+          target/release/ym.exe doctor || echo "::warning title=ym doctor::exited with $? (informational; hosted runners have no GPU)"
+
+      - name: Fetch an A7C II raw file (CC0, RawDB / raw.pixls.us)
+        id: sample
+        continue-on-error: true
+        run: |
+          python -I tools/fetch/ymfetch.py samples --refresh --body ILCE-7CM2 --per-body 1 --max-file-mb 80
+          SAMPLE=$(find testdata/arw -iname '*.arw' | head -n 1)
+          test -n "$SAMPLE"
+          echo "file=${SAMPLE}" >> "$GITHUB_OUTPUT"
+
+      - name: Develop it with ym on Windows
+        if: steps.sample.outcome == 'success'
+        run: |
+          # The data folder is the repository's in a source build; the installer puts it next to the executables.
+          export YELLOWMOON_DATA="$PWD/data"
+          mkdir -p "$RUNNER_TEMP/out"
+          target/release/ym.exe info "${{ steps.sample.outputs.file }}"
+          target/release/ym.exe render "${{ steps.sample.outputs.file }}" --cpu --format jpeg --long-edge 2000 --out "$RUNNER_TEMP/out"
+          ls -la "$RUNNER_TEMP/out"
+          test -n "$(find "$RUNNER_TEMP/out" -iname '*.jpg' -size +10k)"
+
+      - name: Say when no sample was found
+        if: steps.sample.outcome != 'success'
+        run: echo "::warning title=No sample::No A7C II raw file could be fetched; the render check was skipped."
+
+      - name: Zip the command-line tool
+        run: |
+          # The same data the installer bundles (tauri.conf.json bundle.resources), next to ym.exe, where ym looks first.
+          DEST="$RUNNER_TEMP/ym/ym"
+          mkdir -p "$DEST/data/looks"
+          cp target/release/ym.exe "$DEST/"
+          cp -r data/alexa data/arri data/cameras data/models "$DEST/data/"
+          cp -r data/looks/builtin "$DEST/data/looks/builtin"
+          cp data/looks/arri-packages.json "$DEST/data/looks/"
+          cp LICENSE NOTICE THIRD-PARTY.md "$DEST/"
+          (cd "$RUNNER_TEMP/ym" && 7z a -tzip "ym-${{ steps.version.outputs.version }}-windows-x64.zip" ym >/dev/null)
+          echo "ZIP=$RUNNER_TEMP/ym/ym-${{ steps.version.outputs.version }}-windows-x64.zip" >> "$GITHUB_ENV"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Yellowmoon-windows-${{ github.sha }}
+          path: |
+            ${{ steps.bundle.outputs.installer }}
+            ${{ env.ZIP }}
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Release notes
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && steps.check_tag.outputs.exists == 'false'
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          {
+            echo "Yellowmoon ${VERSION} for Windows (64-bit), built from this fork's main branch."
+            echo
+            echo "### Install"
+            echo
+            echo "Download \`Yellowmoon_${VERSION}_x64-setup.exe\` below and run it. It installs for your user only, no admin rights."
+            echo "The installer is not code-signed, so Windows SmartScreen may say it protected your PC: click **More info**, then **Run anyway**."
+            echo
+            echo "The command-line tool is in \`ym-${VERSION}-windows-x64.zip\`, or \`ym.exe\` in the app's install folder."
+            echo
+            echo "No auto-update on Windows: check this page for new versions."
+            echo
+            echo "Upstream (macOS) release notes: https://github.com/ngriaznov/yellowmoon/releases"
+          } > "$RUNNER_TEMP/notes.md"
+
+      - name: Publish release
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && steps.check_tag.outputs.exists == 'false'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          name: "Yellowmoon ${{ steps.version.outputs.version }} for Windows"
+          body_path: ${{ runner.temp }}/notes.md
+          make_latest: true
+          fail_on_unmatched_files: true
+          files: |
+            ${{ steps.bundle.outputs.installer }}
+            ${{ env.ZIP }}

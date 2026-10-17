@@ -10,12 +10,37 @@ use std::process::{Command, Stdio};
 
 use crate::wire::{AppError, ErrorScope};
 
-/// The project's home, opened by the Help menu and by About.
+/// The project's home, opened by the Help menu and by About. Windows builds come from the Windows
+/// port's fork, so its Help menu points there.
+#[cfg(not(windows))]
 pub const GITHUB_URL: &str = "https://github.com/ngriaznov/yellowmoon";
+/// The project's home, opened by the Help menu and by About (the Windows port).
+#[cfg(windows)]
+pub const GITHUB_URL: &str = "https://github.com/shawnzebley/yellowmoon";
 
 /// The bug report form (`.github/ISSUE_TEMPLATE/bug_report.yml`).
+#[cfg(not(windows))]
 pub const ISSUE_URL: &str =
     "https://github.com/ngriaznov/yellowmoon/issues/new?template=bug_report.yml";
+/// The bug report form of the Windows port.
+#[cfg(windows)]
+pub const ISSUE_URL: &str =
+    "https://github.com/shawnzebley/yellowmoon/issues/new?template=bug_report.yml";
+
+/// A command for a desktop helper. On Windows it starts without a console window, which a
+/// windowed app would otherwise flash on the screen for every helper it runs.
+fn helper(program: impl AsRef<std::ffi::OsStr>) -> Command {
+    #[cfg_attr(not(windows), allow(unused_mut))]
+    let mut command = Command::new(program);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        /// `CREATE_NO_WINDOW` from the Win32 process creation flags.
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    command
+}
 
 /// The hosts `open_url` opens: ARRI's look page (`docs/08`) and GitHub's pages and help
 /// (`AGENTS.md` rule 7). Anything else is refused.
@@ -64,6 +89,9 @@ fn failed(what: &str, e: impl std::fmt::Display) -> AppError {
 fn opener() -> &'static str {
     if cfg!(target_os = "macos") {
         "open"
+    } else if cfg!(windows) {
+        // Explorer hands an https address to the default browser and opens a folder in a window.
+        "explorer"
     } else {
         "xdg-open"
     }
@@ -76,7 +104,7 @@ fn opener() -> &'static str {
 /// [`AppError`] when the address is not allowed or the browser cannot be started.
 pub fn open_url(url: &str) -> Result<(), AppError> {
     check_url(url)?;
-    Command::new(opener())
+    helper(opener())
         .arg(url)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -111,6 +139,16 @@ fn reveal_arguments(
     }
 }
 
+/// The arguments Explorer gets to show `path`: a folder is opened, a file is shown selected in its
+/// folder (`explorer /select,<file>`).
+fn windows_reveal_arguments(path: &Path, is_dir: bool) -> Vec<std::ffi::OsString> {
+    if is_dir {
+        vec![path.into()]
+    } else {
+        vec!["/select,".into(), path.into()]
+    }
+}
+
 /// Shows a file in Finder (selected), or opens a folder. A folder that could be an application or
 /// another bundle is shown, never launched.
 ///
@@ -123,13 +161,13 @@ pub fn reveal_in_finder(path: &Path) -> Result<(), AppError> {
     // A link called "Pictures" that points at "Calculator.app" is the application.
     let bundle_like = path.extension().is_some()
         || std::fs::canonicalize(path).is_ok_and(|real| real.extension().is_some());
-    Command::new(opener())
-        .args(reveal_arguments(
-            path,
-            meta.is_dir(),
-            bundle_like,
-            cfg!(target_os = "macos"),
-        ))
+    let args = if cfg!(windows) {
+        windows_reveal_arguments(path, meta.is_dir())
+    } else {
+        reveal_arguments(path, meta.is_dir(), bundle_like, cfg!(target_os = "macos"))
+    };
+    helper(opener())
+        .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -169,6 +207,21 @@ pub fn trash_path(path: &Path) -> Result<(), AppError> {
 pub fn copy_to_clipboard(text: &str) -> Result<(), AppError> {
     let candidates: &[(&str, &[&str])] = if cfg!(target_os = "macos") {
         &[("pbcopy", &[])]
+    } else if cfg!(windows) {
+        // PowerShell reads the text as UTF-8 and keeps it whole; `clip` is the fallback for
+        // plain text when PowerShell is not there.
+        &[
+            (
+                "powershell",
+                &[
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    "[Console]::InputEncoding = [Text.Encoding]::UTF8; Set-Clipboard -Value ([Console]::In.ReadToEnd())",
+                ],
+            ),
+            ("clip", &[]),
+        ]
     } else {
         &[
             ("wl-copy", &[]),
@@ -177,7 +230,7 @@ pub fn copy_to_clipboard(text: &str) -> Result<(), AppError> {
         ]
     };
     for (program, args) in candidates {
-        let Ok(mut child) = Command::new(program)
+        let Ok(mut child) = helper(program)
             .args(*args)
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
@@ -208,7 +261,7 @@ pub fn copy_to_clipboard(text: &str) -> Result<(), AppError> {
 ///
 /// [`AppError`] when the command cannot be run or fails.
 pub fn doctor_output(ym: &Path) -> Result<String, AppError> {
-    let output = Command::new(ym)
+    let output = helper(ym)
         .arg("doctor")
         .stdin(Stdio::null())
         .output()
