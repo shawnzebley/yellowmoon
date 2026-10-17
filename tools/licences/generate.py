@@ -27,6 +27,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -351,8 +352,10 @@ def verify(text: str) -> list[str]:
 
 def run(command: list[str], *, cwd: Path = REPO) -> str:
     """Runs a tool and returns its standard output."""
+    # On Windows npx and npm are .cmd scripts, which CreateProcess finds only by their full name.
+    program = shutil.which(command[0]) or command[0]
     try:
-        done = subprocess.run(command, cwd=cwd, capture_output=True, text=True, check=False)
+        done = subprocess.run([program, *command[1:]], cwd=cwd, capture_output=True, text=True, check=False)
     except FileNotFoundError as error:
         raise GenerateError(f"{command[0]} is not installed ({error})") from error
     if done.returncode != 0:
