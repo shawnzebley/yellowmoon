@@ -110,11 +110,11 @@ jobs:
           grep -q "^ym ${VERSION} " "$RUNNER_TEMP/ym-version.txt"
           target/release/ym.exe doctor || echo "::warning title=ym doctor::exited with $? (informational; hosted runners have no GPU)"
 
-      - name: Fetch an A7C II raw file (CC0, RawDB / raw.pixls.us)
+      - name: Fetch an A7C II raw file (CC0, raw.pixls.us; the A7 IV, same sensor, if there is none)
         id: sample
         continue-on-error: true
         run: |
-          python -I tools/fetch/ymfetch.py samples --refresh --body ILCE-7CM2 --per-body 1 --max-file-mb 80
+          python -I tools/fetch/ymfetch.py samples --refresh --source pixls --body ILCE-7CM2 --per-body 1 --max-file-mb 80 || python -I tools/fetch/ymfetch.py samples --refresh --source pixls --body ILCE-7M4 --per-body 1 --max-file-mb 80
           SAMPLE=$(find testdata/arw -iname '*.arw' | head -n 1)
           test -n "$SAMPLE"
           echo "file=${SAMPLE}" >> "$GITHUB_OUTPUT"
