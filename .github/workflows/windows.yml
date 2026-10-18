@@ -110,29 +110,28 @@ jobs:
           grep -q "^ym ${VERSION} " "$RUNNER_TEMP/ym-version.txt"
           target/release/ym.exe doctor || echo "::warning title=ym doctor::exited with $? (informational; hosted runners have no GPU)"
 
-      - name: Fetch an A7C II raw file (CC0, raw.pixls.us; the A7 IV, same sensor, if there is none)
-        id: sample
-        continue-on-error: true
+      # The CC0 corpus has no A7C II file that has passed the repository's licence check (raw.pixls.us files stay
+      # pending until a person checks them, tools/fetch/README.md), so the check uses a synthetic A7C II raw made by
+      # ym-raw's own generator: it carries the camera's model name, so ym picks the A7C II profile and its light model.
+      - name: Make an A7C II raw file (synthetic)
         run: |
-          python -I tools/fetch/ymfetch.py samples --refresh --source pixls --body ILCE-7CM2 --per-body 1 --max-file-mb 80 || python -I tools/fetch/ymfetch.py samples --refresh --source pixls --body ILCE-7M4 --per-body 1 --max-file-mb 80
-          SAMPLE=$(find testdata/arw -iname '*.arw' | head -n 1)
-          test -n "$SAMPLE"
-          echo "file=${SAMPLE}" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/raw"
+          cargo run -p ym-raw --features testgen --release --example gen_arw -- ILCE-7CM2 1536 1024 "$RUNNER_TEMP/raw/A7CII.ARW" iso=800
+          ls -la "$RUNNER_TEMP/raw"
 
       - name: Develop it with ym on Windows
-        if: steps.sample.outcome == 'success'
         run: |
           # The data folder is the repository's in a source build; the installer puts it next to the executables.
           export YELLOWMOON_DATA="$PWD/data"
-          mkdir -p "$RUNNER_TEMP/out"
-          target/release/ym.exe info "${{ steps.sample.outputs.file }}"
-          target/release/ym.exe render "${{ steps.sample.outputs.file }}" --cpu --format jpeg --long-edge 2000 --out "$RUNNER_TEMP/out"
-          ls -la "$RUNNER_TEMP/out"
-          test -n "$(find "$RUNNER_TEMP/out" -iname '*.jpg' -size +10k)"
-
-      - name: Say when no sample was found
-        if: steps.sample.outcome != 'success'
-        run: echo "::warning title=No sample::No A7C II raw file could be fetched; the render check was skipped."
+          RAW="$RUNNER_TEMP/raw/A7CII.ARW"
+          target/release/ym.exe info "$RAW" | tee "$RUNNER_TEMP/info.txt"
+          grep -qi 'ILCE-7CM2\|A7C II' "$RUNNER_TEMP/info.txt"
+          mkdir -p "$RUNNER_TEMP/out-cpu" "$RUNNER_TEMP/out-auto"
+          target/release/ym.exe render "$RAW" --cpu --format jpeg --out "$RUNNER_TEMP/out-cpu"
+          test -n "$(find "$RUNNER_TEMP/out-cpu" -iname '*.jpg' -size +1k)"
+          # The default policy: the GPU when there is one (hosted runners have only Microsoft's software adapter).
+          target/release/ym.exe render "$RAW" --format tiff --out "$RUNNER_TEMP/out-auto"
+          ls -la "$RUNNER_TEMP/out-cpu" "$RUNNER_TEMP/out-auto"
 
       - name: Zip the command-line tool
         run: |
