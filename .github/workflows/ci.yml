@@ -408,11 +408,13 @@ jobs:
         with:
           path: testdata/golden/refs
           key: golden-refs-${{ hashFiles('tools/golden/expected.json') }}
-      - name: Golden check on the device, the subset on a push and all 61 files nightly
+      - name: Golden check on the device, all 61 files on pull requests and nightly
         shell: bash
         run: |
           subset=(--subset tools/golden/gpu-subset.txt)
-          if [ "${{ github.event_name }}" = schedule ]; then subset=(); fi
+          # Upstream syncs can change cases outside the ten-file smoke subset.
+          # Hold every pull request against all 61 pictures before it reaches main.
+          if [ "${{ github.event_name }}" = schedule ] || [ "${{ github.event_name }}" = pull_request ]; then subset=(); fi
           target/release/golden check --device gpu "${subset[@]}" --ym target/release/ym --require-all \
             --report golden-gpu-report.json | tee golden-gpu.txt
           { echo '### golden check --device gpu (lavapipe)'; echo '```text'; tail -n 4 golden-gpu.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"

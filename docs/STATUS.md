@@ -24,8 +24,10 @@ Windows has standard Auto and shows no Apple Intelligence controls. The native
 Metal viewport optimisations apply only to Macs. Mac-only release and bridge
 workflows remain upstream-only.
 
-Validation is in progress on Linux; Windows installer/render validation runs in
-GitHub Actions. The historical GPU failure below predates the imported limiter
+Frontend validation: 1,707 tests passed (9 skipped), and the production build
+and Rust formatting passed. Rust and Windows installer/render checks are in
+progress. Pull requests now run the full 61-picture GPU golden suite rather
+than the ten-picture smoke subset, so upstream syncs check every prior failure. The historical GPU failure below predates the imported limiter
 fix; do not treat it as a measurement of this merged version.
 
 ## Fork CI repair (2026-10-20)
