@@ -21,9 +21,13 @@ import { toAppError } from "../api";
 import type {
   ApplyScope,
   AppError,
+  AppleAutoStatus,
+  BalanceSetting,
   ChromaSample,
   ChromaScatter,
   CliLinkStatus,
+  ColorBalance,
+  ColorBalancePoint,
   DevelopSettings,
   DisplayLut,
   ExportJob,
@@ -38,6 +42,7 @@ import type {
   MenuState,
   OpenSummary,
   PasteReport,
+  PercentSetting,
   PhotoId,
   PhotoProgress,
   PhotoStatus,
@@ -47,6 +52,7 @@ import type {
   PreferencesPatch,
   RenderStats,
   ResolvedSettings,
+  SessionChange,
   SessionState,
   SettingsPatch,
   SourceRecognition,
@@ -67,7 +73,7 @@ import type { ExportRun } from "../export/run";
 import { diffSettings, PhotoHistory } from "./history";
 import type { HistoryEntry } from "./history";
 import { perfCount } from "../perf";
-import { isReady, mergeSession, photoName, releaseUrl } from "./photo";
+import { isReady, mergeSession, photoName, releaseUrl, removedNotice, restoredNotice, withoutPhotos, withRestoredPhotos } from "./photo";
 import { RequestLimiter } from "./requestLimiter";
 import { ViewportInputQueue } from "./viewportInputQueue";
 import type { StreamInput } from "./viewportInputQueue";
@@ -78,6 +84,9 @@ export type Screen = "start" | "photos" | "import-looks";
 
 /** What Photos shows in the right-hand panel: the six tool tabs, or Export (`docs/11-ui.md` §Export). */
 export type Panel = "tools" | "export";
+
+/** What the notice bar offers next to Dismiss: Undo for a removal (`docs/11` §Removing photos). Only the notice of a removal has one. */
+export type NoticeAction = "undo-removal";
 
 /** A dialog laid over the screen: Preferences (⌘,), About, the question before closing a session during an export, the `.cube` import. */
 export type Overlay = "preferences" | "about" | "confirm-close" | "import-cube";
@@ -192,6 +201,11 @@ export interface AppState {
   displayLuts: readonly DisplayLut[] | null;
   /** Whether the command-line tool is linked onto the PATH, once asked for (Preferences). */
   cliLink: CliLinkStatus | null;
+  /**
+   * Whether Apple Auto is available on this computer and acts (`apple_auto_status`, `docs/19`), asked for each time Preferences opens;
+   * null before the first answer. Preferences shows "Auto with Apple Intelligence" only while it is available.
+   */
+  appleAuto: AppleAutoStatus | null;
   /** Which panel Photos shows. */
   panel: Panel;
   /** The Export panel's options: the remembered defaults, changed by the person (`docs/09` §Options). */
@@ -208,6 +222,8 @@ export interface AppState {
   cubeImport: CubeImport | null;
   /** A short message that is not an error ("Yellowmoon is up to date."), until dismissed. */
   notice: string | null;
+  /** The button the notice has besides Dismiss: Undo, after photos were removed from the filmstrip. Null for every other notice. */
+  noticeAction: NoticeAction | null;
   /**
    * Which viewport backend draws the photo (`viewport_info`): `native` leaves the photo cell transparent, `fallback` shows the
    * frames below. Null while unknown, and for an API that has none (the browser mock), where the screen draws its own picture.
@@ -233,7 +249,7 @@ export function initialState(): AppState {
     stats: null,
     before: false,
     zoom: { kind: "fit" },
-    applyScope: "all",
+    applyScope: "this",
     collapsedLookLibraries: [],
     dropNotice: null,
     error: null,
@@ -247,6 +263,7 @@ export function initialState(): AppState {
     preferences: null,
     displayLuts: null,
     cliLink: null,
+    appleAuto: null,
     panel: "tools",
     exportOptions: defaultExportOptions(),
     exportScope: "this",
@@ -255,6 +272,7 @@ export function initialState(): AppState {
     overlay: null,
     cubeImport: null,
     notice: null,
+    noticeAction: null,
     viewportBackend: null,
     viewportFrame: null,
     exportBusy: false,
@@ -266,16 +284,10 @@ export function initialState(): AppState {
 const DIRECT_KEYS: ReadonlySet<string> = new Set([
   "look",
   "look_intensity",
-  "contrast",
   "brightness",
-  "highlights",
-  "shadows",
   "white",
   "white_offset_ev",
-  "black",
   "light_source",
-  "color_balance",
-  "saturation",
   "color_warp",
   "output_sharpening",
   "curve",
@@ -286,12 +298,39 @@ const DIRECT_KEYS: ReadonlySet<string> = new Set([
   "white_pick",
 ]);
 
-/** The mirrored settings with a patch applied to the fields that need no resolving. */
+/** The settings that are Auto or a value from −100 to 100 (`docs/19` section 5), each resolved against the estimate of the same name. */
+const PERCENT_KEYS: ReadonlySet<string> = new Set(["contrast", "saturation", "highlights", "shadows", "black"]);
+
+/**
+ * The mirrored settings with a patch applied to the fields that need no resolving. Contrast, saturation, highlights, shadows, black
+ * and the shadows and highlights wheels are Auto or a value (`docs/19` section 5) and need none either: Auto is the photo's Auto value,
+ * which the mirror already has (`estimates`).
+ */
 export function applyDirect(rs: ResolvedSettings, patch: SettingsPatch): ResolvedSettings {
   const settings = { ...rs.settings } as Record<string, unknown>;
   const values = { ...rs.values } as Record<string, unknown>;
   let auto = rs.auto;
   for (const [key, value] of Object.entries(patch)) {
+    if (value !== undefined && PERCENT_KEYS.has(key)) {
+      const field = key as "contrast" | "saturation" | "highlights" | "shadows" | "black";
+      const setting = value as PercentSetting;
+      settings[field] = setting;
+      values[field] = setting.kind === "manual" ? setting.value : rs.estimates[field];
+      auto = { ...auto, [field]: setting.kind === "auto" };
+      continue;
+    }
+    if (value !== undefined && key === "color_balance") {
+      const cb = { ...rs.settings.color_balance, ...(value as Partial<ColorBalance>) };
+      const point = (w: BalanceSetting, est: ColorBalancePoint): ColorBalancePoint => (w.kind === "manual" ? w.point : est);
+      settings.color_balance = cb;
+      values.color_balance = {
+        shadows: point(cb.shadows, rs.estimates.balance_shadows),
+        midtones: cb.midtones,
+        highlights: point(cb.highlights, rs.estimates.balance_highlights),
+      };
+      auto = { ...auto, balance_shadows: cb.shadows.kind === "auto", balance_highlights: cb.highlights.kind === "auto" };
+      continue;
+    }
     if (value === undefined || !DIRECT_KEYS.has(key)) continue;
     settings[key] = value;
     values[key] = value;
@@ -339,6 +378,17 @@ interface LookThumb {
   url: string | null;
 }
 
+/** The photos of the last removal, as far as the page keeps them (the core keeps the rest: `Session::restore_removed`). */
+interface PendingRemoval {
+  /** Their undo histories (⌘Z steps of their settings), put back with them. */
+  histories: Map<PhotoId, PhotoHistory>;
+  /**
+   * How many undo steps the photos that stayed had when the photos left. While the histories still hold that many, nothing was done
+   * since and ⌘Z takes the removal back; after a new change ⌘Z undoes the change first, as in any undo stack.
+   */
+  depth: number;
+}
+
 /** The store. Create one per window with the `Api` to use. */
 export class AppStore {
   private state: AppState = initialState();
@@ -351,12 +401,35 @@ export class AppStore {
   private readonly gestures = new Map<PhotoId, { base: DevelopSettings }>();
   private readonly senders = new Map<PhotoId, Sender>();
   private readonly settingsRequests = new Map<PhotoId, Promise<void>>();
+  /**
+   * Counts the times the core changed photos behind the mirror's back ("Apply to" copies, pastes). A read of a photo's settings that
+   * began before the latest one may carry the old settings, so it is asked again instead of being kept.
+   */
+  private bulkEpoch = 0;
+  /**
+   * How many times the store has written each photo's settings or sent a patch for it (a patch made, its reply, settings read in): a
+   * `getSettings` reply asked for before the latest of these may predate it, so {@link resyncSettings} and {@link refreshSettings} do not
+   * show it (a slider being dragged would jump back).
+   */
+  private readonly writes = new Map<PhotoId, number>();
+  /** The end of the "Apply to" copies asked for so far: the next one waits for it, so they reach the core in the order they were made. */
+  private applyTail: Promise<void> = Promise.resolve();
   /** The number of the newest `viewport_frame` heard, whether it showed a picture or took it away; null before the first. */
   private newestFrame: number | null = null;
   /** Photos with a Pick white click on its way to the core: their settings are read when the click is answered. */
   private readonly picks = new Set<PhotoId>();
   /** Photos a paste is changing: the core's `settings_changed` for them is the paste's own news, which the store handles itself. */
   private readonly pasting = new Set<PhotoId>();
+  /**
+   * The last removal, which Undo takes back until the next removal or the end of the session: the removed photos' undo histories (the
+   * core keeps their settings, picks and place). In memory only, like everything about a photo (hard rule 4).
+   */
+  private removal: PendingRemoval | null = null;
+  /**
+   * Photos being removed: from the moment {@link removePhotos} begins until the core has answered. A read of a leaving photo's settings
+   * that the core's news started ({@link refreshSettings}) neither starts nor reports its failure, and shows nothing: the photo is gone.
+   */
+  private readonly leaving = new Set<PhotoId>();
   /** The state the native menu was last told, which is the one it starts with: the settings items off. */
   private menuState: MenuState = { copy_settings: false, paste_settings: false, paste_settings_to_picked: false };
   private readonly lookThumbs = new Map<PhotoId, { key: string; urls: Map<LookId, LookThumb> }>();
@@ -651,10 +724,10 @@ export class AppStore {
     this.set({ viewportFrame: none ? null : frame });
   }
 
-  /** The core changed a photo's settings by itself (a Pick white click): ask for them again. */
+  /** The core changed a photo's settings or estimates by itself (an Apple Auto answer, a burst's exposure): ask for them again. */
   private async onSettingsChanged(id: PhotoId): Promise<void> {
-    if (this.picks.has(id) || this.pasting.has(id) || !this.state.settings[id]) return;
-    await this.resyncSettings(id);
+    if (this.picks.has(id) || this.pasting.has(id) || this.leaving.has(id) || !this.state.settings[id]) return;
+    await this.refreshSettings(id);
   }
 
   // --- Session ------------------------------------------------------------------------------
@@ -728,7 +801,15 @@ export class AppStore {
    */
   private adoptOpened(snapshot: SessionState): void {
     const old = this.state.session;
+    // Files opened on the Start screen start a new session: the removal of the last one is not offered any more.
+    if (!old) this.forgetRemoval();
     this.adoptSession(old ? mergeSession(old, snapshot) : snapshot);
+  }
+
+  /** The last removal can no longer be taken back (a new session has begun): its histories and the notice that offered Undo go. */
+  private forgetRemoval(): void {
+    this.removal = null;
+    if (this.state.noticeAction !== null) this.set({ notice: null, noticeAction: null });
   }
 
   /** True while Photos is on screen: files opened now are added to the session, and Photos says what was added. */
@@ -738,7 +819,7 @@ export class AppStore {
 
   /** "No ARW files in what you dropped.": in the drop zone on Start, in the notice bar where there is no drop zone. */
   private sayNoArw(onPhotos: boolean): void {
-    if (onPhotos) this.set({ dropNotice: null, notice: NO_ARW_NOTICE });
+    if (onPhotos) this.set({ dropNotice: null, notice: NO_ARW_NOTICE, noticeAction: null });
     else this.set({ dropNotice: NO_ARW_NOTICE });
   }
 
@@ -763,12 +844,24 @@ export class AppStore {
       this.fail(error);
       return;
     }
+    // What a removal kept goes with the session, and so does the notice that offered to take it back.
+    this.forgetRemoval();
+    this.endSessionView();
+  }
+
+  /**
+   * The page forgets the session and shows Start: the thumbnails, settings and histories of its photos, the Look tab's tiles and
+   * what depends on the photo on screen. Not the core: `closeSession` asks it to close first, and a session whose last photo was
+   * removed is empty in the core already (and keeps what Undo needs).
+   */
+  private endSessionView(): void {
     for (const url of Object.values(this.state.thumbnails)) releaseUrl(url);
     this.releaseLookThumbs();
     this.pendingStatus.clear();
     this.histories.clear();
     this.gestures.clear();
     this.senders.clear();
+    this.writes.clear();
     this.settingsRequests.clear();
     this.batch = [];
     this.state = {
@@ -781,12 +874,14 @@ export class AppStore {
       preferences: this.state.preferences,
       displayLuts: this.state.displayLuts,
       cliLink: this.state.cliLink,
+      appleAuto: this.state.appleAuto,
       exportOptions: this.state.exportOptions,
       // A run still writing files outlives the session; a finished one has been seen.
       exportRun: this.state.exportRun?.phase === "running" ? this.state.exportRun : null,
       overlay: this.state.overlay === "confirm-close" ? null : this.state.overlay,
       cubeImport: this.state.cubeImport,
       notice: this.state.notice,
+      noticeAction: this.state.noticeAction,
       viewportBackend: this.state.viewportBackend,
       exportBusy: this.state.exportBusy,
       // What was copied is for pasting in another folder too; the id of its photo belongs to the closed session.
@@ -886,6 +981,199 @@ export class AppStore {
     await Promise.all(photos.filter((p) => p.picked).map((p) => this.setPicked(p.id, false)));
   }
 
+  // --- Removing photos ----------------------------------------------------------------------
+
+  /**
+   * Remove from filmstrip (`docs/11` §Removing photos): takes photos out of the session. The files on disk are not touched (hard
+   * rule 5); the photos' edits go with them, because nothing is saved per photo (hard rule 4), and are kept in memory for Undo until
+   * the next removal or the end of the session. The photo on screen hands over to the next one (the previous one when the last was
+   * removed); with no photo left the Start screen shows. Says what happened, with an Undo button ({@link undoRemoval}). Ids that are
+   * not in the session are ignored.
+   */
+  async removePhotos(ids: readonly PhotoId[]): Promise<void> {
+    const open = this.state.session;
+    if (!open) return;
+    const present = new Set(open.photos.map((p) => p.id));
+    const wanted = [...new Set(ids)].filter((id) => present.has(id));
+    if (wanted.length === 0) return;
+    // From now on the core's news about these photos is not read again (an Apple Auto answer that arrives now is for a photo that is
+    // leaving), and a read that is already on its way shows nothing.
+    for (const id of wanted) this.leaving.add(id);
+    try {
+      await this.takeOut(wanted);
+    } finally {
+      for (const id of wanted) this.leaving.delete(id);
+    }
+    // A removal the core refused leaves the photos here, and news of theirs that was passed over meanwhile: read their settings again.
+    for (const id of wanted) if (this.state.settings[id]) void this.refreshSettings(id);
+  }
+
+  /** The body of {@link removePhotos}, for the photos that are in the session. */
+  private async takeOut(wanted: PhotoId[]): Promise<void> {
+    const asked = new Set(wanted);
+    // Patches and the first read of the settings still on their way to these photos land first: none may reach a photo that has left
+    // (it would come back as an error from the core, and as a message on screen).
+    await Promise.all(wanted.map((id) => Promise.all([this.whenIdle(id), this.settingsRequests.get(id)])));
+    const before = this.state.session;
+    if (!before) return;
+    const names = before.photos.filter((p) => asked.has(p.id)).map((p) => photoName(p.file_name));
+    const wasCurrent = this.currentId();
+    // Wheel and drag input that has not been sent was meant for the photo that leaves.
+    if (wasCurrent !== null && asked.has(wasCurrent)) this.viewportQueue.clear();
+    let change: SessionChange;
+    try {
+      change = await this.api.removePhotos(wanted);
+    } catch (error) {
+      this.fail(error);
+      return;
+    }
+    const gone = new Set(change.photo_ids);
+    if (gone.size === 0) return;
+    const session = this.state.session;
+    if (!session) return;
+
+    // Their undo histories are kept with them; the rest of what the page knows about them goes now.
+    const histories = new Map<PhotoId, PhotoHistory>();
+    for (const id of gone) {
+      const history = this.histories.get(id);
+      if (history) histories.set(id, history);
+      this.histories.delete(id);
+      this.gestures.delete(id);
+      this.senders.delete(id);
+      this.settingsRequests.delete(id);
+      this.pendingStatus.delete(id);
+    }
+    this.forgetLookThumbsOf(gone);
+    const thumbnails = { ...this.state.thumbnails };
+    for (const id of gone) {
+      const url = thumbnails[id];
+      if (url !== undefined) releaseUrl(url);
+      delete thumbnails[id];
+    }
+    const settings = { ...this.state.settings };
+    for (const id of gone) delete settings[id];
+    this.removal = { histories, depth: this.undoDepth() };
+
+    // The photo on screen stays unless it left; then it is the shell's choice, the next photo or the previous one.
+    const shell = change.session.current_index === null ? null : (change.session.photos[change.session.current_index]?.id ?? null);
+    const stays = wasCurrent !== null && !gone.has(wasCurrent);
+    const current = stays ? wasCurrent : shell;
+    const next = withoutPhotos(session, gone, current);
+    const notice = { notice: removedNotice(names), noticeAction: "undo-removal" as const };
+    if (next.photos.length === 0) {
+      this.endSessionView();
+      this.set(notice);
+      return;
+    }
+    this.set({ session: next, thumbnails, settings, ...notice, ...(stays ? {} : this.currentChanged()) });
+    this.syncHistoryFlags();
+    const shown = next.photos[next.current_index ?? 0];
+    if (!stays && shown && isReady(shown)) void this.ensureSettings(shown.id);
+  }
+
+  /** Delete or Backspace: removes the photo on screen. */
+  removeCurrentPhoto(): Promise<void> {
+    const id = this.currentId();
+    return id === null ? Promise.resolve() : this.removePhotos([id]);
+  }
+
+  /** "Remove picked photos" in the filmstrip's menu. */
+  removePickedPhotos(): Promise<void> {
+    return this.removePhotos((this.state.session?.photos ?? []).filter((p) => p.picked).map((p) => p.id));
+  }
+
+  /**
+   * Undo of the last removal: the photos come back where they were in the filmstrip, with their settings, picks and undo steps; the
+   * photo that was on screen is on screen again unless the person has moved on since. Used by the notice's Undo button, and by ⌘Z while
+   * nothing was changed after the removal ({@link undo}). A photo whose file was added again meanwhile stays out. Nothing happens
+   * when there is nothing to put back.
+   */
+  async undoRemoval(): Promise<void> {
+    const pending = this.removal;
+    if (!pending) return;
+    let change: SessionChange;
+    try {
+      change = await this.api.restorePhotos();
+    } catch (error) {
+      this.fail(error);
+      return;
+    }
+    this.removal = null;
+    const back = new Set(change.photo_ids);
+    if (back.size === 0) {
+      this.set({ notice: "There is nothing to put back.", noticeAction: null });
+      this.syncHistoryFlags();
+      return;
+    }
+    for (const [id, history] of pending.histories) if (back.has(id)) this.histories.set(id, history);
+    const names = change.session.photos.filter((p) => back.has(p.id)).map((p) => photoName(p.file_name));
+    const notice = { notice: restoredNotice(names, change.already_open), noticeAction: null };
+    const old = this.state.session;
+    if (!old) {
+      // The last photo had been removed: the session starts again from what the core has.
+      this.adoptSession(change.session);
+      this.set({ screen: "photos", ...notice });
+      return;
+    }
+    // The photo on screen stays, unless the core put the person back on the photo the removal had taken away.
+    const wasCurrent = this.currentId();
+    const shell = change.session.current_index === null ? null : (change.session.photos[change.session.current_index]?.id ?? null);
+    const current = shell !== null && back.has(shell) ? shell : wasCurrent;
+    const session = withRestoredPhotos(old, change.session, back, current);
+    const moved = current !== wasCurrent;
+    this.set({ session, ...notice, ...(moved ? this.currentChanged() : {}) });
+    this.syncHistoryFlags();
+    const shown = session.photos[session.current_index ?? 0];
+    if (moved && shown && isReady(shown)) void this.ensureSettings(shown.id);
+  }
+
+  /** True while a removal can be taken back: the notice's Undo button, and ⌘Z on the Start screen after the last photo left. */
+  hasRemovalToUndo(): boolean {
+    return this.removal !== null;
+  }
+
+  /**
+   * The state that depends on the photo on screen, reset because it is another one now (as {@link setCurrent} does): Fit, the camera
+   * view off, no histogram, readout or scatter, no selected colour-warp pin, and the zoom figures of the last frame dropped (they
+   * belong to the photo that left). The core has done the same for its viewport.
+   */
+  private currentChanged(): Partial<AppState> {
+    this.viewportQueue.clear();
+    this.thumbLimiter.supersede(() => true);
+    return {
+      histogram: null,
+      middleReadout: null,
+      chromaScatter: null,
+      warpPin: null,
+      zoom: { kind: "fit" },
+      before: false,
+      stats: this.state.stats && { ...this.state.stats, zoom_percent: null, fit_percent: null },
+    };
+  }
+
+  /** The Look tab's tiles of photos that left are let go (the shell's addresses are not ours to free; the mock's `blob:` ones are). */
+  private forgetLookThumbsOf(ids: ReadonlySet<PhotoId>): void {
+    this.thumbLimiter.supersede((t) => ids.has(t.photoId));
+    for (const id of ids) {
+      const entry = this.lookThumbs.get(id);
+      if (!entry) continue;
+      for (const thumb of entry.urls.values()) void thumb.promise.then(releaseUrl, () => {});
+      this.lookThumbs.delete(id);
+    }
+  }
+
+  /** The undo steps of all photos together: what ⌘Z would take back, photo by photo. */
+  private undoDepth(): number {
+    let depth = 0;
+    for (const history of this.histories.values()) depth += history.undoDepth;
+    return depth;
+  }
+
+  /** The removal is the last thing the person did that ⌘Z can take back: nothing was changed since (or what was has been undone). */
+  private removalIsLatest(): boolean {
+    return this.removal !== null && this.removal.depth === this.undoDepth();
+  }
+
   // --- Navigation ---------------------------------------------------------------------------
 
   go(screen: Screen): void {
@@ -940,8 +1228,23 @@ export class AppStore {
     try {
       const preferences = await this.api.preferencesSet(patch);
       this.set({ preferences });
+      // Apple Auto acts, or stops, with its preference, and asks every photo again with new instructions; the photos' own news comes
+      // as `settings_changed`.
+      if (patch.apple_auto !== undefined || patch.apple_auto_instructions !== undefined) void this.refreshAppleAuto();
     } catch (error) {
       if (before) this.set({ preferences: before });
+      this.fail(error);
+    }
+  }
+
+  /**
+   * Asks whether Apple Auto is available on this computer (the core reads it again: Apple Intelligence may have been switched on, or its
+   * model finished downloading) and whether it acts.
+   */
+  async refreshAppleAuto(): Promise<void> {
+    try {
+      this.set({ appleAuto: await this.api.appleAutoStatus() });
+    } catch (error) {
       this.fail(error);
     }
   }
@@ -970,6 +1273,7 @@ export class AppStore {
     if (overlay === "preferences") {
       void this.refreshCliLink();
       void this.refreshDisplayLuts();
+      void this.refreshAppleAuto();
     }
   }
 
@@ -980,11 +1284,11 @@ export class AppStore {
 
   /** A short message that is not an error. */
   showNotice(notice: string): void {
-    this.set({ notice });
+    this.set({ notice, noticeAction: null });
   }
 
   dismissNotice(): void {
-    this.set({ notice: null });
+    this.set({ notice: null, noticeAction: null });
   }
 
   /** ⌘W: closes the session, after asking when an export is running (`docs/11` §Keyboard shortcuts). */
@@ -1391,41 +1695,103 @@ export class AppStore {
     if (this.state.settings[id]) return Promise.resolve();
     const existing = this.settingsRequests.get(id);
     if (existing) return existing;
-    const request = this.api
-      .getSettings(id)
-      .then((rs) => {
-        if (!this.state.settings[id]) this.set({ settings: { ...this.state.settings, [id]: rs } });
-      })
-      .catch((error) => this.fail(error))
-      .finally(() => {
-        this.settingsRequests.delete(id);
-      });
+    const request = this.readSettings(id).finally(() => {
+      this.settingsRequests.delete(id);
+    });
     this.settingsRequests.set(id, request);
     return request;
   }
 
-  /** Throws away what is known about a photo's settings and asks again. */
-  private async resyncSettings(id: PhotoId): Promise<void> {
-    try {
-      const rs = await this.api.getSettings(id);
-      this.set({ settings: { ...this.state.settings, [id]: rs } });
-    } catch (error) {
-      this.fail(error);
+  /** Reads a photo's settings into the mirror unless it already holds them; asks again when a copy to other photos landed meanwhile. */
+  private async readSettings(id: PhotoId): Promise<void> {
+    for (;;) {
+      const epoch = this.bulkEpoch;
+      try {
+        const rs = await this.api.getSettings(id);
+        if (epoch !== this.bulkEpoch) continue;
+        if (!this.state.settings[id]) this.set({ settings: { ...this.state.settings, [id]: rs } });
+        return;
+      } catch (error) {
+        this.fail(error);
+        return;
+      }
     }
   }
 
+  /**
+   * Throws away what is known about a photo's settings and asks again. What comes back is dropped when a patch was made for the photo
+   * or answered (or a copy to other photos landed) while the question was on its way: the answer may be older than that, and the
+   * patch's own reply puts the settings right.
+   */
+  private async resyncSettings(id: PhotoId): Promise<void> {
+    for (;;) {
+      const epoch = this.bulkEpoch;
+      const written = this.writes.get(id) ?? 0;
+      try {
+        const rs = await this.api.getSettings(id);
+        if (epoch !== this.bulkEpoch) continue;
+        if ((this.writes.get(id) ?? 0) === written) this.setSettings(id, rs);
+        return;
+      } catch (error) {
+        this.fail(error);
+        return;
+      }
+    }
+  }
+
+  /**
+   * Reads a photo's settings again after news from the core, without taking back what the person is doing. Patches on their way land
+   * first; then the settings are asked for, and a reply that a newer write overtook while it was out (a patch sent or answered, Re-run,
+   * a Pick white, a paste: anything {@link writes} counts, or a copy to other photos) is not shown, because it may predate that write
+   * and a slider being dragged would jump back. The store asks again once that write has landed: its own reply may predate the news. A
+   * photo whose settings the mirror no longer holds, or that is being removed ({@link leaving}), is not asked for, and a reply for one
+   * that left meanwhile is not shown.
+   */
+  private async refreshSettings(id: PhotoId): Promise<void> {
+    for (;;) {
+      await this.whenIdle(id);
+      if (!this.state.settings[id] || this.leaving.has(id)) return;
+      if (this.isSending(id)) continue;
+      const epoch = this.bulkEpoch;
+      const asked = this.writes.get(id) ?? 0;
+      let rs: ResolvedSettings;
+      try {
+        rs = await this.api.getSettings(id);
+      } catch (error) {
+        // The core says the photo is unknown when it was removed while the question was on its way: nothing to tell.
+        if (!this.leaving.has(id) && this.state.settings[id]) this.fail(error);
+        return;
+      }
+      if (this.leaving.has(id) || !this.state.settings[id]) return;
+      if (epoch === this.bulkEpoch && (this.writes.get(id) ?? 0) === asked) {
+        this.setSettings(id, rs);
+        return;
+      }
+    }
+  }
+
+  /** Counts a write of a photo's settings, or a patch sent for it ({@link writes}). */
+  private wrote(id: PhotoId): void {
+    this.writes.set(id, (this.writes.get(id) ?? 0) + 1);
+  }
+
   private setSettings(id: PhotoId, rs: ResolvedSettings): void {
+    this.wrote(id);
     this.set({ settings: { ...this.state.settings, [id]: rs } });
   }
 
   /**
-   * Sends a patch for the current photo. While a drag is on, call it with `final = false` (at
-   * most once per frame, which the controls do); the release, a key, a typed value or a reset
-   * calls it with `final = true`, which also records one undo step for the whole gesture.
+   * Sends a patch for a photo. While a drag is on, call it with `final = false` (at most once per frame, which the controls do); the
+   * release, a key, a typed value or a reset calls it with `final = true`, which also records one undo step for the whole gesture.
    * Resolves when the core has answered.
+   *
+   * A patch belongs to the photo the person made the input on. Without `photoId` that is the photo on screen when this is called,
+   * which is right for an input that is handled at once (a key, a click, a typed value). A control that collects its input and sends it
+   * later (a drag, one patch per frame) must name the photo it began on, so that moving to another photo before the frame or the release
+   * cannot send it there: the controls pass the `photo_id` of the settings they were drawn from.
    */
-  update(patch: SettingsPatch, final = true): Promise<void> {
-    const id = this.currentId();
+  update(patch: SettingsPatch, final = true, photoId: PhotoId | null = this.currentId()): Promise<void> {
+    const id = photoId;
     if (id === null) return Promise.resolve();
     const rs = this.state.settings[id];
     if (!rs) return Promise.resolve();
@@ -1450,6 +1816,7 @@ export class AppStore {
   }
 
   private enqueue(id: PhotoId, patch: SettingsPatch, record: Queued["record"]): Promise<void> {
+    this.wrote(id);
     const sender = this.senderFor(id);
     return new Promise<void>((resolve) => {
       const last = sender.queue[sender.queue.length - 1];
@@ -1491,6 +1858,12 @@ export class AppStore {
       sender.busy = false;
       for (const wake of sender.idle.splice(0)) wake();
     }
+  }
+
+  /** Whether a patch for a photo is on its way to the core or waiting to be sent. */
+  private isSending(id: PhotoId): boolean {
+    const sender = this.senders.get(id);
+    return sender !== undefined && (sender.busy || sender.queue.length > 0);
   }
 
   /** Resolves when every patch for a photo has been answered. */
@@ -1557,11 +1930,12 @@ export class AppStore {
       this.showNotice("Copy the settings of a photo first.");
       return;
     }
-    const own = scope === "picked" ? await this.pickedWhiteSource(this.state.copied) : null;
+    // The photos the paste is for are the ones the person has now, picked or on screen: fixed before anything is waited for.
     const { session, copied } = this.state;
-    if (!session || !copied) return;
     const current = this.currentPhoto();
     const chosen = scope === "this" ? (current ? [current] : []) : session.photos.filter((p) => p.picked);
+    const own = scope === "picked" ? await this.pickedWhiteSource(copied) : null;
+    if (!this.state.session) return;
     if (chosen.length === 0) {
       this.showNotice(scope === "this" ? "There is no photo to paste onto." : "No photos are picked.");
       return;
@@ -1579,6 +1953,8 @@ export class AppStore {
       for (const id of ids) this.pasting.add(id);
       try {
         report = await this.api.pasteSettings(ids, copied.patch);
+        // Reads of settings that were on their way when the paste landed may hold the old ones.
+        this.bulkEpoch += 1;
       } catch (error) {
         this.fail(error);
         return;
@@ -1635,44 +2011,96 @@ export class AppStore {
   // --- Looks --------------------------------------------------------------------------------
 
   /**
-   * Picks a look for the current photo and, when "Apply to" is Picked or All, for those photos
-   * too. The current photo goes first through `update_settings`, so the change is one undo step
-   * and the viewport answers at once; the others follow through `apply_look`.
+   * Picks a look for a photo (the one on screen unless `photoId` names another) and, when "Apply to" is Picked or All, for those photos
+   * too. The photo goes first through `update_settings`, so the change is one undo step and the viewport answers at once; the others
+   * follow through `apply_look`.
+   *
+   * Everything the pick means is fixed when it is made: the photo, the scope, the look and its strength. The person may move to
+   * another photo, or pick again there, before the core has answered; this pick still goes to the photo it was made on, and its copy
+   * to the others reaches the core before the copy of any pick made after it ({@link applyAfter}).
    */
-  async chooseLook(lookId: LookId, intensity?: number): Promise<void> {
-    const rs = this.currentSettings();
+  async chooseLook(lookId: LookId, intensity?: number, photoId: PhotoId | null = this.currentId()): Promise<void> {
+    if (photoId === null) return;
+    const rs = this.state.settings[photoId];
     const look = this.state.looks?.find((l) => l.id === lookId);
     if (!rs || !look || look.missing) return;
     const level = intensity ?? rs.values.look_intensity;
-    const failed = this.failures;
-    await this.update({ look: lookId, look_intensity: level }, true);
-    // If the current photo could not take the look, the others must not get it either.
-    if (this.failures === failed) await this.copyLook(lookId, level);
+    await this.changeLook(photoId, this.state.applyScope, { look: lookId, look_intensity: level }, true, lookId, level);
   }
 
-  /** Sets the look strength; the other photos of the scope get it when the drag ends. */
-  async setLookIntensity(level: number, final: boolean): Promise<void> {
-    const rs = this.currentSettings();
+  /**
+   * Sets the look strength of a photo (the one on screen unless `photoId` names another); the other photos of the scope get it, with
+   * the look the photo has, when the drag ends. A drag names the photo it began on, as {@link update} asks of every control.
+   */
+  async setLookIntensity(level: number, final: boolean, photoId: PhotoId | null = this.currentId()): Promise<void> {
+    if (photoId === null) return;
+    const rs = this.state.settings[photoId];
     if (!rs) return;
-    const failed = this.failures;
-    await this.update({ look_intensity: level }, final);
-    if (final && this.failures === failed) await this.copyLook(rs.values.look, level);
+    await this.changeLook(photoId, this.state.applyScope, { look_intensity: level }, final, rs.values.look, level);
   }
 
-  private async copyLook(lookId: LookId, level: number): Promise<void> {
-    const scope = this.state.applyScope;
+  /** The patch of one photo's look, then (at the end of a gesture) the copy to the photos of the scope. */
+  private async changeLook(id: PhotoId, scope: ApplyScope, patch: SettingsPatch, final: boolean, lookId: LookId, level: number): Promise<void> {
+    const failed = this.failures;
+    const sent = this.update(patch, final, id);
+    if (!final || scope === "this") {
+      await sent;
+      return;
+    }
+    await this.applyAfter(sent, async () => {
+      // If the photo could not take the look, the others must not get it either.
+      if (this.failures === failed) await this.copyLook(id, scope, lookId, level);
+    });
+  }
+
+  /**
+   * Runs a copy to other photos once the photo's own patch has been answered and every copy asked for before it has finished. Each
+   * photo's patch is answered when it is (a photo's patches go one at a time, different photos' at once), and the core takes commands
+   * as they come: left alone, a pick on photo 1 that is slow would have its copy land after the copy of a pick made on photo 2
+   * afterwards, and leave every photo with the older look. The copies go in the order of the picks.
+   */
+  private async applyAfter(own: Promise<void>, copy: () => Promise<void>): Promise<void> {
+    const before = this.applyTail;
+    const turn = (async () => {
+      await own;
+      await before;
+      await copy();
+    })();
+    this.applyTail = turn.catch(() => {});
+    await turn;
+  }
+
+  /**
+   * Copies a look and its strength to the photos of `scope`, which the person chose when they picked it. The photo they picked it on
+   * (`source`) already has them, from its own reply. The other photos' look changed in the core behind the mirror's back: what the
+   * mirror holds for them is dropped, and asked for again when they are shown. The photo on screen now (the person may have moved
+   * since the pick) is asked for at once, so it is never left showing the look it had.
+   */
+  private async copyLook(source: PhotoId, scope: ApplyScope, lookId: LookId, level: number): Promise<void> {
     if (scope === "this") return;
-    const current = this.currentId();
     try {
       await this.api.applyLook(scope, lookId, level);
     } catch (error) {
       this.fail(error);
       return;
     }
-    // The other photos' looks changed behind the mirror's back.
+    await this.forgetOthers(source);
+  }
+
+  /**
+   * The core changed photos other than `keep` without the mirror knowing: forgets their settings, and reads the settings of the photo
+   * on screen again if it is one of them. Its old settings stay in the meantime (a control being dragged there has to find them) and are
+   * replaced when the answer comes. Reads that were already on their way are asked again when they arrive (`bulkEpoch`).
+   */
+  private async forgetOthers(keep: PhotoId | null): Promise<void> {
+    this.bulkEpoch += 1;
+    const shown = this.currentPhoto();
     const kept: Record<PhotoId, ResolvedSettings> = {};
-    for (const [key, value] of Object.entries(this.state.settings)) if (Number(key) === current) kept[Number(key)] = value;
+    for (const [key, value] of Object.entries(this.state.settings)) if (Number(key) === keep || Number(key) === shown?.id) kept[Number(key)] = value;
     this.set({ settings: kept });
+    if (!shown || shown.id === keep || !isReady(shown)) return;
+    if (kept[shown.id]) await this.resyncSettings(shown.id);
+    else await this.ensureSettings(shown.id);
   }
 
   /** "Make default": the look every new photo opens with (a preference). */
@@ -1908,13 +2336,21 @@ export class AppStore {
   private syncHistoryFlags(): void {
     const id = this.currentId();
     const history = id === null ? undefined : this.histories.get(id);
-    const canUndo = history?.canUndo ?? false;
+    // A removal that is the latest thing done can be undone too (⌘Z restores the photos).
+    const canUndo = (history?.canUndo ?? false) || this.removalIsLatest();
     const canRedo = history?.canRedo ?? false;
     if (canUndo !== this.state.canUndo || canRedo !== this.state.canRedo) this.set({ canUndo, canRedo });
   }
 
-  /** ⌘Z for the current photo. */
+  /**
+   * ⌘Z: takes back the photos of the last removal while nothing was changed after it ({@link undoRemoval}); otherwise undoes the
+   * newest setting change of the current photo.
+   */
   async undo(): Promise<void> {
+    if (this.removalIsLatest()) {
+      await this.undoRemoval();
+      return;
+    }
     await this.stepHistory((h) => h.undo(), "before");
   }
 

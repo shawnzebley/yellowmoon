@@ -11,10 +11,14 @@ use ym_color::exposure::TARGET_GREY;
 use ym_color::exposure::white;
 use ym_color::gamut::{awg4_luminance_row, matrices};
 use ym_color::grade::{
-    BRIGHTNESS_SIGMA, COLOR_BALANCE_STRENGTH, E1, E2, ZONE_CONTROL_SIGMA, ZONE_SIGMA,
+    BRIGHTNESS_SIGMA, COLOR_BALANCE_STRENGTH, CONTRAST_BLACK, CONTRAST_COLOR,
+    CONTRAST_NEUTRAL_CHROMA, CONTRAST_TOP, E1, E2, SATURATION_CODE_LIMIT, ZONE_CONTROL_SIGMA,
+    ZONE_SIGMA,
 };
 use ym_color::tone::HIGHLIGHT_GREY;
-use ym_color::warp::{WARP_MAX_PINS, WARP_NEUTRAL_GUARD, WARP_TONE_HALF_WIDTH};
+use ym_color::warp::{
+    WARP_EXP_LIMIT, WARP_MAX_PINS, WARP_MAX_STEPS, WARP_NEUTRAL_GUARD, WARP_TONE_HALF_WIDTH,
+};
 
 use super::aces;
 use super::color::{WARP_LOCK_ROWS, WARP_MOVE_ROWS};
@@ -93,6 +97,8 @@ pub enum KernelId {
     Sampler,
     /// C13 with dither and the letterbox to RGBA8 or 8 / 16-bit interleaved bands.
     Encode,
+    /// The Catmull-Rom magnification of a view above 100 % with the paper, C13 fused.
+    Magnify,
     /// R1 normalise, R3 vignetting and R4 gains of a rectangle, from the resident raw words.
     Prep,
     /// The R1 clip bits of a rectangle (one bit per photosite) from the words and the steps.
@@ -163,7 +169,7 @@ impl KernelId {
     /// last the spikes and the probe, which no render uses. [`KernelSet::kernels`] and `warm_up`
     /// compile in this order, so that what the first frame of the first photo waits for is compiled
     /// before what only a zoomed view or an export needs.
-    pub const ALL: [KernelId; 62] = [
+    pub const ALL: [KernelId; 63] = [
         // The fit view of a mosaic photo.
         KernelId::Prep,
         KernelId::PrepMask,
@@ -191,6 +197,7 @@ impl KernelId {
         KernelId::OutputSharpenWindow,
         KernelId::OutputSharpenTransfer,
         KernelId::Encode,
+        KernelId::Magnify,
         // The full-resolution raw chain (the 100 % view and the exports).
         KernelId::AdaptiveRatioPrepare,
         KernelId::AdaptiveRatioGreen,
@@ -271,6 +278,7 @@ impl KernelId {
             KernelId::AdaptiveRatioExit => "adaptive_ratio_exit",
             KernelId::Sampler => "sampler",
             KernelId::Encode => "encode",
+            KernelId::Magnify => "magnify",
             KernelId::Prep => "prep",
             KernelId::PrepMask => "prep_mask",
             KernelId::HighlightsSuper => "highlights_super",
@@ -335,7 +343,8 @@ impl KernelId {
             | KernelId::OutputSharpenWindow
             | KernelId::OutputSharpenTransfer
             | KernelId::Sampler
-            | KernelId::Encode => KernelSet::View,
+            | KernelId::Encode
+            | KernelId::Magnify => KernelSet::View,
             KernelId::Resize => KernelSet::Tail,
             _ => KernelSet::Raw,
         }
@@ -378,6 +387,7 @@ impl KernelId {
             | KernelId::AdaptiveRatioExit => super::adaptive_ratio::body(self),
             KernelId::Sampler => super::sampler::body(),
             KernelId::Encode => super::encode::body(),
+            KernelId::Magnify => super::magnify::body(),
             KernelId::SigmaExpand | KernelId::Bilateral => super::bilateral::body(self),
             KernelId::Guided
             | KernelId::GuidedCols
@@ -524,20 +534,27 @@ fn constants() -> String {
         ("ZONE_CONTROL_SIGMA", ZONE_CONTROL_SIGMA),
         ("ZONE_SIGMA", ZONE_SIGMA),
         ("BALANCE_STRENGTH", COLOR_BALANCE_STRENGTH),
+        ("CONTRAST_BLACK", CONTRAST_BLACK),
+        ("CONTRAST_TOP", CONTRAST_TOP),
+        ("CONTRAST_COLOR", CONTRAST_COLOR),
+        ("CONTRAST_NEUTRAL", CONTRAST_NEUTRAL_CHROMA),
+        ("SAT_CODE_LIMIT", SATURATION_CODE_LIMIT),
         ("HIGHLIGHT_GREY", HIGHLIGHT_GREY),
         ("WHITE_LIFT_KNEE", white::KNEE_EV),
         ("WHITE_LIFT_GREY", TARGET_GREY),
         ("WARP_NEUTRAL_GUARD", WARP_NEUTRAL_GUARD),
         ("WARP_TONE_HALF_WIDTH", WARP_TONE_HALF_WIDTH),
+        ("WARP_EXP_LIMIT", WARP_EXP_LIMIT),
     ] {
         let _ = writeln!(s, "const {n}: f32 = {};", f(v));
     }
-    // The colour warp's pin count and the sizes of its rows in the colour kernel's uniform block
-    // (`kernels::color`, `ChainU`).
+    // The colour warp's pin count, the sizes of its rows in the colour kernel's uniform block
+    // (`kernels::color`, `ChainU`) and the most flow steps a frame takes.
     for (n, v) in [
         ("WARP_MAX_PINS", WARP_MAX_PINS),
         ("WARP_MOVE_ROWS", WARP_MOVE_ROWS),
         ("WARP_LOCK_ROWS", WARP_LOCK_ROWS),
+        ("WARP_MAX_STEPS", WARP_MAX_STEPS as usize),
     ] {
         let _ = writeln!(s, "const {n}: u32 = {v}u;");
     }

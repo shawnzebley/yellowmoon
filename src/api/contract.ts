@@ -35,12 +35,15 @@ type AllTrue<Checks extends Record<string, true>> = Checks;
 /** Answers and events: what the core sends has to fit the type the screens read. */
 export type FromCore = AllTrue<{
   sessionState: Assignable<B.SessionState, T.SessionState>;
+  sessionChange: Assignable<B.SessionChange, T.SessionChange>;
   photoSummary: Assignable<B.PhotoSummary, T.PhotoSummary>;
   photoStatus: Assignable<B.PhotoStatus, T.PhotoStatus>;
   cameraInfo: Assignable<B.CameraInfo, T.CameraInfo>;
   resolvedSettings: Assignable<B.ResolvedSettings, T.ResolvedSettings>;
   developSettings: Assignable<B.DevelopSettings, T.DevelopSettings>;
   autoEstimates: Assignable<B.AutoEstimates, T.AutoEstimates>;
+  appleAuto: Assignable<B.AppleAuto, T.AppleAuto>;
+  appleAutoStatus: Assignable<B.AppleAutoStatus, T.AppleAutoStatus>;
   look: Assignable<B.Look, T.Look>;
   looksImportResult: Assignable<B.LooksImportResult, T.LooksImportResult>;
   sourceRecognition: Assignable<B.SourceRecognition, T.SourceRecognition>;
@@ -81,6 +84,8 @@ export type Both = AllTrue<{
   crop: Same<T.Crop, B.Crop>;
   curves: Same<T.Curves, B.Curves>;
   colorBalance: Same<T.ColorBalance, B.ColorBalance>;
+  colorBalancePoints: Same<T.ColorBalancePoints, B.ColorBalancePoints>;
+  balanceSetting: Same<T.BalanceSetting, B.BalanceSetting>;
   colorWarp: Same<T.ColorWarp, B.ColorWarp>;
   colorWarpPin: Same<T.ColorWarpPin, B.ColorWarpPin>;
   viewportRect: Same<T.ViewportRect, B.ViewportRect>;
@@ -90,6 +95,18 @@ export type Both = AllTrue<{
   viewportBackendKind: Same<T.ViewportBackendKind, B.ViewportBackendKind>;
   errorScope: Same<T.ErrorScope, B.ErrorScope>;
   lightSource: Same<T.LightSource, B.LightSource>;
+  percentSetting: Same<T.PercentSetting, B.PercentSetting>;
+  autoSource: Same<T.AutoSource, B.AutoSource>;
+  appleAutoReason: Same<T.AppleAutoReason, B.AppleAutoReason>;
+  appleAutoFailure: Same<T.AppleAutoFailure, B.AppleAutoFailure>;
+  appleAutoMode: Same<T.AppleAutoMode, B.AppleAutoMode>;
+  appleAutoInfo: Same<T.AppleAutoInfo, B.AppleAutoInfo>;
+  appleAutoSteps: Same<T.AppleAutoSteps, B.AppleAutoSteps>;
+  appleAutoAnswer: Same<T.AppleAutoAnswer, B.AppleAutoAnswer>;
+  appleAutoInstructions: Same<T.AppleAutoInstructions, B.AppleAutoInstructions>;
+  appleShadowColor: Same<T.AppleShadowColor, B.AppleShadowColor>;
+  appleHighlightColor: Same<T.AppleHighlightColor, B.AppleHighlightColor>;
+  appleAutoStatus: Same<T.AppleAutoStatus, B.AppleAutoStatus>;
   lookInput: Same<T.LookInput, B.LookInput>;
   lookGroup: Same<T.LookGroup, B.LookGroup>;
   lookLibrary: Same<T.LookLibrary, B.LookLibrary>;

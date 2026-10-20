@@ -60,13 +60,24 @@ impl Harness {
     }
 
     pub(crate) fn with_watch(watch: WatchConfig) -> Self {
+        Self::with(watch, None)
+    }
+
+    /// An app whose Apple Auto asks `advisor` (`docs/19` section 12: `FakeAdvisor`, or a scripted
+    /// one); the other harnesses have none, as the golden and parity tests need.
+    pub(crate) fn with_advisor(advisor: Arc<dyn ym_core::apple_auto::AutoAdvisor>) -> Self {
+        Self::with(WatchConfig::default(), Some(crate::api::Advisor(advisor)))
+    }
+
+    fn with(watch: WatchConfig, advisor: Option<crate::api::Advisor>) -> Self {
         let photos = tempfile::tempdir().expect("photos");
         let app_root = tempfile::tempdir().expect("app root");
         let home = tempfile::tempdir().expect("home");
         let events = Arc::new(Recorder::new());
         let frames = Arc::new(FrameStore::new());
         let emitter: Arc<dyn Emitter> = events.clone();
-        let sink = Arc::new(FallbackSink::new(Arc::clone(&frames), Arc::clone(&emitter)));
+        let sink: Arc<dyn crate::viewport::FrameSink> =
+            Arc::new(FallbackSink::new(Arc::clone(&frames), Arc::clone(&emitter)));
         let tool = home.path().join("app").join("ym");
         std::fs::create_dir_all(tool.parent().expect("parent")).expect("mkdir");
         std::fs::write(&tool, b"#!/bin/sh\n").expect("write the tool");
@@ -78,6 +89,7 @@ impl Harness {
             thumbnails: true,
             decode_threads: Some(2),
             watch,
+            advisor,
         };
         // Only the folders of the test: `CliLink::new` also names the real `/usr/local/bin` and
         // `/opt/homebrew/bin` of a Mac, where a test would look at (and replace) the link of the
@@ -88,7 +100,7 @@ impl Harness {
         let api = AppApi::start(
             config,
             emitter,
-            sink,
+            move |_| sink,
             Arc::clone(&frames),
             Box::new(NoElevation),
             Some(cli),

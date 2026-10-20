@@ -9,8 +9,12 @@ use common::{Sandbox, shape};
 use predicates::prelude::*;
 use serde_json::Value;
 
+/// The binary as it is, but with Apple Auto not available, as for every test of this crate
+/// (`common`).
 fn ym() -> Command {
-    cargo_bin_cmd!("ym")
+    let mut cmd = cargo_bin_cmd!("ym");
+    cmd.env(common::NO_APPLE_AUTO.0, common::NO_APPLE_AUTO.1);
+    cmd
 }
 
 #[test]
@@ -33,7 +37,7 @@ fn version_reports_the_workspace_and_pipeline_versions() {
         .assert()
         .success()
         .stdout(predicate::str::starts_with(format!(
-            "ym {} (pipeline 0.4.0, ",
+            "ym {} (pipeline 0.4.4, ",
             env!("CARGO_PKG_VERSION")
         )));
 }
@@ -120,7 +124,7 @@ fn doctor_says_what_it_includes_and_lists_the_parts() {
     let sb = Sandbox::new();
     let out = sb.ym().arg("doctor").assert().success();
     let text = String::from_utf8_lossy(&out.get_output().stdout).into_owned();
-    let version_line = format!("ym {} (pipeline 0.4.0, ", env!("CARGO_PKG_VERSION"));
+    let version_line = format!("ym {} (pipeline 0.4.4, ", env!("CARGO_PKG_VERSION"));
     for needle in [
         "does not include photos, file names, locations",
         "Version",
@@ -153,7 +157,7 @@ fn doctor_json_has_the_same_parts() {
             .expect("includes")
             .contains("does not include")
     );
-    assert_eq!(v["pipeline_version"], "0.4.0");
+    assert_eq!(v["pipeline_version"], "0.4.4");
     assert!(v["gpu"]["available"].is_boolean());
     if v["gpu"]["available"] == true {
         assert!(v["gpu"]["name"].is_string() && v["gpu"]["limits"]["max_buffer_size"].is_u64());
@@ -173,10 +177,11 @@ fn doctor_json_has_the_same_parts() {
 
 #[test]
 fn doctor_json_shape_snapshot_on_a_machine_with_no_adapter() {
-    // No Direct3D 12 here whatever the machine is, so the GPU section is the same everywhere.
+    // No Direct3D 12 here whatever the machine is, so the GPU section is the same everywhere; the
+    // test advisor of Apple Auto makes its section the same everywhere too.
     let sb = Sandbox::new();
     let out = sb
-        .ym()
+        .ym_fake()
         .env("WGPU_BACKEND", "dx12")
         .env_remove("YELLOWMOON_GPU")
         .args(["doctor", "--json"])
