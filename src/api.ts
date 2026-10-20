@@ -22,6 +22,7 @@ import type {
   ApiEventName,
   ApiEvents,
   AppError,
+  AppleAutoStatus,
   ApplyScope,
   AppInfo,
   ChromaSample,
@@ -45,6 +46,7 @@ import type {
   Preferences,
   PreferencesPatch,
   ResolvedSettings,
+  SessionChange,
   SessionState,
   SettingsPatch,
   SourceRecognition,
@@ -81,6 +83,19 @@ export interface Api {
   setCurrent(photoId: PhotoId): Promise<void>;
   /** `set_picked`. */
   setPicked(photoId: PhotoId, picked: boolean): Promise<void>;
+  /**
+   * `remove_photos` (addition, "Remove from filmstrip"): take photos out of the filmstrip. The files on disk are not touched; the
+   * photos' edits go with them (nothing is saved per photo). Queued development and renders for them stop, and the burst frames that
+   * stay share their median again (`settings_changed` for those whose estimates moved). The photo on screen hands over to the next
+   * one (the previous one when the last was removed). An id that is not in the session is ignored. The last removal is kept in
+   * memory for `restorePhotos` until the next removal or the end of the session; exports that were queued keep their photos.
+   */
+  removePhotos(photoIds: PhotoId[]): Promise<SessionChange>;
+  /**
+   * `restore_photos` (addition): Undo of the last `removePhotos`. The photos come back where they were in the filmstrip, with their
+   * settings, picks and thumbnails (`thumbnail_ready` again). Answers an empty change when there is nothing to put back.
+   */
+  restorePhotos(): Promise<SessionChange>;
 
   // --- Settings ------------------------------------------------------------
 
@@ -226,6 +241,12 @@ export interface Api {
   preferencesGet(): Promise<Preferences>;
   /** `preferences_set`: apply a patch and return the new preferences. */
   preferencesSet(patch: PreferencesPatch): Promise<Preferences>;
+  /**
+   * `apple_auto_status`: whether Apple Auto is available on this computer (read again for the answer) and whether it acts
+   * (`docs/19` sections 1 and 2). Preferences asks when it opens and shows "Auto with Apple Intelligence" only while it is available.
+   * Addition.
+   */
+  appleAutoStatus(): Promise<AppleAutoStatus>;
   /** `install_cli_link`: the "Install Command-Line Tool…" menu item. */
   installCliLink(): Promise<CliLinkResult>;
   /** `cli_link_status`: whether the link exists and where (Preferences › Command-line tool). Addition. */
@@ -279,6 +300,8 @@ export const tauriApi: Api = {
   closeSession: () => unit(commands.closeSession()),
   setCurrent: (photoId) => unit(commands.setCurrent(photoId)),
   setPicked: (photoId, picked) => unit(commands.setPicked(photoId, picked)),
+  removePhotos: (photoIds) => commands.removePhotos(photoIds),
+  restorePhotos: () => commands.restorePhotos(),
 
   getSettings: (photoId) => commands.getSettings(photoId),
   updateSettings: (photoId, patch) => commands.updateSettings(photoId, patch),
@@ -323,6 +346,7 @@ export const tauriApi: Api = {
 
   preferencesGet: () => commands.preferencesGet(),
   preferencesSet: (patch) => commands.preferencesSet(patch),
+  appleAutoStatus: () => commands.appleAutoStatus(),
   installCliLink: () => commands.installCliLink(),
   cliLinkStatus: () => commands.cliLinkStatus(),
   appInfo: () => commands.appInfo(),

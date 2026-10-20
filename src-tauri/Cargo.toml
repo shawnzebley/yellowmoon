@@ -20,6 +20,9 @@ tauri-build.workspace = true
 
 [dependencies]
 ym-core.workspace = true
+# Apple Auto's bridge to Apple's on-device model (docs/19 section 11; Apache-2.0, ours). Off Apple
+# silicon or without the macOS 27 SDK it builds a stub that reports why it is not available.
+ym-apple.workspace = true
 ym-color.workspace = true
 ym-export.workspace = true
 ym-gpu.workspace = true
@@ -60,3 +63,7 @@ zip.workspace = true
 regex = "1"
 # Synthetic ARW files for the command tests.
 ym-raw = { workspace = true, features = ["testgen"] }
+# The native viewport's two pipelines (`src/present.rs`) drawn on any adapter by `tests/present.rs`
+# (MIT OR Apache-2.0; both already in the tree through ym-gpu, so nothing new is built).
+wgpu.workspace = true
+pollster.workspace = true

@@ -16,11 +16,13 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use ym_core::app::gpu::{GpuOpener, GpuPolicy, GpuSlot};
 use ym_core::app::{Core, CoreOptions};
+use ym_core::apple_auto::AutoAdvisor;
 use ym_core::export_queue::{ExportEvent, ExportJob as CoreExportJob, ExportSink};
 use ym_core::pipeline::PhotoSource;
 use ym_core::session::{
     EventSink, OpenOptions, PhotoId as CorePhotoId, SessionError, SessionEvent,
 };
+use ym_gpu::device::Gpu;
 use ym_gpu::queue::CancelToken;
 use ym_looks::import::Stage;
 use ym_looks::import::watch::WatchConfig;
@@ -31,12 +33,12 @@ use crate::events::{AppEvent, Emitter};
 use crate::thumbs::Thumbnails;
 use crate::viewport::{FrameSink, FrameStore, Viewport, core_id};
 use crate::wire::{
-    AppError, AppInfo, ApplyScope, ChromaSample, ChromaScatter, CliLinkResult, CliLinkStatus,
-    DisplayLut, ErrorScope, ExportEstimate, ExportJob, ExportJobId, HistogramData, Look, LookId,
-    LookInput, LooksImportProgress, LooksImportResult, OpenSummary, PasteReport, PhotoId,
-    PhotoProgress, PixelSample, Preferences, PreferencesPatch, ResolvedSettings, SessionState,
-    SettingsPatch, SourceRecognition, ThumbnailReady, ViewportInfo, ViewportInput, ViewportMode,
-    ViewportRect, WatchStatus, convert,
+    AppError, AppInfo, AppleAutoStatus, ApplyScope, ChromaSample, ChromaScatter, CliLinkResult,
+    CliLinkStatus, DisplayLut, ErrorScope, ExportEstimate, ExportJob, ExportJobId, HistogramData,
+    Look, LookId, LookInput, LooksImportProgress, LooksImportResult, OpenSummary, PasteReport,
+    PhotoId, PhotoProgress, PixelSample, Preferences, PreferencesPatch, ResolvedSettings,
+    SessionChange, SessionState, SettingsPatch, SourceRecognition, ThumbnailReady, ViewportInfo,
+    ViewportInput, ViewportMode, ViewportRect, WatchStatus, convert,
 };
 use crate::wizard::{Downloads, recognise};
 
@@ -66,6 +68,21 @@ pub struct AppConfig {
     pub decode_threads: Option<usize>,
     /// The Downloads watcher's settings.
     pub watch: WatchConfig,
+    /// What looks at each photo for Apple Auto (`docs/19` sections 11 and 12): `ym_apple`'s system
+    /// advisor in the app (Apple's on-device model where it is available, the fake with
+    /// `YELLOWMOON_TEST_APPLE_AUTO=fake`); `None` in the tests unless they give one, which is the
+    /// same as unavailable.
+    pub advisor: Option<Advisor>,
+}
+
+/// An Apple Auto advisor for [`AppConfig`].
+#[derive(Clone)]
+pub struct Advisor(pub Arc<dyn AutoAdvisor>);
+
+impl std::fmt::Debug for Advisor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Advisor")
+    }
 }
 
 impl AppConfig {
@@ -88,6 +105,7 @@ impl AppConfig {
             thumbnails: true,
             decode_threads: None,
             watch: WatchConfig::default(),
+            advisor: Some(Advisor(ym_apple::system_advisor())),
         })
     }
 }
@@ -156,17 +174,27 @@ fn touches_thumbnail(patch: &SettingsPatch) -> bool {
 impl AppApi {
     /// Builds the core and the viewport and starts the background threads.
     ///
+    /// The graphics device is opened first, and `make_sink` makes the viewport's sink with it (the
+    /// device the core renders with, `None` when the core uses the CPU): the native viewport draws
+    /// with that device, so a frame the core makes there is drawn from there
+    /// (`docs/01` §Native viewport).
+    ///
     /// # Errors
     ///
     /// [`AppError`] when the data folder cannot be read or a thread cannot start.
     pub fn start(
         config: AppConfig,
         emitter: Arc<dyn Emitter>,
-        sink: Arc<dyn FrameSink>,
+        make_sink: impl FnOnce(Option<&Arc<Gpu>>) -> Arc<dyn FrameSink>,
         frames: Arc<FrameStore>,
         elevate: Box<dyn Elevate + Send + Sync>,
         cli: Option<CliLink>,
     ) -> Result<Arc<Self>, AppError> {
+        let mut options = CoreOptions::new(config.data_root.clone(), config.app_root.clone());
+        // The device is opened here and nowhere else (`ym_core::app::gpu`), as `ym` opens it: the
+        // same policy, the same adapter, the same budgets. The viewport's sink is made with it.
+        let slot = open_app_gpu(config.gpu, options.render.budget);
+        let sink = make_sink(slot.gpu());
         let viewport = Viewport::new(Arc::clone(&emitter), sink);
         let shared = viewport.shared();
 
@@ -196,7 +224,13 @@ impl AppApi {
                         url,
                     }));
                 }
-                SessionEvent::EstimatesChanged { id } => shared.estimates_changed(id),
+                // A burst's median moved, Apple Auto answered or failed, or its preference changed
+                // (`docs/19` section 6): the viewport draws the photo again, and the webview reads its
+                // settings again, so the Automatic card and the sliders' detents follow.
+                SessionEvent::EstimatesChanged { id } => {
+                    shared.estimates_changed(id);
+                    emitter.emit(AppEvent::SettingsChanged(PhotoId(id.0)));
+                }
             })
         };
         let export_events = {
@@ -212,17 +246,14 @@ impl AppApi {
             })
         };
 
-        let mut options = CoreOptions::new(config.data_root.clone(), config.app_root.clone());
         options.session_events = session_events;
         options.export_events = export_events;
         options.home = config.home.clone();
         options.thumbnails = config.thumbnails;
+        options.advisor = config.advisor.as_ref().map(|a| Arc::clone(&a.0));
         if let Some(threads) = config.decode_threads {
             options.decode_threads = threads;
         }
-        // The device is opened here and nowhere else (`ym_core::app::gpu`), as `ym` opens it: the
-        // same policy, the same adapter, the same budgets.
-        let slot = open_app_gpu(config.gpu, options.render.budget);
         slot.apply_to(&mut options.render);
         // The ground of the interface is dark: the letterbox of a viewport frame, a thumbnail and a look tile is that colour, as the
         // window behind the webview is (`native.rs`). Exports have no letterbox, so no file changes.
@@ -393,6 +424,68 @@ impl AppApi {
             .session
             .set_picked(core_id(id), picked)
             .map_err(session_error)
+    }
+
+    /// `remove_photos`: takes photos out of the filmstrip ([`ym_core::app::Core::remove_photos`]). The files on disk are not
+    /// touched. The photo on screen hands over to the next one (the previous one when the last was removed) or, with no photo
+    /// left, the viewport shows nothing. The photos' thumbnails are set aside for Undo ([`AppApi::restore_photos`]), the burst
+    /// frames that stay get new estimates, a `settings_changed` event and a new thumbnail. An id that is not in the session is
+    /// ignored; the answer lists the photos that were removed. Exports that were queued keep going with their snapshots.
+    ///
+    /// # Errors
+    ///
+    /// [`AppError`] only if the shapes of the core and of the bridge disagree (a bug).
+    pub fn remove_photos(&self, ids: &[PhotoId]) -> Result<SessionChange, AppError> {
+        let core_ids: Vec<CorePhotoId> = ids.iter().map(|id| core_id(*id)).collect();
+        let outcome = self.core.remove_photos(&core_ids);
+        if !outcome.removed.is_empty() {
+            self.thumbs.forget(&outcome.removed);
+            let gone: Vec<u32> = outcome.removed.iter().map(|id| id.0).collect();
+            self.frames.set_aside_photos(&gone);
+            self.sync_current();
+            self.estimates_moved(&outcome.estimates_changed);
+        }
+        Ok(SessionChange {
+            photo_ids: outcome.removed.iter().map(|id| PhotoId(id.0)).collect(),
+            already_open: 0,
+            session: self.session_state()?,
+        })
+    }
+
+    /// `restore_photos`: Undo of the last `remove_photos` ([`ym_core::app::Core::restore_photos`]): the photos come back where
+    /// they were with their settings, their thumbnails are announced again at once, and the photo on screen is the one that was
+    /// on screen when the removal took it away, unless the person has moved on. Answers an empty change when there is nothing
+    /// to put back.
+    ///
+    /// # Errors
+    ///
+    /// [`AppError`] only if the shapes of the core and of the bridge disagree (a bug).
+    pub fn restore_photos(&self) -> Result<SessionChange, AppError> {
+        let outcome = self.core.restore_photos();
+        if !outcome.restored.is_empty() {
+            let back: Vec<u32> = outcome.restored.iter().map(|id| id.0).collect();
+            for (id, url) in self.frames.bring_back_photos(&back) {
+                self.emitter.emit(AppEvent::ThumbnailReady(ThumbnailReady {
+                    id: PhotoId(id),
+                    url,
+                }));
+            }
+            self.sync_current();
+            self.estimates_moved(&outcome.estimates_changed);
+        }
+        Ok(SessionChange {
+            photo_ids: outcome.restored.iter().map(|id| PhotoId(id.0)).collect(),
+            already_open: u32::try_from(outcome.already_open).unwrap_or(u32::MAX),
+            session: self.session_state()?,
+        })
+    }
+
+    /// Photos that stay in the session had their shared estimates made again (a burst lost or regained a frame): they get a new
+    /// thumbnail. The webview is told to read their settings again, which show the exposure and the Apple Auto values the burst now
+    /// shares, by the event sink: the core sent each of them `estimates_changed` before the command returned, which the sink turns
+    /// into `settings_changed` for every cause (an Apple Auto answer, a burst's median, a removal).
+    fn estimates_moved(&self, ids: &[CorePhotoId]) {
+        self.thumbs.refresh(ids.iter().copied());
     }
 
     /// Tells the renderer and the viewport which photo is current.
@@ -974,6 +1067,17 @@ impl AppApi {
         // The display rendering may have changed what the viewport shows.
         self.viewport.invalidate();
         convert(&next)
+    }
+
+    /// `apple_auto_status`: whether Apple Auto is available on this computer, read again now, and
+    /// whether it acts (`docs/19` sections 1 and 2). Preferences asks when it opens and shows its
+    /// row only while Apple Auto is available.
+    ///
+    /// # Errors
+    ///
+    /// [`AppError::internal`] when the answer does not cross the bridge (a bug).
+    pub fn apple_auto_status(&self) -> Result<AppleAutoStatus, AppError> {
+        convert(&self.core.apple_auto_status())
     }
 
     /// `install_cli_link`.

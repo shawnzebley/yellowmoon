@@ -31,10 +31,11 @@ esac
 
 git lfs version >/dev/null 2>&1 || { echo "error: Git LFS is required (https://git-lfs.com)" >&2; exit 127; }
 if [ -d "$dest/.git" ]; then
+  git -C "$dest" remote set-url origin https://github.com/ngriaznov/yellowmoon.git
   git -C "$dest" fetch --quiet --depth 1 origin readme-photos
   git -C "$dest" checkout --quiet --force FETCH_HEAD
 else
-  git clone --quiet --depth 1 --branch readme-photos --single-branch "$(git -C "$root" remote get-url origin)" "$dest"
+  git clone --quiet --depth 1 --branch readme-photos --single-branch "https://github.com/ngriaznov/yellowmoon.git" "$dest"
 fi
 git -C "$dest" lfs pull
 verify || exit 1

@@ -2,6 +2,9 @@ import { expect, test } from "@playwright/test";
 import type { Page } from "@playwright/test";
 import { configureMock, failNext, lookTilesLoaded, openApp, openPhotos, recordCalls, setUpdateState, setValue, settle, showUpdateReady, watchErrors } from "./helpers/app";
 
+/** A manual contrast or saturation (`docs/19` section 5: Auto or a value). */
+const manual = (value: number) => ({ kind: "manual", value }) as const;
+
 // Photos screen (tasks M3-06, M3-07, M3-08 UI) in a real browser against the mocked API: layout, the
 // flow Start → open → look → every tab, keyboard shortcuts, Crop and Pick white by mouse, and the error
 // states. Screenshot comparisons are in screenshots.spec.ts.
@@ -114,17 +117,19 @@ test.describe("the flow", () => {
     }
   });
 
-  test("a look picked with Apply to = All reaches every photo's thumbnail; This photo keeps the others", async ({ page }) => {
+  test("a look picked keeps the other photos' thumbnails (Apply to starts on This photo); All reaches every photo's thumbnail", async ({ page }) => {
     await photos(page);
-    const before = await page.locator(".ym-filmstrip__thumb img").first().getAttribute("src");
-    await page.getByRole("button", { name: "Night blue look, key 8" }).click();
-    await expect.poll(async () => page.locator(".ym-filmstrip__thumb img").first().getAttribute("src")).not.toBe(before);
-    await page.getByRole("radio", { name: "This photo" }).click();
-    const second = await page.locator(".ym-filmstrip__thumb img").nth(1).getAttribute("src");
+    const thumb = (n: number) => page.locator(".ym-filmstrip__thumb img").nth(n);
+    await expect(page.getByRole("radio", { name: "This photo" })).toHaveAttribute("aria-checked", "true");
+    const second = await thumb(1).getAttribute("src");
     await page.getByRole("button", { name: "Film warm look, key 3" }).click();
     await expect(page.getByRole("img", { name: /Film warm/ })).toBeVisible();
     await page.waitForTimeout(150);
-    expect(await page.locator(".ym-filmstrip__thumb img").nth(1).getAttribute("src")).toBe(second);
+    expect(await thumb(1).getAttribute("src")).toBe(second);
+    await page.getByRole("radio", { name: /^All/ }).click();
+    const before = await thumb(0).getAttribute("src");
+    await page.getByRole("button", { name: "Night blue look, key 8" }).click();
+    await expect.poll(async () => thumb(0).getAttribute("src")).not.toBe(before);
   });
 
   test("look thumbnails load lazily: the tiles in view first, the rest as they scroll into view, all decodable", async ({ page }) => {
@@ -591,7 +596,7 @@ test("a folder of 500 photos: the first one opens while the rest develop, and th
 
 test("settings made before the session opens come through the mock (initialSettings)", async ({ page }) => {
   await openApp(page, MOCKUP);
-  await configureMock(page, { initialSettings: { DSC04204: { highlights: -18, shadows: 12, saturation: 6 } } });
+  await configureMock(page, { initialSettings: { DSC04204: { highlights: manual(-18), shadows: manual(12), saturation: manual(6) } } });
   await openPhotos(page);
   await page.keyboard.press("Meta+2");
   await expect(valueBox(page, "Highlights")).toHaveValue("−18");
