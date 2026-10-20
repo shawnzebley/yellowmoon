@@ -427,7 +427,8 @@ jobs:
         if: ${{ !cancelled() && steps.owner.outputs.cache-hit != 'true' }}
         uses: actions/checkout@v4
         with:
-          ref: readme-photos
+          repository: ngriaznov/yellowmoon
+          ref: 52a19c660c151b8a78d0bdd86e1bc597ff625c8b # readme-photos; pinned with owner-photos.sha256
           lfs: true
           path: testdata/readme-photos/src
           persist-credentials: false

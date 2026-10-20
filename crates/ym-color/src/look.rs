@@ -93,10 +93,10 @@ pub const MAX_PROFILE_POINTS: usize = 64;
 /// Largest chroma multiplier a curve may ask for.
 pub const MAX_SATURATION_FACTOR: f64 = 8.0;
 
-/// The largest value a parametric look's CDL may reach on the unit cube of LogC4 inputs, before its
-/// saturation. A real look stays within about -0.5 to 2; a slope and power that send white to 1000 or
-/// beyond (or to infinity: slope 5.9 with power 1405 does) leave nothing usable, and the hue curves
-/// after the CDL would turn such values into NaN.
+/// Upper limit on the conservative magnitude bound of a parametric look's CDL,
+/// including the preceding luma-curve shift and its saturation. Real looks stay
+/// within about -0.5 to 2; extreme values leave nothing usable and can overflow
+/// the hue maths or the baked cube's f32 samples.
 pub const CDL_OUTPUT_LIMIT: f64 = 1000.0;
 
 /// What a look expects as input (`docs/08-looks.md`).
@@ -150,12 +150,12 @@ pub enum LookError {
     Lut(#[from] LutError),
     /// The CDL sends a LogC4 input inside the unit cube beyond [`CDL_OUTPUT_LIMIT`].
     #[error(
-        "CDL: the {channel} channel reaches {value:e} at white; a look's CDL must stay below {CDL_OUTPUT_LIMIT}"
+        "CDL: the {channel} channel reaches {value:e} at its maximum input; a look's CDL must stay below {CDL_OUTPUT_LIMIT}"
     )]
     CdlOutOfRange {
-        /// `red`, `green` or `blue`.
+        /// `red`, `green`, `blue` or `saturation`.
         channel: &'static str,
-        /// What the slope, offset and power make of an input of 1.0 (may be infinite).
+        /// Upper bound after slope, offset and power (may be infinite).
         value: f64,
     },
 }
@@ -621,13 +621,31 @@ impl ParametricLook {
             Some(c) => Cdl::new(c.slope, c.offset, c.power, c.saturation)?,
             None => Cdl::identity(),
         };
-        // Slope >= 0 and power > 0 make each channel's slope-offset-power rise with its input, so an input
-        // of 1.0 gives its largest value on the unit cube.
+        // The luma curve shifts all channels by T(L) - L before the CDL. Its values
+        // and L are in [0, 1] (and its continuation has slope 1), so this can add
+        // at most 1 to a unit-cube input. Checking white before that shift missed
+        // overflow at interior colours with a very large CDL power.
+        let max_input = if luma_curve.is_some() { 2.0 } else { 1.0 };
+        let mut max_sop = 0.0f64;
         for (k, channel) in ["red", "green", "blue"].into_iter().enumerate() {
-            let value = (cdl.slope[k] + cdl.offset[k]).max(0.0).powf(cdl.power[k]);
+            let value = (max_input * cdl.slope[k] + cdl.offset[k])
+                .max(0.0)
+                .powf(cdl.power[k]);
             if value.is_nan() || value >= CDL_OUTPUT_LIMIT {
                 return Err(LookError::CdlOutOfRange { channel, value });
             }
+            max_sop = max_sop.max(value);
+        }
+        // Positive Rec.709 weights sum to one. For saturation <= 1 the CDL is
+        // a convex combination; above 1 its magnitude is bounded by s * max_sop.
+        // Limit the result too, so finite but huge saturation cannot overflow
+        // the subsequent chroma maths or the baked cube's f32 samples.
+        let saturated_bound = max_sop * cdl.saturation.max(1.0);
+        if !saturated_bound.is_finite() || saturated_bound >= CDL_OUTPUT_LIMIT {
+            return Err(LookError::CdlOutOfRange {
+                channel: "saturation",
+                value: saturated_bound,
+            });
         }
         let hue_key = (0.0, 360.0, false);
         check_points(
@@ -827,6 +845,45 @@ mod tests {
             ParametricLook::from_json(&over),
             Err(LookError::CdlOutOfRange {
                 channel: "blue",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn a_luma_curve_cannot_hide_cdl_overflow_at_an_interior_colour() {
+        let input = include_str!("../fuzz/corpus/look_json/luma-cdl-overflow.json");
+        assert!(matches!(
+            ParametricLook::from_json(input),
+            Err(LookError::CdlOutOfRange {
+                channel: "green",
+                ..
+            })
+        ));
+        // The same curve with an ordinary power remains usable, including baking.
+        let safe = input.replace("333333333333333331", "2");
+        let look = ParametricLook::from_json(&safe).unwrap();
+        for r in 0..=4 {
+            for g in 0..=4 {
+                for b in 0..=4 {
+                    let rgb = [r, g, b].map(|v| f64::from(v) / 4.0);
+                    assert!(look.evaluate(rgb).iter().all(|v| v.is_finite()));
+                }
+            }
+        }
+        look.bake(5).unwrap();
+        look.to_transform().unwrap();
+    }
+
+    #[test]
+    fn saturation_cannot_overflow_an_accepted_look() {
+        let input = r#"{"schema":"yellowmoon.parametric-look/1","name":"overflow",
+            "cdl":{"slope":[1,1,1],"offset":[0,0,0],"power":[1,1,1],
+            "saturation":1e308}}"#;
+        assert!(matches!(
+            ParametricLook::from_json(input),
+            Err(LookError::CdlOutOfRange {
+                channel: "saturation",
                 ..
             })
         ));

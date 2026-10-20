@@ -64,6 +64,11 @@ Application maths is in `docs/02-colour-pipeline.md` (C10). Intensity 0–100% p
 
 `luma_curve` is a tone curve on the luminance of the pixel: 2 to 16 points `{ "x", "y" }` in [0, 1]² with `x` strictly increasing, where `x` is the LogC4 code value of the AWG4 luminance (`LogC4::luma`, the `L` of the Curve tab's luma curve) and `y` what it becomes. It is applied as `v += T(L) - L` on all three channels, so it moves tone and leaves the differences between the channels in LogC4 (hue, chroma) alone. `T` is the monotone cubic of `ym_color::curve::Curve`; it holds its end values between 0 and the first point and between the last point and 1, and continues with slope 1 below 0 and above 1. Points on `y = x` from 0 to 1 are the identity. Its `x` is not the `luma` of `luma_vs_sat`, which is the Rec.709-weighted luma of the codes; the two are never mixed. `hue_vs_sat` and `luma_vs_sat` values multiply the chroma (0 to 8); `hue_vs_hue` values are degrees (±180, positive turns red towards yellow). Hue is in degrees on the LogC4 hue circle (0 red, 60 yellow, 120 green, 180 cyan, 240 blue, 300 magenta), `luma` is the Rec.709-weighted LogC4 luma in [0, 1]. At most 64 points per curve; the curves are monotone (Fritsch–Carlson) splines, periodic for hue, so they never overshoot the values given. The order is `luma_curve`, then the CDL, then the hue and luma-vs-saturation curves, which see the CDL output and keep its luma. Full details: the module documentation of `crates/ym-color/src/look.rs`.
 
+The loader rejects a CDL whose conservative output bound reaches 1000, including
+up to one code value of lift from a nonidentity luma curve and the CDL saturation.
+This is checked before baking: a finite JSON power can otherwise overflow at an
+interior colour even when the unshifted white endpoint is safe.
+
 ## Library folder
 
 ```

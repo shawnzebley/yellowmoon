@@ -8,6 +8,36 @@ Repository: github.com/ngriaznov/yellowmoon · Domain: not given yet (the handov
 
 Work is on `main`; releases are cut from it (`docs/12`). Commits are authored as ngriaznov; links below are to commits.
 
+## Fork CI repair (2026-10-20)
+
+Repository under repair: `shawnzebley/yellowmoon`, Windows port of upstream.
+The Windows workflow at `36978c9` passed (run 39084003855); the failed alerts
+are from the broader CI workflow.
+
+- **Look JSON crash fixed:** run 39394324276, job 118533164664 found a finite
+  green power of 333333333333333331 that passed the white-only CDL check but
+  overflowed after the luma curve lifted an interior colour. Validation now
+  bounds the preceding curve shift and the CDL saturation before accepting the
+  look. The exact crash is a fuzz seed and a unit regression; ordinary curves
+  still evaluate and bake. No existing look's pixel maths changed.
+- **Owner-photo source fixed:** `golden-gpu` tried to check out `readme-photos`
+  from this fork, which has no such branch. CI now names upstream explicitly
+  and pins commit `52a19c6`; the local fetcher also uses upstream, including
+  existing checkouts. Downloaded all six files locally and verified every SHA-256.
+- **Still failing, not waived:** the nightly full GPU golden comparison in run
+  39394324276 exceeded the max DeltaE00 gate on 8 of 61 synthetic images
+  (worst 4.371, gate 3.8; 53 passed). This is separate from the missing photos.
+  The project's existing notes describe sensitivity of the output-sharpening
+  rank limiter to CPU/GPU rounding, but this run's precise cause has not been
+  established. No thresholds, expected images, subsets or GPU policies were
+  changed. It needs GPU reproduction and diagnosis before the whole CI failure
+  can be called resolved; this Linux environment has no Vulkan driver.
+
+Validation: all 582 `ym-color` tests passed (9 ignored); clippy for all
+`ym-color` targets passed with warnings denied; Rust formatting, workflow YAML,
+`bash -n` and whitespace checks passed. Full workspace, frontend and Metal checks
+are left to CI; no app shell or frontend code changed.
+
 ## Current milestone
 
 M0–M3 were built in parallel in one session (2026-10-12), each task implemented and then independently reviewed. Integration is done: ym-core (session, render pipeline, export queue), the `ym` CLI, the Tauri app, the frontend wired to it, the golden runner and dngfit. A review pass followed, and on 2026-10-13 the raw-algorithm work (below) changed the R6 and sharpening defaults. M4 hasn't started.
