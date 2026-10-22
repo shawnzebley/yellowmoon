@@ -8,6 +8,28 @@ Repository: github.com/ngriaznov/yellowmoon · Domain: not given yet (the handov
 
 Work is on `main`; releases are cut from it (`docs/12`). Commits are authored as ngriaznov; links below are to commits.
 
+## Windows fork TLS dependency repair (2026-10-22)
+
+The October 21 and 22 scheduled CI runs failed only the `deny` job:
+RUSTSEC-2026-0382 (`rustls-webpki` 0.103.15) and RUSTSEC-2026-0383
+(`webpki-root-certs` 1.0.9). Update the lockfile to 0.103.16 and 1.0.10,
+respectively, using the published crates.io checksums. Both patches retain
+the same dependency graph and features; no application code, advisory
+exceptions, licence policy or image thresholds change. Existing Apache-compatible
+dependency licences are checked by `deny` and the bundle licence jobs.
+
+Validation: [PR #2 CI](https://github.com/shawnzebley/yellowmoon/actions/runs/39757117685)
+passed all 20 active jobs at `89661b0`: formatting, clippy, workspace tests,
+frontend/build, browser tests, licence checks, DNG validation, CPU/GPU and
+app/CLI parity. The full GPU golden set passed 61/61 at the unchanged DeltaE00
+3.8 limit, and the owner-photo GPU check passed. The `deny` job reports
+advisories, bans, licences and sources all OK.
+[Windows](https://github.com/shawnzebley/yellowmoon/actions/runs/39757117635)
+passed the installer build and synthetic A7C II JPEG/TIFF render checks.
+Only this validation record was updated after those runs; the tested lockfile
+and application code are unchanged. Validation used GitHub-hosted runners;
+no local Mac UI or Metal check is claimed.
+
 ## Windows fork upstream sync (2026-10-20)
 
 Merged upstream `b9791e2eec05b1ae0359c6f86d2280ce85b305e3` (62 commits since
