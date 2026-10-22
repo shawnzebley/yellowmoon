@@ -18,8 +18,17 @@ the same dependency graph and features; no application code, advisory
 exceptions, licence policy or image thresholds change. Existing Apache-compatible
 dependency licences are checked by `deny` and the bundle licence jobs.
 
-Validation: PR CI and Windows installer/render checks are pending. This change
-is validated on GitHub-hosted runners; no local Mac UI or Metal check is claimed.
+Validation: [PR #2 CI](https://github.com/shawnzebley/yellowmoon/actions/runs/39757117685)
+passed all 20 active jobs at `89661b0`: formatting, clippy, workspace tests,
+frontend/build, browser tests, licence checks, DNG validation, CPU/GPU and
+app/CLI parity. The full GPU golden set passed 61/61 at the unchanged DeltaE00
+3.8 limit, and the owner-photo GPU check passed. The `deny` job reports
+advisories, bans, licences and sources all OK.
+[Windows](https://github.com/shawnzebley/yellowmoon/actions/runs/39757117635)
+passed the installer build and synthetic A7C II JPEG/TIFF render checks.
+Only this validation record was updated after those runs; the tested lockfile
+and application code are unchanged. Validation used GitHub-hosted runners;
+no local Mac UI or Metal check is claimed.
 
 ## Windows fork upstream sync (2026-10-20)
 
