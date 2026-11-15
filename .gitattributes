@@ -1,4 +1,6 @@
-# Data files are checked byte for byte against their SHA256SUMS (tools/licences/generate.py and the
-# loaders). Git on Windows would turn LF into CRLF in the text ones (JSON profiles, LICENSE files) and
-# break the hashes, so nothing under data/ gets line-ending conversion.
+# Every folder with a SHA256SUMS file is checked byte for byte (tools/licences/generate.py and the
+# loaders). Git on Windows would turn LF into CRLF in the text files there (JSON profiles, LICENSE
+# files) and break the hashes, so these folders get no line-ending conversion. A new SHA256SUMS
+# folder outside data/ needs its own line here.
 data/** -text
+crates/ym-film/tests/oracle/** -text
