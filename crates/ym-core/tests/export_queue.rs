@@ -18,6 +18,7 @@ use ym_core::pipeline::{
 };
 use ym_core::session::{ApplyScope, OpenOptions, PhotoId, Session};
 use ym_core::settings::SettingsPatch;
+use ym_core::settings::{GradePatch, NodeId, NodePatch};
 use ym_export::{ExportOptions, IfExists};
 use ym_looks::library::LookId;
 
@@ -258,11 +259,17 @@ fn settings_are_snapshotted_when_the_job_is_queued() {
         f.session
             .update_settings(
                 *id,
-                &SettingsPatch {
-                    saturation: Some(ym_core::settings::PercentSetting::manual_value(60.0)),
-                    contrast: Some(ym_core::settings::PercentSetting::manual_value(-30.0)),
-                    ..SettingsPatch::exposure_ev(1.5)
-                },
+                &SettingsPatch::exposure_ev(1.5).and(
+                    NodeId::MAIN,
+                    NodePatch {
+                        grade: Some(GradePatch {
+                            saturation: Some(ym_core::settings::PercentSetting::manual_value(60.0)),
+                            contrast: Some(ym_core::settings::PercentSetting::manual_value(-30.0)),
+                            ..GradePatch::default()
+                        }),
+                        ..NodePatch::default()
+                    },
+                ),
             )
             .expect("edit");
     }
@@ -434,13 +441,6 @@ impl LookProvider for Looks {
             )),
         }
     }
-
-    fn display_transform(
-        &self,
-        id: &LookId,
-    ) -> Result<(ym_color::display::DisplayTransform, String), LookProblem> {
-        NeutralOnly.display_transform(id)
-    }
 }
 
 #[test]
@@ -456,10 +456,13 @@ fn one_photo_that_fails_does_not_stop_the_job() {
     f.session
         .update_settings(
             f.ids[1],
-            &SettingsPatch {
-                look: Some(LookId::parse("arri:3000:gone").expect("id")),
-                ..SettingsPatch::default()
-            },
+            &SettingsPatch::default().and(
+                NodeId::Output,
+                NodePatch {
+                    look: Some(LookId::parse("arri:3000:gone").expect("id")),
+                    ..NodePatch::default()
+                },
+            ),
         )
         .expect("edit");
     let id = queue
@@ -486,8 +489,81 @@ fn one_photo_that_fails_does_not_stop_the_job() {
     let s = queue.summary(id).expect("summary");
     assert_eq!((s.saved, s.failed, s.skipped, s.done), (2, 1, 0, 3));
     assert_eq!(s.state, JobState::Finished);
+    // A failure about one photo does not stop the job.
+    assert_eq!((s.stopped, s.not_tried), (None, 0));
+    assert!(progress(&events).iter().all(|e| !e.stopped));
     assert_eq!(s.errors.len(), 1);
     assert_eq!(s.errors[0].file, "DSC00002_gone.jpg");
+}
+
+#[test]
+fn a_file_that_went_away_or_changed_before_its_turn_fails_with_its_sentence_and_the_job_goes_on() {
+    // `docs/26` P1-4: the check is made when the photo's turn comes, not when it is queued.
+    let f = folder(5, 300, 200);
+    let (home, out) = (
+        tempfile::tempdir().expect("h"),
+        tempfile::tempdir().expect("o"),
+    );
+    let (_ctx, queue, rx) = neutral_queue(home.path());
+    // The first two photos are cached (the current photo and its neighbour); these are not.
+    let gone = f._dir.path().join("DSC00003.ARW");
+    let cut = f._dir.path().join("DSC00004.ARW");
+    assert!(!f.session.cached_ids().contains(&f.ids[2]));
+    assert!(!f.session.cached_ids().contains(&f.ids[3]));
+    let id = queue
+        .start(&f.session, &job(ApplyScope::All, out.path()), false)
+        .expect("queued");
+    // Between queueing and its turn.
+    std::fs::remove_file(&gone).expect("remove");
+    let bytes = std::fs::read(&cut).expect("read");
+    std::fs::write(&cut, &bytes[..bytes.len() / 2]).expect("cut");
+    let events = until_idle(&rx);
+
+    let s = queue.summary(id).expect("summary");
+    assert_eq!((s.saved, s.failed, s.skipped, s.done), (3, 2, 0, 5));
+    assert_eq!(s.state, JobState::Finished);
+    // A file that failed is that photo's failure: the job is not stopped (that is for the destination).
+    assert_eq!((s.stopped, s.not_tried), (None, 0));
+    assert_eq!(
+        names_in(out.path()),
+        vec![
+            "DSC00001_neutral.jpg",
+            "DSC00002_neutral.jpg",
+            "DSC00005_neutral.jpg"
+        ]
+    );
+    let failures: Vec<_> = progress(&events)
+        .into_iter()
+        .filter_map(|e| e.error.as_deref().map(|m| (e.file.as_str(), m)))
+        .collect();
+    assert_eq!(
+        failures,
+        vec![
+            ("DSC00003_neutral.jpg", ym_raw::error::MESSAGE_NOT_FOUND),
+            ("DSC00004_neutral.jpg", ym_core::media::CHANGED_MESSAGE),
+        ]
+    );
+    assert!(progress(&events).iter().all(|e| !e.stopped));
+    assert_eq!(
+        progress(&events).last().map(|e| (e.done, e.total)),
+        Some((5, 5))
+    );
+    // The same sentences are in the summary the panel and `ym` read.
+    assert_eq!(s.errors.len(), 2);
+    assert_eq!(s.errors[0].message, ym_raw::error::MESSAGE_NOT_FOUND);
+    assert_eq!(s.errors[1].message, ym_core::media::CHANGED_MESSAGE);
+    // And the session says the same about the photos.
+    for (photo, sentence) in [
+        (f.ids[2], ym_raw::error::MESSAGE_NOT_FOUND),
+        (f.ids[3], ym_core::media::CHANGED_MESSAGE),
+    ] {
+        assert_eq!(
+            f.session.status(photo),
+            Some(ym_core::session::PhotoStatus::Skipped {
+                reason: sentence.to_owned()
+            })
+        );
+    }
 }
 
 #[test]
@@ -673,10 +749,16 @@ fn the_estimate_counts_bytes_seconds_and_what_a_command_cannot_carry() {
     f.session
         .update_settings(
             f.ids[0],
-            &SettingsPatch {
-                saturation: Some(ym_core::settings::PercentSetting::manual_value(10.0)),
-                ..SettingsPatch::default()
-            },
+            &SettingsPatch::default().and(
+                NodeId::MAIN,
+                NodePatch {
+                    grade: Some(GradePatch {
+                        saturation: Some(ym_core::settings::PercentSetting::manual_value(10.0)),
+                        ..GradePatch::default()
+                    }),
+                    ..NodePatch::default()
+                },
+            ),
         )
         .expect("edit");
     assert_eq!(queue.estimate(&f.session, &jpeg).adjusted_photos, 1);
@@ -1000,10 +1082,13 @@ fn each_photo_gets_a_file_event_with_the_report_for_the_clis_json() {
     f.session
         .update_settings(
             f.ids[1],
-            &SettingsPatch {
-                look: Some(LookId::parse("arri:3000:gone").expect("id")),
-                ..SettingsPatch::default()
-            },
+            &SettingsPatch::default().and(
+                NodeId::Output,
+                NodePatch {
+                    look: Some(LookId::parse("arri:3000:gone").expect("id")),
+                    ..NodePatch::default()
+                },
+            ),
         )
         .expect("edit");
     let mut j = job(ApplyScope::All, out.path());

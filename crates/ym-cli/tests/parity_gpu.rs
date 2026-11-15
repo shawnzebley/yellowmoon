@@ -16,13 +16,25 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use common::{Sandbox, data_dir, names_in};
-use ym_core::app::gpu::{GpuPolicy, GpuSlot, open_gpu};
+use ym_core::app::gpu::{GpuPolicy, GpuSlot};
 use ym_core::app::{Core, CoreOptions};
 use ym_core::export_queue::ExportJob;
 use ym_core::scheduler::MemoryBudget;
 use ym_core::session::{ApplyScope, OpenOptions};
+use ym_core::settings::DevelopSettings;
+use ym_core::settings::{LensKind, LensPatch, SettingsPatch};
+use ym_core::settings::{NodeId, NodePatch};
 use ym_export::{BitDepth, ExportOptions, FormatKind};
 use ym_gpu::device::gpu_required_by_env;
+
+/// The tests of this file run one at a time: they share a software rasteriser on a CI runner, and a lens export is
+/// heavy enough to push the others past the device's hang limit when they run beside it (a render that fell back
+/// to the CPU is a different file).
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 /// Whether the slot holds a device; says so, loudly, when it does not (and fails when the environment
 /// demands one).
@@ -41,12 +53,13 @@ fn slot_has_device(slot: &GpuSlot) -> bool {
 
 /// Whether a device opens under the `On` policy.
 fn device_opens() -> bool {
-    slot_has_device(&open_gpu(GpuPolicy::On, MemoryBudget::detect()))
+    slot_has_device(&ym_apple::gpu_opener(GpuPolicy::On, MemoryBudget::detect()).open())
 }
 
 /// The app's side: a core over its own app folder with the device attached.
 struct App {
     core: Core,
+    photo: ym_core::session::PhotoId,
     slot: GpuSlot,
     _home: tempfile::TempDir,
 }
@@ -55,12 +68,17 @@ impl App {
     /// Opens `files` with the device of the `On` policy attached, or `None` (with a notice) when
     /// there is no adapter.
     fn open(files: &[&Path]) -> Option<Self> {
-        let slot = open_gpu(GpuPolicy::On, MemoryBudget::detect());
+        Self::open_with(files, data_dir())
+    }
+
+    /// [`App::open`] over the data folder `data`.
+    fn open_with(files: &[&Path], data: PathBuf) -> Option<Self> {
+        let slot = ym_apple::gpu_opener(GpuPolicy::On, MemoryBudget::detect()).open();
         if !slot_has_device(&slot) {
             return None;
         }
         let home = tempfile::tempdir().expect("tempdir");
-        let mut options = CoreOptions::new(data_dir(), home.path().to_path_buf());
+        let mut options = CoreOptions::new(data, home.path().to_path_buf());
         // What the CLI does: no thumbnail renders competing with the export.
         options.thumbnails = false;
         let core = Core::open(options).expect("core");
@@ -72,8 +90,10 @@ impl App {
             core.session.wait_idle(Duration::from_secs(120)),
             "the photos develop"
         );
+        let photo = outcome.added[0];
         Some(Self {
             core,
+            photo,
             slot,
             _home: home,
         })
@@ -105,8 +125,19 @@ fn bytes(path: &Path) -> Vec<u8> {
 
 /// Runs the binary on `inputs` with the device switched on, `flags` extra, writing to `dir`.
 fn cli_export(sb: &Sandbox, inputs: &[&Path], flags: &[&str], dir: &Path) -> Vec<PathBuf> {
+    cli_export_in(sb, &data_dir(), inputs, flags, dir)
+}
+
+/// [`cli_export`] reading the data folder `data`.
+fn cli_export_in(
+    sb: &Sandbox,
+    data: &Path,
+    inputs: &[&Path],
+    flags: &[&str],
+    dir: &Path,
+) -> Vec<PathBuf> {
     let out = sb
-        .ym()
+        .ym_data(data)
         .env("YELLOWMOON_GPU", "on")
         .args(["render", "--apple-auto", "off"])
         .args(inputs)
@@ -143,6 +174,7 @@ fn assert_same_files(a: &[PathBuf], b: &[PathBuf], what: &str) {
 /// jobs and the tile seams are part of the comparison.
 #[test]
 fn a_jpeg_of_several_tiles_is_byte_identical_through_the_app_path_and_the_binary_on_the_device() {
+    let _serial = serial();
     let sb = Sandbox::new();
     let arw = sb.arw_sized("big.ARW", 2100, 1100, 9);
     let Some(app) = App::open(&[&arw]) else {
@@ -162,8 +194,254 @@ fn a_jpeg_of_several_tiles_is_byte_identical_through_the_app_path_and_the_binary
     assert_eq!(names_in(&sb.root().join("cli")).len(), 1);
 }
 
+/// A Brush row with Grow, Feather and Refine edges beside a Radial (N-13, `docs/10`), on a photo of six export tiles:
+/// each tile is coloured over itself grown by the raster planes' halo, and the app and the binary write the same
+/// bytes in a JPEG and a 16-bit TIFF, which are not the files of the same graph without the brush.
+#[test]
+fn a_brush_with_grow_feather_and_refine_edges_is_byte_identical_through_the_app_path_and_the_binary_on_the_device()
+ {
+    let _serial = serial();
+    let sb = Sandbox::new();
+    let arw = sb.arw_sized("brush.ARW", 2100, 1100, 9);
+    let Some(app) = App::open(&[&arw]) else {
+        return;
+    };
+    let doc = |brush: bool| {
+        let mut rows = vec![serde_json::json!({
+            "kind": "radial", "mode": "add", "center": [0.7, 0.45], "radii": [0.2, 0.12],
+            "angle_deg": 15, "feather": 0.4
+        })];
+        if brush {
+            rows.push(serde_json::json!({
+                "kind": "brush", "mode": "add", "grow": 0.3, "feather": 0.35, "refine": 0.7,
+                "strokes": [
+                    { "size": 0.12, "hardness": 0.3, "erase": false,
+                      "points": [[0.1, 0.3], [0.35, 0.6], [0.6, 0.35], [0.9, 0.65]] },
+                    { "size": 0.04, "hardness": 1, "erase": true, "points": [[0.35, 0.6]] }
+                ]
+            }));
+        }
+        serde_json::json!({ "nodes": { "items": [
+            { "id": 2, "kind": "corrector", "pos": [1, 0], "trim": { "exposure_ev": 0.8 },
+              "masks": { "invert": false, "items": rows } }
+        ], "links": [
+            { "from": { "node": "input", "port": "picture" }, "to": { "node": 1, "port": "picture" } },
+            { "from": { "node": 1, "port": "picture" }, "to": { "node": 2, "port": "picture" } },
+            { "from": { "node": 2, "port": "picture" }, "to": { "node": "output", "port": "picture" } }
+        ] } })
+    };
+    let settings_of = |doc: serde_json::Value| {
+        DevelopSettings::from_value(doc, &app.core.looks.effective_default())
+            .expect("settings")
+            .0
+    };
+    let file = sb.root().join("brush.json");
+    std::fs::write(&file, doc(true).to_string()).expect("write");
+    let tiff = || ExportOptions {
+        format: FormatKind::Tiff,
+        bit_depth: BitDepth::Sixteen,
+        ..ExportOptions::default()
+    };
+    app.core
+        .session
+        .replace_settings(app.photo, settings_of(doc(false)))
+        .expect("replace");
+    let without = app.export(tiff(), &sb.root().join("app-without"));
+    app.core
+        .session
+        .replace_settings(app.photo, settings_of(doc(true)))
+        .expect("replace");
+    for (name, options, flags) in [
+        ("jpeg", ExportOptions::default(), vec!["--format", "jpeg"]),
+        ("tiff16", tiff(), vec!["--format", "tiff", "--bits", "16"]),
+    ] {
+        let from_app = app.export(options, &sb.root().join(format!("app-{name}")));
+        let mut args = flags;
+        args.extend(["--settings", file.to_str().expect("utf-8")]);
+        let from_cli = cli_export(&sb, &[&arw], &args, &sb.root().join(format!("cli-{name}")));
+        assert_same_files(&from_app, &from_cli, &format!("a brush, {name}"));
+        if name == "tiff16" {
+            assert!(
+                bytes(&from_app[0]) != bytes(&without[0]),
+                "the brush changed no pixel"
+            );
+        }
+    }
+}
+
+/// An Object row (N-18, `docs/10`) on a photo of six export tiles, on the device: SAM's plane is made on the CPU from the photo's picture
+/// (the CPU reference path, whatever the device), taken to each tile through the raster planes with their halos, and the app (which found
+/// the object with a click) and the binary (which makes the features itself at export time from the stored points) write the same
+/// bytes in a JPEG and a 16-bit TIFF, which are not the files of the same graph without the row.
+#[test]
+fn an_object_mask_is_byte_identical_through_the_app_path_and_the_binary_on_the_device() {
+    use ym_core::pipeline::{MaskFound, ObjectModel, ObjectPrompt};
+    let _serial = serial();
+    if !ObjectModel::probe(&data_dir()).is_some_and(|m| m.sam().is_ok()) {
+        assert!(
+            std::env::var_os("YM_REQUIRE_SAM2").is_none(),
+            "YM_REQUIRE_SAM2 is set and data/models/sam2 is missing"
+        );
+        eprintln!("\n* OBJECT TESTS SKIPPED in parity_gpu: no SAM weights (tools/fetch/sam2.sh)\n");
+        return;
+    }
+    let sb = Sandbox::new();
+    let arw = sb.arw_sized("object.ARW", 2100, 1100, 9);
+    let Some(app) = App::open(&[&arw]) else {
+        return;
+    };
+    let doc = |object: bool| {
+        let mut rows = vec![serde_json::json!({
+            "kind": "radial", "mode": "add", "center": [0.7, 0.45], "radii": [0.2, 0.12],
+            "angle_deg": 15, "feather": 0.4
+        })];
+        if object {
+            rows.push(serde_json::json!({
+                "kind": "object", "mode": "add", "grow": 0.1, "feather": 0.25, "refine": 0.6,
+                "points": [[0.5, 0.5, true], [0.9, 0.9, false]], "box": [0.1, 0.1, 0.9, 0.9]
+            }));
+        }
+        serde_json::json!({ "nodes": { "items": [
+            { "id": 2, "kind": "corrector", "pos": [1, 0], "trim": { "exposure_ev": 0.8 },
+              "masks": { "invert": false, "items": rows } }
+        ], "links": [
+            { "from": { "node": "input", "port": "picture" }, "to": { "node": 1, "port": "picture" } },
+            { "from": { "node": 1, "port": "picture" }, "to": { "node": 2, "port": "picture" } },
+            { "from": { "node": 2, "port": "picture" }, "to": { "node": "output", "port": "picture" } }
+        ] } })
+    };
+    let settings_of = |doc: serde_json::Value| {
+        DevelopSettings::from_value(doc, &app.core.looks.effective_default())
+            .expect("settings")
+            .0
+    };
+    let file = sb.root().join("object.json");
+    std::fs::write(&file, doc(true).to_string()).expect("write");
+    let tiff = || ExportOptions {
+        format: FormatKind::Tiff,
+        bit_depth: BitDepth::Sixteen,
+        ..ExportOptions::default()
+    };
+    app.core
+        .session
+        .replace_settings(app.photo, settings_of(doc(false)))
+        .expect("replace");
+    let without = app.export(tiff(), &sb.root().join("app-without"));
+    app.core
+        .session
+        .replace_settings(app.photo, settings_of(doc(true)))
+        .expect("replace");
+    // The click the person would have made: the model finds an object there on this photo (a row that found nothing would change no pixel).
+    let found = app
+        .core
+        .mask_find(
+            app.photo,
+            2,
+            1,
+            ObjectPrompt::Point {
+                x: 0.5,
+                y: 0.5,
+                positive: true,
+            },
+            &ym_gpu::queue::CancelToken::new(),
+        )
+        .expect("mask_find");
+    assert!(matches!(found, MaskFound::Found { .. }), "{found:?}");
+    for (name, options, flags) in [
+        ("jpeg", ExportOptions::default(), vec!["--format", "jpeg"]),
+        ("tiff16", tiff(), vec!["--format", "tiff", "--bits", "16"]),
+    ] {
+        let from_app = app.export(options, &sb.root().join(format!("app-{name}")));
+        let mut args = flags;
+        args.extend(["--settings", file.to_str().expect("utf-8")]);
+        let from_cli = cli_export(&sb, &[&arw], &args, &sb.root().join(format!("cli-{name}")));
+        assert_same_files(&from_app, &from_cli, &format!("an object, {name}"));
+        if name == "tiff16" {
+            assert!(
+                bytes(&from_app[0]) != bytes(&without[0]),
+                "the object row changed no pixel"
+            );
+        }
+    }
+}
+
+/// Not a gate, and slow (minutes on lavapipe): the time of a 24 MP export (6000 x 4000) through the binary with no
+/// mask, and with two Brush rows (Grow, Feather and Refine edges at 40 %, and Feather and Refine edges at 100 %).
+/// Run it with `--ignored --nocapture`; the numbers are in `docs/23` section 15.
+#[test]
+#[ignore = "a 24 MP export on lavapipe takes minutes; run by hand for the timings"]
+fn a_24_mp_export_with_two_raster_rows_is_timed_on_the_device() {
+    time_24_mp_exports("on", "the device");
+}
+
+/// The same export on the CPU reference path (`YELLOWMOON_GPU=off`): not a gate, and slower still.
+#[test]
+#[ignore = "a 24 MP export on the CPU takes minutes; run by hand for the timings"]
+fn a_24_mp_export_with_two_raster_rows_is_timed_on_the_cpu() {
+    time_24_mp_exports("off", "the CPU");
+}
+
+fn time_24_mp_exports(gpu: &str, where_: &str) {
+    use std::time::Instant;
+    let _serial = serial();
+    let sb = Sandbox::new();
+    let arw = sb.arw_sized("big.ARW", 6000, 4000, 9);
+    let row = |grow: f64, feather: f64, refine: f64, y: f64| {
+        serde_json::json!({
+            "kind": "brush", "mode": "add", "grow": grow, "feather": feather, "refine": refine,
+            "strokes": [ { "size": 0.2, "hardness": 0.5, "erase": false,
+                           "points": [[0.15, y], [0.5, y + 0.15], [0.85, y]] } ]
+        })
+    };
+    let doc = |rows: Vec<serde_json::Value>| {
+        serde_json::json!({ "nodes": { "items": [
+            { "id": 2, "kind": "corrector", "pos": [1, 0], "trim": { "exposure_ev": 0.8 },
+              "masks": { "invert": false, "items": rows } }
+        ], "links": [
+            { "from": { "node": "input", "port": "picture" }, "to": { "node": 1, "port": "picture" } },
+            { "from": { "node": 1, "port": "picture" }, "to": { "node": 2, "port": "picture" } },
+            { "from": { "node": 2, "port": "picture" }, "to": { "node": "output", "port": "picture" } }
+        ] } })
+    };
+    for (what, rows) in [
+        ("no mask rows", vec![]),
+        (
+            "two Brush rows",
+            vec![row(0.4, 0.4, 0.4, 0.3), row(0.0, 1.0, 1.0, 0.6)],
+        ),
+    ] {
+        let file = sb.root().join("timing.json");
+        std::fs::write(&file, doc(rows).to_string()).expect("write");
+        let dir = sb.root().join(what.replace(' ', "-"));
+        let t = Instant::now();
+        let out = sb
+            .ym()
+            .env("YELLOWMOON_GPU", gpu)
+            .args([
+                "render",
+                "--apple-auto",
+                "off",
+                "--format",
+                "jpeg",
+                "--settings",
+            ])
+            .arg(&file)
+            .arg(&arw)
+            .arg("--out")
+            .arg(&dir)
+            .assert()
+            .success();
+        let _ = out;
+        eprintln!(
+            "TIMING 24 MP export on {where_}, {what}: {:.1} s",
+            t.elapsed().as_secs_f64()
+        );
+    }
+}
+
 #[test]
 fn the_binary_gives_the_same_bytes_twice_and_with_one_and_several_photos_in_flight() {
+    let _serial = serial();
     let sb = Sandbox::new();
     sb.arw_sized("a.ARW", 2100, 1100, 9);
     sb.arw_sized("b.ARW", 1300, 900, 5);
@@ -189,6 +467,7 @@ fn the_binary_gives_the_same_bytes_twice_and_with_one_and_several_photos_in_flig
 /// device and no fall-back note was written.
 #[test]
 fn the_binary_really_renders_the_raw_chain_on_the_device_under_the_on_policy() {
+    let _serial = serial();
     let sb = Sandbox::new();
     let arw = sb.arw_sized("a.ARW", 1300, 900, 5);
     if !device_opens() {
@@ -216,6 +495,7 @@ fn the_binary_really_renders_the_raw_chain_on_the_device_under_the_on_policy() {
 /// A 16-bit TIFF keeps the pixels the JPEG quantises: the two front ends agree on every one.
 #[test]
 fn a_sixteen_bit_tiff_is_byte_identical_through_the_app_path_and_the_binary_on_the_device() {
+    let _serial = serial();
     let sb = Sandbox::new();
     let arw = sb.arw_sized("big.ARW", 1500, 1100, 3);
     let Some(app) = App::open(&[&arw]) else {
@@ -230,7 +510,7 @@ fn a_sixteen_bit_tiff_is_byte_identical_through_the_app_path_and_the_binary_on_t
     let from_cli = cli_export(
         &sb,
         &[&arw],
-        &["--format", "tiff", "--bits", "16", "--compression", "lzw"],
+        &["--format", "tiff", "--bits", "16"],
         &sb.root().join("cli"),
     );
     assert_same_files(&from_app, &from_cli, "tiff-16 on the device");
@@ -240,6 +520,7 @@ fn a_sixteen_bit_tiff_is_byte_identical_through_the_app_path_and_the_binary_on_t
 /// two front ends agree on every byte, the XMP, the preview and the 16-bit pixels included.
 #[test]
 fn a_dng_is_byte_identical_through_the_app_path_and_the_binary_on_the_device() {
+    let _serial = serial();
     let sb = Sandbox::new();
     let arw = sb.arw_sized("big.ARW", 1500, 1100, 3);
     let Some(app) = App::open(&[&arw]) else {
@@ -267,6 +548,7 @@ fn a_dng_is_byte_identical_through_the_app_path_and_the_binary_on_the_device() {
 /// alone. Nothing of R8 leaks from one into the other (`docs/09`, "What a DNG carries").
 #[test]
 fn a_dng_and_a_tiff_exported_one_after_the_other_on_the_device_do_not_share_r8() {
+    let _serial = serial();
     let sb = Sandbox::new();
     let arw = sb.arw_sized("big.ARW", 1500, 1100, 3);
     let Some(app) = App::open(&[&arw]) else {
@@ -297,4 +579,122 @@ fn a_dng_and_a_tiff_exported_one_after_the_other_on_the_device_do_not_share_r8()
         &dng_alone,
         "a DNG after a TIFF and a DNG alone",
     );
+}
+
+/// The lens on the device (`docs/21` section 9): L1, L2 and L3 as kernels, from the raw tiles where the raw chain
+/// left them, into the export tail. The app's export and `ym render --lens vintage ...` with the device on
+/// write the same bytes (a JPEG and a 16-bit TIFF), the binary's report says the pictures were made on the
+/// device without a fall-back note, and the lens changed the file. Two photos: a gradient (L2 and L3 act) and a
+/// night scene of defocused lights (the bokeh is reshaped too: L1's kernels run, which the dispatch count shows).
+#[test]
+fn a_lens_is_byte_identical_through_the_app_path_and_the_binary_on_the_device() {
+    let _serial = serial();
+    let sb = Sandbox::new();
+    let gradient = sb.arw_sized("big.ARW", 1500, 1100, 3);
+    let lights = sb.arw_bokeh("lights.ARW", 1500, 1100, 4);
+    // The classical detector decides which photos have bokeh: the learned map's verdict on a synthetic scene is
+    // its own business (`docs/21` section 7).
+    let data = sb.data_without_the_bokeh_model();
+    let mut dispatches = Vec::new();
+    for (name, arw) in [("gradient", &gradient), ("defocused lights", &lights)] {
+        let Some(d) = lens_parity(&sb, &data, name, arw) else {
+            return;
+        };
+        dispatches.push(d);
+    }
+    eprintln!(
+        "[parity_gpu] lens export dispatches: gradient {}, defocused lights {}",
+        dispatches[0], dispatches[1]
+    );
+    // The reshaping's kernels ran on the second photo and not on the first: twelve dispatches a tile at least.
+    assert!(
+        dispatches[1] >= dispatches[0] + 12,
+        "L1 did not run on the device for the defocused lights: {dispatches:?} dispatches"
+    );
+}
+
+/// The checks of the test above for one photo; the number of dispatches of the app's lens export, or `None` when
+/// there is no adapter.
+fn lens_parity(sb: &Sandbox, data: &Path, name: &str, arw: &Path) -> Option<u64> {
+    let app = App::open_with(&[arw], data.to_path_buf())?;
+    let out = |what: &str| sb.root().join(format!("{name}-{what}"));
+    let plain = app.export(ExportOptions::default(), &out("plain"));
+    app.core
+        .session
+        .update_settings(
+            app.photo,
+            &SettingsPatch::default().and(
+                NodeId::Input,
+                NodePatch {
+                    lens: Some(LensPatch {
+                        kind: Some(LensKind::Vintage),
+                        flares: Some(60.0),
+                        edges: Some(50.0),
+                        anamorphic: Some(50.0),
+                    }),
+                    ..NodePatch::default()
+                },
+            ),
+        )
+        .expect("patch");
+    let flags = [
+        "--lens",
+        "vintage",
+        "--flares",
+        "60",
+        "--edges",
+        "50",
+        "--anamorphic",
+        "50",
+    ];
+    let device = app.slot.gpu().expect("a device").clone();
+    let before = device.counters();
+    let from_app = app.export(ExportOptions::default(), &out("app"));
+    let dispatches = device.counters().since(before).dispatches;
+    assert!(dispatches > 0);
+    let mut jpeg_flags = vec!["--format", "jpeg"];
+    jpeg_flags.extend(flags);
+    let from_cli = cli_export_in(sb, data, &[arw], &jpeg_flags, &out("cli"));
+    assert_same_files(
+        &from_app,
+        &from_cli,
+        &format!("{name}: a lens on the device, jpeg"),
+    );
+    assert!(
+        bytes(&from_app[0]) != bytes(&plain[0]),
+        "{name}: the lens changed nothing in the file"
+    );
+    let tiff = ExportOptions {
+        format: FormatKind::Tiff,
+        bit_depth: BitDepth::Sixteen,
+        ..ExportOptions::default()
+    };
+    let from_app = app.export(tiff, &out("app-tiff"));
+    let mut tiff_flags = vec!["--format", "tiff", "--bits", "16"];
+    tiff_flags.extend(flags);
+    let from_cli = cli_export_in(sb, data, &[arw], &tiff_flags, &out("cli-tiff"));
+    assert_same_files(
+        &from_app,
+        &from_cli,
+        &format!("{name}: a lens on the device, tiff-16"),
+    );
+    // The binary really made the pictures on the device.
+    let json = sb
+        .ym_data(data)
+        .env("YELLOWMOON_GPU", "on")
+        .args(["render", "--json", "--quiet", "--apple-auto", "off"])
+        .arg(arw)
+        .args(flags)
+        .arg("--out")
+        .arg(out("json"))
+        .assert()
+        .success();
+    let text = String::from_utf8(json.get_output().stdout.clone()).expect("utf-8");
+    let v: serde_json::Value = serde_json::from_str(text.trim()).expect("one JSON object");
+    assert_eq!(v["device"], "gpu", "{name}: {text}");
+    assert!(
+        !v["notes"].to_string().contains("graphics card"),
+        "{name}: the binary fell back to the CPU: {text}"
+    );
+    Some(dispatches)
 }

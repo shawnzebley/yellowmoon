@@ -1,9 +1,10 @@
 // The mock's side of the ARRI wizard, the export extras and Preferences: synthetic packages, recognition, the simulated
-// import, the Downloads watcher, the system commands, display LUTs, the estimate's extra fields and the preferences store.
+// import, the Downloads watcher, the system commands, the estimate's extra fields and the preferences store.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { createMockApi, FAILURE_ZIPS, LOOK_FILE_ZIPS, PACKAGE_FACTS, PACKAGE_ZIPS } from "./api.mock";
+import { createMockApi, DISPLAY_ONLY_REASON, FILE_GONE_MESSAGE, FAILURE_ZIPS, LOOK_FILE_ZIPS, PACKAGE_FACTS, PACKAGE_ZIPS } from "./api.mock";
 import type { MockApi } from "./api.mock";
 import type { AppError, DownloadFound, ExportJob, ExportOptions, ExportProgress, LooksImportProgress } from "./api/types";
+import { mainGradePatch, outputPatch } from "./state/settingsGraph";
 
 /** A manual contrast or saturation (`docs/19` section 5: Auto or a value). */
 const manual = (value: number) => ({ kind: "manual", value }) as const;
@@ -27,7 +28,7 @@ function job(scope: ExportJob["scope"], options: Partial<ExportOptions> = {}): E
       format: "jpeg",
       jpeg_quality: 92,
       bit_depth: 16,
-      tiff_compression: "lzw",
+      tiff_compression: "zip",
       color_space: "srgb",
       size: { kind: "full" },
       destination: null,
@@ -49,9 +50,9 @@ afterEach(() => {
 });
 
 describe("recognising synthetic packages", () => {
-  it("knows the five packages by their zips, with the counts of docs/08", async () => {
+  it("knows the three look packages by their zips, with the counts of docs/08", async () => {
     const found = await Promise.all(Object.values(PACKAGE_ZIPS).map((name) => api.looksRecognise(downloads(name))));
-    expect(found.map((f) => f.recognition.kind)).toEqual(["package", "package", "package", "package", "package"]);
+    expect(found.map((f) => f.recognition.kind)).toEqual(["package", "package", "package"]);
     const ll4 = found[0]!;
     expect(ll4).toMatchObject({
       name: "ARRI_LookLibrary_LogC4.zip",
@@ -59,7 +60,7 @@ describe("recognising synthetic packages", () => {
       size_bytes: 181_000_000,
       recognition: { package_id: "look_library_logc4", title: "Look Library · LogC4", what: "Look Library · LogC4 · log to log", contents: "87 .cube · 65-point", file_count: 87 },
     });
-    expect(found.map((f) => (f.recognition.kind === "package" ? f.recognition.file_count : 0))).toEqual([87, 22, 87, 87, 48]);
+    expect(found.map((f) => (f.recognition.kind === "package" ? f.recognition.file_count : 0))).toEqual([87, 87, 87]);
   });
 
   it("finds a name by its last part only, ignoring case, so a dropped name works as well as a full path", async () => {
@@ -143,7 +144,7 @@ describe("importing", () => {
     expect(events.at(-1)).toMatchObject({ done: 87, total: 87 });
     expect(result.added).toHaveLength(87);
     expect(result.added[0]).toMatchObject({ id: "arri:3000:film-warm", name: "Film warm", input: "logc4" });
-    expect(result.display_luts_added).toBe(0);
+    expect(result).not.toHaveProperty("display_luts_added");
   });
 
   it("names the seven looks of the mockup first and groups the library", async () => {
@@ -169,22 +170,20 @@ describe("importing", () => {
     expect(events.at(-1)).toMatchObject({ done: 87, total: 87 });
   });
 
-  it("adds ARRI's display LUTs, which the wizard offers as the display rendering", async () => {
-    expect(await api.looksDisplayLuts()).toEqual([]);
-    const importing = api.looksImport(downloads(PACKAGE_ZIPS.display_luts_logc4));
-    await vi.advanceTimersByTimeAsync(4000);
-    const result = await importing;
-    expect(result).toMatchObject({ added: [], display_luts_added: 22 });
-    const luts = await api.looksDisplayLuts();
-    expect(luts).toHaveLength(22);
-    expect(luts[0]).toEqual({ id: "arri-display:logc4:rec709-g24", name: "Rec.709 · Gamma 2.4", input: "logc4", target: "rec709-g24" });
-    await api.preferencesSet({ display_rendering: { kind: "arri_display", id: luts[0]!.id } });
-    expect((await api.preferencesGet()).display_rendering).toEqual({ kind: "arri_display", id: "arri-display:logc4:rec709-g24" });
+  it("recognises ARRI's display LUT packages, says there is nothing to import, and imports nothing", async () => {
+    const before = await api.looksList();
+    for (const zip of [FAILURE_ZIPS.displayLutsLogc4, FAILURE_ZIPS.displayLutsLogc3]) {
+      const found = await api.looksRecognise(downloads(zip));
+      expect(found.recognition).toEqual({ kind: "unusable", package_id: null, reason: DISPLAY_ONLY_REASON });
+      const error = await rejection(api.looksImport(downloads(zip)));
+      expect(error).toMatchObject({ scope: "looks", message: DISPLAY_ONLY_REASON });
+    }
+    expect(await api.looksList()).toEqual(before);
   });
 
-  it("refuses a display rendering that is not imported", async () => {
-    const error = await rejection(api.preferencesSet({ display_rendering: { kind: "arri_display", id: "arri-display:logc4:nope" } }));
-    expect(error.scope).toBe("preferences");
+  it("has no display rendering to choose and no display LUTs to list", async () => {
+    expect(await api.preferencesGet()).not.toHaveProperty("display_rendering");
+    expect(api).not.toHaveProperty("looksDisplayLuts");
   });
 
   it("gives LogC3 looks their own ids and inputs", async () => {
@@ -271,14 +270,14 @@ describe("watching Downloads", () => {
   });
 
   it("delivers the zips named in the options one after the other", async () => {
-    api.reset({ downloads: [PACKAGE_ZIPS.look_library_logc4, PACKAGE_ZIPS.display_luts_logc4] });
+    api.reset({ downloads: [PACKAGE_ZIPS.look_library_logc4, PACKAGE_ZIPS.look_library_logc3] });
     const found: string[] = [];
     api.on("download_found", (e) => found.push(e.file_name));
     await api.looksWatchDownloads(true);
     await vi.advanceTimersByTimeAsync(2600);
     expect(found).toEqual(["ARRI_LookLibrary_LogC4.zip"]);
     await vi.advanceTimersByTimeAsync(2600);
-    expect(found).toEqual(["ARRI_LookLibrary_LogC4.zip", "ARRI_DisplayLUTs_LogC4.zip"]);
+    expect(found).toEqual(["ARRI_LookLibrary_LogC4.zip", "ARRI_LookLibrary_LogC3.zip"]);
     await api.looksWatchDownloads(false);
   });
 
@@ -322,7 +321,7 @@ describe("the system", () => {
     expect(await api.cliLinkStatus()).toEqual({ installed: false, path: null });
     expect(await api.installCliLink()).toEqual({ path: "/usr/local/bin/ym" });
     expect(await api.cliLinkStatus()).toEqual({ installed: true, path: "/usr/local/bin/ym" });
-    expect(await api.appInfo()).toEqual({ version: expect.stringMatching(/^\d+\.\d+\.\d+/), pipeline_version: "1.0.0" });
+    expect(await api.appInfo()).toEqual({ version: expect.stringMatching(/^\d+\.\d+\.\d+/), pipeline_version: "1.0.0", os: "macos" });
   });
 });
 
@@ -335,8 +334,8 @@ describe("the estimate's extra fields", () => {
   it("counts photos with adjustments beyond the look", async () => {
     expect((await api.exportEstimate(job("picked"))).adjusted_photos).toBe(0);
     // The current photo is DSC04204 (id 4), and it is picked with DSC04203 (id 3).
-    await api.updateSettings(4, { contrast: manual(12) });
-    await api.updateSettings(3, { look: "builtin:signature", look_intensity: 60 });
+    await api.updateSettings(4, mainGradePatch({ contrast: manual(12) }));
+    await api.updateSettings(3, outputPatch({ look: "builtin:signature", look_intensity: 60 }));
     expect((await api.exportEstimate(job("picked"))).adjusted_photos).toBe(1);
     expect((await api.exportEstimate(job("this"))).adjusted_photos).toBe(1);
     expect((await api.exportEstimate(job("all"))).adjusted_photos).toBe(1);
@@ -405,6 +404,53 @@ describe("export outcomes", () => {
     expect(events.at(-1)).toMatchObject({ done: 3, total: 3, file_percent: 100, error: null });
   });
 
+  it("fails a photo whose file went away with the not-found sentence, and carries on (mockVanish)", async () => {
+    // The photos are Ready first: the file goes away after that.
+    api.reset({ picked: [2, 3, 4], current: 0, vanish: ["DSC04204"] });
+    await api.openPaths(ARW);
+    await vi.advanceTimersByTimeAsync(6000);
+    const events: ExportProgress[] = [];
+    api.on("export_progress", (e) => events.push(e));
+    await api.exportStart(job("picked"));
+    await vi.advanceTimersByTimeAsync(6000);
+    const failed = events.filter((e) => e.error);
+    expect(failed).toHaveLength(1);
+    expect(failed[0]).toMatchObject({ file: "DSC04204_neutral.jpg", done: 2, total: 3, error: FILE_GONE_MESSAGE, stopped: false });
+    expect(events.at(-1)).toMatchObject({ done: 3, total: 3, file_percent: 100, error: null });
+    expect((await api.sessionState()).photos.find((p) => p.file_name === "DSC04204.ARW")?.status).toEqual({ kind: "skipped", reason: FILE_GONE_MESSAGE });
+  });
+
+  it("skips a Ready photo that vanishes when it is shown, with a photo_progress error event (mockVanish)", async () => {
+    api.reset({ vanish: ["DSC04207"], current: 0 });
+    await api.openPaths(ARW);
+    await vi.advanceTimersByTimeAsync(6000);
+    const progress: Array<{ id: number; error: string | null }> = [];
+    api.on("photo_progress", (e) => progress.push({ id: e.id, error: e.error }));
+    const photos = (await api.sessionState()).photos;
+    const vanishing = photos.find((p) => p.file_name === "DSC04207.ARW")!;
+    expect(vanishing.status).toEqual({ kind: "ready" });
+    await api.setCurrent(vanishing.id);
+    expect(progress).toEqual([{ id: vanishing.id, error: FILE_GONE_MESSAGE }]);
+    expect((await api.sessionState()).photos.find((p) => p.id === vanishing.id)?.status).toEqual({ kind: "skipped", reason: FILE_GONE_MESSAGE });
+    // Shown again: nothing new is said.
+    await api.setCurrent(vanishing.id);
+    expect(progress).toHaveLength(1);
+  });
+
+  it("stops at a failure of the destination: the last event is the failing photo's, and the rest are not tried", async () => {
+    const events = await runJob(job("picked"), { exportFailures: { DSC04204: "disk_full" } });
+    const stopped = events.filter((e) => e.stopped);
+    expect(stopped).toHaveLength(1);
+    expect(stopped[0]).toMatchObject({
+      file: "DSC04204_neutral.jpg",
+      done: 2,
+      total: 3,
+      error: "The disk is full, so the export stopped. Free some space, then export the photos that are left.",
+    });
+    expect(events.at(-1)).toBe(stopped[0]);
+    expect(await api.exportBusy()).toBe(false);
+  });
+
   it("leaves a file that can't be developed out of All", async () => {
     api.reset({ skipped: { DSC04207: "Can't read this." } });
     await api.openPaths(ARW);
@@ -459,7 +505,6 @@ describe("preferences", () => {
 describe("package facts", () => {
   it("match the mockup's choose step", () => {
     expect(PACKAGE_FACTS.look_library_logc4).toMatchObject({ fileCount: 87, megabytes: 181, contents: "87 .cube · 65-point" });
-    expect(PACKAGE_FACTS.display_luts_logc4).toMatchObject({ fileCount: 22, megabytes: 32 });
-    expect(PACKAGE_FACTS.display_luts_logc3).toMatchObject({ fileCount: 48, megabytes: 46 });
+    expect(Object.keys(PACKAGE_FACTS)).toEqual(["look_library_logc4", "look_library_logc3", "look_library_logc3_to_rec709"]);
   });
 });

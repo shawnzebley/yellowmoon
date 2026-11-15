@@ -21,9 +21,11 @@ time.workspace = true
 zip.workspace = true
 # Cross-process file lock for `looks/.lock` (MIT OR Apache-2.0).
 fs4.workspace = true
-# Recoverable "Move to Trash" for the downloaded zip (MIT).
-trash = "5"
 
 [dev-dependencies]
 tempfile.workspace = true
 proptest.workspace = true
+
+# Recoverable "Move to Trash" for the downloaded zip (MIT). A WebAssembly build (the iPhone web app) has no system Trash.
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+trash = "5"

@@ -169,6 +169,13 @@ describe("Filmstrip in export mode", () => {
     expect(screen.getByText("2 to export")).toBeInTheDocument();
   });
 
+  it("is a named, focusable region, so the keyboard can scroll it (nothing in it takes the focus)", () => {
+    render(<Filmstrip mode="export" photos={exportPhotos} currentId={2} />);
+    const region = screen.getByRole("region", { name: "List of photos to export" });
+    expect(region).toHaveAttribute("tabindex", "0");
+    expect(region).toHaveClass("ym-filmstrip__scroll");
+  });
+
   it("dims what will not be exported and names what will", () => {
     render(<Filmstrip mode="export" photos={exportPhotos} currentId={2} />);
     expect(screen.getByRole("img", { name: "DSC04202, picked, will be exported" })).toHaveAttribute("data-in-export", "true");
@@ -315,5 +322,23 @@ describe("Filmstrip remove menu", () => {
       </>,
     );
     expect(screen.getByRole("button", { name: "Elsewhere" })).toHaveFocus();
+  });
+
+  it("marks a photo that has nodes with the glyph at its thumbnail's bottom left, says so in its name, and gives the words as a tooltip", async () => {
+    const photos: FilmstripPhoto[] = [
+      { id: 1, name: "DSC04201", src: "a.png" },
+      { id: 2, name: "DSC04202", src: "b.png", picked: true, nodes: "4 nodes" },
+      { id: 3, name: "DSC04203", src: "c.png", nodes: "Node 1 has masks or a trim" },
+    ];
+    const { container } = render(<Filmstrip photos={photos} currentId={2} />);
+    const glyphs = container.querySelectorAll(".ym-filmstrip__nodes");
+    expect(glyphs).toHaveLength(2);
+    expect(screen.getByRole("button", { name: "Show DSC04201" }).querySelector(".ym-filmstrip__nodes")).toBeNull();
+    const withNodes = screen.getByRole("button", { name: "Show DSC04202, picked, 4 nodes" });
+    expect(withNodes.querySelector(".ym-filmstrip__nodes")).toHaveAttribute("data-nodes", "4 nodes");
+    expect(withNodes.querySelector(".ym-filmstrip__nodes svg")).toHaveAttribute("aria-hidden", "true");
+    expect(screen.getByRole("button", { name: "Show DSC04203, node 1 has masks or a trim" })).toBeInTheDocument();
+    await userEvent.setup().hover(glyphs[0] as HTMLElement);
+    expect(await screen.findByRole("tooltip", {}, { timeout: 2000 })).toHaveTextContent("4 nodes");
   });
 });

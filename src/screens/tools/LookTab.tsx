@@ -4,11 +4,13 @@ import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/component
 import type { ReactNode } from "react";
 import { AutoRow, AutoToggle, Button, Card, Field, formats, LinkButton, LookTile, ResetLink, RowNote, Rows, SearchField, Segmented, Slider, Tag } from "../../components";
 import type { TabId } from "../../components";
-import type { AppleAuto, AppleAutoSteps, ApplyScope, Look, LookId, LookLibrary, ResolvedSettings } from "../../api/types";
+import type { AppleAuto, AppleAutoSteps, ApplyScope, AutoProvider, Look, LookId, LookLibrary, ResolvedSettings } from "../../api/types";
 import { perfCount } from "../../perf";
 import { useAppState, useStore } from "../../state/context";
+import { autoCardLine } from "../../state/autoProviders";
 import { isArriLook, LOOK_LIBRARIES, looksInDisplayOrder, lookTooltip } from "../../state/looks";
 import type { LookLibraryInfo } from "../../state/looks";
+import { foldPatches, inputOf, inputPatch, mainGradePatch, outputOf, withoutLook } from "../../state/settingsGraph";
 import type { AppStore } from "../../state/store";
 import { useLookThumbnail } from "../../state/useLookThumbnail";
 import { shortBody } from "./RawTab";
@@ -19,19 +21,14 @@ import type { TabProps } from "./shared";
 /** Said on a tile whose look file is gone or changed (`docs/08-looks.md` §Missing looks). */
 export const MISSING_LOOK_NOTE = "File missing or changed. Import again.";
 
-/** The Automatic card's line under its rows while Apple Auto is on for the session (`docs/19` section 10), by the photo's state. */
-export const APPLE_AUTO_LINES = {
-  answered: "Set with Apple Intelligence.",
-  pending: "Apple Intelligence is looking at this photo…",
-  failed: "Apple Intelligence couldn't look at this photo, so Auto uses Yellowmoon's own settings.",
-} as const;
-
 /**
- * The Automatic card's line for a photo's Apple Auto state, or null while Apple Auto is off or not available: then the card has none
- * of Apple Auto's rows and no line, and is the card it was before Apple Auto.
+ * The Automatic card's line for a photo's Auto state (`docs/19` section 10, `docs/22` section 12.5): "Set with Claude Code.", "Apple
+ * Intelligence is looking at this photo…", the failure, or, for a program that was chosen and is not available, that; null while Auto is
+ * off or not available in a way the card does not say: then the card has none of a provider's rows and no line, and is the card it was
+ * before Apple Auto. `chosen` is the saved choice, the provider the line names while the photo's state names none.
  */
-export function appleAutoLine(apple: AppleAuto): string | null {
-  return apple.state === "answered" || apple.state === "pending" || apple.state === "failed" ? APPLE_AUTO_LINES[apple.state] : null;
+export function appleAutoLine(apple: AppleAuto, chosen: AutoProvider): string | null {
+  return autoCardLine(apple, chosen);
 }
 
 /** The model's plan for the photo, shown under the card's line (`docs/19` section 10); null without an answer or with no words. */
@@ -297,7 +294,18 @@ export function ToneCard({ store, rs }: { store: AppStore; rs: ResolvedSettings 
           <AutoToggle isAuto={isAuto} onAuto={() => whiteBalanceToAuto(store)} aria-label="Auto temperature" />
         </>
       }
-      action={<ResetLink size="card" onClick={() => void store.update({ white_balance: AUTO, light_source: "auto", white_pick: null, contrast: AUTO, saturation: AUTO }, true, rs.photo_id)} />}
+      action={
+        <ResetLink
+          size="card"
+          onClick={() =>
+            void store.update(
+              foldPatches(inputPatch({ white_balance: AUTO, light_source: "auto", white_pick: null }), mainGradePatch({ contrast: AUTO, saturation: AUTO })),
+              true,
+              rs.photo_id,
+            )
+          }
+        />
+      }
     >
       <KelvinSlider store={store} rs={rs} label="Temperature" />
       <ContrastSlider store={store} rs={rs} />
@@ -312,57 +320,35 @@ export interface LookTabProps extends TabProps {
 }
 
 /**
- * Look: the Automatic card (what was worked out for this photo, and where to change it), the
- * Look card (strength, "Apply to", search and the grid of looks with lazy thumbnails) and the Tone
- * card (Temperature, Contrast, Saturation).
+ * The Look card (`docs/11` §Look tab): Intensity, "Apply to", the search field and the grid of looks with lazy thumbnails, in sections
+ * by library. One look per photo, and it is the Output's (`docs/23` §2): the simple view's Look tab and the node view's Output › Look tab
+ * both draw it. The thumbnails show the photo as it is developed now, so they follow every change except the look itself.
  */
-export const LookTab = memo(function LookTab({ store, photo, rs, onOpenTab }: LookTabProps) {
-  perfCount("LookTab");
+export function LookCard({ store, photo, rs }: TabProps) {
+  perfCount("LookCard");
   const looks = useAppState((s) => s.looks);
   const nPicked = useAppState((s) => s.session?.picked.length ?? 0);
   const nAll = useAppState((s) => s.session?.photos.length ?? 0);
   const scope = useAppState((s) => s.applyScope);
   const [query, setQuery] = useState("");
-  const { settings, values, auto } = rs;
+  const { settings } = rs;
+  const { output } = rs.values;
+  const outputNode = outputOf(settings);
 
   const collapsed = useAppState((s) => s.collapsedLookLibraries);
   const ordered = useMemo(() => looksInDisplayOrder(looks ?? []), [looks]);
   const keyOf = useMemo(() => new Map(ordered.map((l, i) => [l.id, i + 1])), [ordered]);
-  const current = ordered.find((l) => l.id === settings.look);
+  const current = ordered.find((l) => l.id === outputNode.look);
   const defaultLook = ordered.find((l) => l.is_default);
   const q = query.trim().toLowerCase();
 
   // Thumbnails show the photo as it is developed now, so they follow every change except the look itself, and the Auto values the
   // settings resolve to: Apple Auto's answer (`docs/19`) or a burst's median moves them without a change of the settings.
   const { estimates } = rs;
-  const rawKey = useMemo(() => {
-    const { look: _look, look_intensity: _intensity, ...rest } = settings;
-    return JSON.stringify([
-      rest,
-      estimates.exposure_ev,
-      estimates.kelvin,
-      estimates.tint,
-      estimates.contrast,
-      estimates.saturation,
-      estimates.highlights,
-      estimates.shadows,
-      estimates.black,
-      estimates.balance_shadows,
-      estimates.balance_highlights,
-    ]);
-  }, [
-    settings,
-    estimates.exposure_ev,
-    estimates.kelvin,
-    estimates.tint,
-    estimates.contrast,
-    estimates.saturation,
-    estimates.highlights,
-    estimates.shadows,
-    estimates.black,
-    estimates.balance_shadows,
-    estimates.balance_highlights,
-  ]);
+  const rawKey = useMemo(
+    () => JSON.stringify([withoutLook(settings), estimates.input.exposure_ev, estimates.input.kelvin, estimates.input.tint, estimates.main]),
+    [settings, estimates.input.exposure_ev, estimates.input.kelvin, estimates.input.tint, estimates.main],
+  );
   const thumbKey = useSettled(rawKey, THUMBNAIL_SETTLE_MS);
 
   // One observer and one select function for every tile, so a tile's props change only when the tile does.
@@ -394,16 +380,117 @@ export const LookTab = memo(function LookTab({ store, photo, rs, onOpenTab }: Lo
     { value: "all", label: `All · ${nAll}` },
   ];
 
-  const noiseValue = `Luminance ${Math.round(values.noise_reduction.luminance)}`;
-  // Apple Auto on for the session: the photo is waiting for its answer, has it, or failed (`docs/19` section 10). Its rows are the
+  return (
+    <Card
+      title="Look"
+      action={
+        <span className="ym-card__actions">
+          {current && defaultLook && current.id !== defaultLook.id ? (
+            <LinkButton size="sm" onClick={() => void store.makeDefault(current.id)}>
+              Make default
+            </LinkButton>
+          ) : null}
+          <ResetLink
+            size="card"
+            onClick={() => (defaultLook ? void store.chooseLook(defaultLook.id, 100, photo.id) : void store.setLookIntensity(100, true, photo.id))}
+          />
+        </span>
+      }
+    >
+      <Slider
+        label="Intensity"
+        value={output.look_intensity}
+        min={0}
+        max={100}
+        defaultValue={100}
+        format={formats.percent}
+        onChange={(v, final) => void store.setLookIntensity(v, final, photo.id)}
+      />
+      <Field label="Apply to">
+        <Segmented label="Apply look to" value={scope} onChange={(next) => store.setApplyScope(next)} options={scopeOptions} />
+      </Field>
+      <div className="ym-look-block">
+        <SearchField className="ym-look-search" value={query} onChange={setQuery} label="Search looks" />
+        {sections.map(({ library, all, shown }) => {
+          if (library.id === "arri_logc4" && arriCount === 0) {
+            // Nothing of ARRI's is imported: say so, and offer the wizard.
+            return q ? null : (
+              <div className="ym-look-group" key="arri-none">
+                <div className="ym-look-group__header">
+                  <span>ARRI looks</span>
+                  <span className="ym-look-group__count">0</span>
+                </div>
+                <p className="ym-look-cta">The free ARRI Look Library is not imported yet.</p>
+                <LinkButton className="ym-look-import" onClick={() => store.go("import-looks")}>
+                  Import ARRI looks →
+                </LinkButton>
+              </div>
+            );
+          }
+          if (shown.length === 0) return null;
+          return (
+            <LookSection
+              key={library.id}
+              library={library}
+              total={all.length}
+              shown={shown.length}
+              searching={q !== ""}
+              collapsed={collapsed.includes(library.id)}
+              holdsCurrent={all.some((l) => l.id === outputNode.look)}
+              onToggle={() => store.toggleLookLibrary(library.id)}
+            >
+              {shown.map((look) => (
+                <LazyLookTile
+                  key={look.id}
+                  look={look}
+                  index={keyOf.get(look.id) ?? 0}
+                  selected={look.id === outputNode.look}
+                  photoId={photo.id}
+                  thumbKey={thumbKey}
+                  onSelect={selectLook}
+                  watch={watch}
+                />
+              ))}
+            </LookSection>
+          );
+        })}
+        {!anyShown && q ? <p className="ym-look-empty">No looks match “{query.trim()}”.</p> : null}
+        <div className="ym-look-links">
+          {arriCount > 0 ? (
+            <LinkButton className="ym-look-import" onClick={() => store.go("import-looks")}>
+              Import ARRI looks →
+            </LinkButton>
+          ) : null}
+          <LinkButton className="ym-look-import" onClick={() => void store.startCubeImport()}>
+            Import LUTs and look files…
+          </LinkButton>
+        </div>
+      </div>
+    </Card>
+  );
+}
+
+/**
+ * Look: the Automatic card (what was worked out for this photo, and where to change it), the
+ * Look card (strength, "Apply to", search and the grid of looks with lazy thumbnails), the Tone
+ * card (Temperature, Contrast, Saturation). The lens has a tab of its own (`LensTab`).
+ */
+export const LookTab = memo(function LookTab({ store, photo, rs, onOpenTab }: LookTabProps) {
+  perfCount("LookTab");
+  const { settings, auto } = rs;
+  const { input, main } = rs.values;
+
+  const noiseValue = `Luminance ${Math.round(input.noise_reduction.luminance)}`;
+  // A provider on for the session: the photo is waiting for its answer, has it, or failed (`docs/19` section 10). Its rows are the
   // values the answer in effect set, in the order of the table; a value the model left empty has no row.
-  const appleLine = appleAutoLine(rs.estimates.apple);
+  // The provider the photo's state is about: the core says (`estimates.provider`, `docs/22` section 14.1), also while it is pending.
+  const appleLine = appleAutoLine(rs.estimates.apple, rs.estimates.provider);
   const applePlan = appleAutoPlan(rs.estimates.apple);
   const rows = appleRows(appleLine !== null ? rs.estimates.apple_steps : null);
   const openLight = (): void => onOpenTab("light");
   const openColor = (): void => onOpenTab("color");
   const openTone = (label: string): void => revealToneSlider(document.querySelector<HTMLElement>(".ym-tone-card"), label);
-  const whiteAuto = auto.white_balance && auto.light_source && settings.white_pick === null;
+  const whiteAuto = auto.input.white_balance && auto.input.light_source && inputOf(settings).white_pick === null;
   const profileText =
     photo.camera.match_kind.kind === "exact" ? `${shortBody(photo.camera.body)} · measured profile` : `${shortBody(photo.camera.body)} · ${photo.camera.profile} profile`;
 
@@ -413,39 +500,32 @@ export const LookTab = memo(function LookTab({ store, photo, rs, onOpenTab }: Lo
         <Rows>
           <AutoRow
             label="Exposure"
-            value={`${formats.ev(values.exposure_ev)} EV`}
-            isAuto={auto.exposure}
-            tabLabel="Light"
-            onOpen={() => onOpenTab("light")}
-          />
-          <AutoRow
-            label="White"
-            value={values.white_ev > 0 ? `${formats.ev(values.white_ev)} EV` : "None"}
-            isAuto={values.white_offset_ev === 0}
+            value={`${formats.ev(input.exposure_ev)} EV`}
+            isAuto={auto.input.exposure}
             tabLabel="Light"
             onOpen={() => onOpenTab("light")}
           />
           <AutoRow
             label="White balance"
-            value={`${Math.round(values.kelvin)} K · tint ${tintLabel(values.tint)}`}
+            value={`${Math.round(input.kelvin)} K · tint ${tintLabel(input.tint)}`}
             isAuto={whiteAuto}
             tabLabel="Colour"
             onOpen={() => onOpenTab("color")}
           />
           {rows.highlights ? (
-            <AutoRow label="Highlights" value={formats.signed(values.highlights)} isAuto={auto.highlights} tabLabel="Light" onOpen={openLight} />
+            <AutoRow label="Highlights" value={formats.signed(main.grade.highlights)} isAuto={auto.main.highlights} tabLabel="Light" onOpen={openLight} />
           ) : null}
           {rows.shadows ? (
-            <AutoRow label="Shadows" value={formats.signed(values.shadows)} isAuto={auto.shadows} tabLabel="Light" onOpen={openLight} />
+            <AutoRow label="Shadows" value={formats.signed(main.grade.shadows)} isAuto={auto.main.shadows} tabLabel="Light" onOpen={openLight} />
           ) : null}
           {rows.black ? (
-            <AutoRow label="Black" value={formats.signed(values.black)} isAuto={auto.black} tabLabel="Light" onOpen={openLight} />
+            <AutoRow label="Black" value={formats.signed(main.grade.black)} isAuto={auto.main.black} tabLabel="Light" onOpen={openLight} />
           ) : null}
           {rows.contrast ? (
             <AutoRow
               label="Contrast"
-              value={formats.signed(values.contrast)}
-              isAuto={auto.contrast}
+              value={formats.signed(main.grade.contrast)}
+              isAuto={auto.main.contrast}
               tabLabel="Tone"
               onOpen={() => openTone("Contrast")}
             />
@@ -453,8 +533,8 @@ export const LookTab = memo(function LookTab({ store, photo, rs, onOpenTab }: Lo
           {rows.saturation ? (
             <AutoRow
               label="Saturation"
-              value={formats.signed(values.saturation)}
-              isAuto={auto.saturation}
+              value={formats.signed(main.grade.saturation)}
+              isAuto={auto.main.saturation}
               tabLabel="Tone"
               onOpen={() => openTone("Saturation")}
             />
@@ -462,8 +542,8 @@ export const LookTab = memo(function LookTab({ store, photo, rs, onOpenTab }: Lo
           {rows.shadowColor !== null ? (
             <AutoRow
               label="Shadows colour"
-              value={auto.balance_shadows ? rows.shadowColor : "Custom"}
-              isAuto={auto.balance_shadows}
+              value={auto.main.balance_shadows ? rows.shadowColor : "Custom"}
+              isAuto={auto.main.balance_shadows}
               tabLabel="Colour"
               onOpen={openColor}
             />
@@ -471,106 +551,20 @@ export const LookTab = memo(function LookTab({ store, photo, rs, onOpenTab }: Lo
           {rows.highlightColor !== null ? (
             <AutoRow
               label="Highlights colour"
-              value={auto.balance_highlights ? rows.highlightColor : "Custom"}
-              isAuto={auto.balance_highlights}
+              value={auto.main.balance_highlights ? rows.highlightColor : "Custom"}
+              isAuto={auto.main.balance_highlights}
               tabLabel="Colour"
               onOpen={openColor}
             />
           ) : null}
-          <AutoRow label="Noise" value={noiseValue} isAuto={auto.noise_reduction} tabLabel="Detail" onOpen={() => onOpenTab("detail")} />
+          <AutoRow label="Noise" value={noiseValue} isAuto={auto.input.noise_reduction} tabLabel="Detail" onOpen={() => onOpenTab("detail")} />
           <AutoRow label="Camera" value={profileText} isAuto tabLabel="RAW" onOpen={() => onOpenTab("raw")} />
         </Rows>
         {appleLine !== null ? <RowNote>{appleLine}</RowNote> : null}
         {applePlan !== null ? <RowNote>{`\u201c${applePlan}\u201d`}</RowNote> : null}
       </Card>
-      <Card
-        title="Look"
-        action={
-          <span className="ym-card__actions">
-            {current && defaultLook && current.id !== defaultLook.id ? (
-              <LinkButton size="sm" onClick={() => void store.makeDefault(current.id)}>
-                Make default
-              </LinkButton>
-            ) : null}
-            <ResetLink
-              size="card"
-              onClick={() => (defaultLook ? void store.chooseLook(defaultLook.id, 100, photo.id) : void store.setLookIntensity(100, true, photo.id))}
-            />
-          </span>
-        }
-      >
-        <Slider
-          label="Intensity"
-          value={values.look_intensity}
-          min={0}
-          max={100}
-          defaultValue={100}
-          format={formats.percent}
-          onChange={(v, final) => void store.setLookIntensity(v, final, photo.id)}
-        />
-        <Field label="Apply to">
-          <Segmented label="Apply look to" value={scope} onChange={(next) => store.setApplyScope(next)} options={scopeOptions} />
-        </Field>
-        <div className="ym-look-block">
-          <SearchField className="ym-look-search" value={query} onChange={setQuery} label="Search looks" />
-          {sections.map(({ library, all, shown }) => {
-            if (library.id === "arri_logc4" && arriCount === 0) {
-              // Nothing of ARRI's is imported: say so, and offer the wizard.
-              return q ? null : (
-                <div className="ym-look-group" key="arri-none">
-                  <div className="ym-look-group__header">
-                    <span>ARRI looks</span>
-                    <span className="ym-look-group__count">0</span>
-                  </div>
-                  <p className="ym-look-cta">The free ARRI Look Library is not imported yet.</p>
-                  <LinkButton className="ym-look-import" onClick={() => store.go("import-looks")}>
-                    Import ARRI looks →
-                  </LinkButton>
-                </div>
-              );
-            }
-            if (shown.length === 0) return null;
-            return (
-              <LookSection
-                key={library.id}
-                library={library}
-                total={all.length}
-                shown={shown.length}
-                searching={q !== ""}
-                collapsed={collapsed.includes(library.id)}
-                holdsCurrent={all.some((l) => l.id === settings.look)}
-                onToggle={() => store.toggleLookLibrary(library.id)}
-              >
-                {shown.map((look) => (
-                  <LazyLookTile
-                    key={look.id}
-                    look={look}
-                    index={keyOf.get(look.id) ?? 0}
-                    selected={look.id === settings.look}
-                    photoId={photo.id}
-                    thumbKey={thumbKey}
-                    onSelect={selectLook}
-                    watch={watch}
-                  />
-                ))}
-              </LookSection>
-            );
-          })}
-          {!anyShown && q ? <p className="ym-look-empty">No looks match “{query.trim()}”.</p> : null}
-          <div className="ym-look-links">
-            {arriCount > 0 ? (
-              <LinkButton className="ym-look-import" onClick={() => store.go("import-looks")}>
-                Import ARRI looks →
-              </LinkButton>
-            ) : null}
-            <LinkButton className="ym-look-import" onClick={() => void store.startCubeImport()}>
-              Import .cube…
-            </LinkButton>
-          </div>
-        </div>
-      </Card>
+      <LookCard store={store} photo={photo} rs={rs} />
       <ToneCard store={store} rs={rs} />
     </>
   );
 });
-

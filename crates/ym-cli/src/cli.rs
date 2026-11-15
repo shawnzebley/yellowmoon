@@ -9,7 +9,8 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use ym_core::apple_auto::AppleAutoMode;
+use ym_core::auto_provider::{AutoChoice, AutoProvider};
+use ym_core::settings::{CropAspect, LensKind};
 use ym_core::version::{PIPELINE_VERSION, app_version};
 use ym_export::{BitDepth, ColorSpace, FormatKind, TiffCompression};
 
@@ -57,6 +58,12 @@ pub enum Command {
     /// Manage the look library.
     #[command(subcommand)]
     Looks(LooksCommand),
+    /// Show the film stocks and papers that a Film node of a `--settings` file can use.
+    #[command(subcommand)]
+    Film(FilmCommand),
+    /// Show the lenses that `ym render --lens` can give a photo.
+    #[command(subcommand)]
+    Lenses(LensesCommand),
     /// Print the diagnostics that go into a bug report.
     Doctor(DoctorArgs),
 }
@@ -69,6 +76,7 @@ const H_INPUT: &str = "Photos";
 const H_LOOK: &str = "Look and display";
 const H_LIGHT: &str = "Light";
 const H_COLOR: &str = "Colour";
+const H_LENS: &str = "Lens";
 const H_DETAIL: &str = "Detail";
 const H_RAW: &str = "RAW";
 const H_OUTPUT: &str = "Output";
@@ -77,7 +85,7 @@ const H_RUN: &str = "Run";
 /// Arguments of `ym render`.
 #[derive(Debug, Args)]
 #[command(
-    after_help = "Examples:\n  ym render ~/Pictures/2026-10-04 --look neutral --format jpeg --long-edge 3000 --out ~/Exports\n  fd -e ARW . /Volumes/A1 | ym render - --json --format tiff --bits 16 > results.jsonl\n  ym render DSC04204.ARW --exposure-offset -0.5 --wb 5200,4\n\nPer-photo settings beyond these options go in a JSON file given with --settings (the `ym:Settings` schema of an exported file). Options given alongside it override it. A file with several photos' settings is an object keyed by file name."
+    after_help = "Examples:\n  ym render ~/Pictures/2026-10-04 --look neutral --format jpeg --long-edge 3000 --out ~/Exports\n  fd -e ARW . /Volumes/A1 | ym render - --format tiff --bits 16 --out ~/Exports\n  ym render DSC04204.ARW --exposure-offset -0.5 --wb 5200,4\n\nSettings are a graph of nodes. The options set fields of three of them: the Input (--exposure, --exposure-offset, --wb, --light, --lens, --flares, --edges, --anamorphic, --nr, --sharpen, --rolloff, --no-neural, --no-highlight-recovery, --no-lens, --no-ca, --auto-crop), node 1, Main (--contrast, --brightness, --highlights, --shadows, --white, --black, --saturation) and the Output (--look, --intensity, --output-sharpening). Everything else goes in a JSON file given with --settings: other nodes (correctors, mixers, splitters and combiners, and Film nodes whose stocks `ym film list` shows), masks and links, colour balance, curves, crop, orientation, white pick. The file is a graph, for example {\"nodes\":{\"items\":[{\"id\":1,\"grade\":{\"contrast\":{\"kind\":\"manual\",\"value\":20}}}]}}; the `ym:Settings` of an export's XMP holds a photo's settings in that form. A file in the form of Yellowmoon 0.1 is refused. Options given alongside --settings override it. A file with several photos' settings is an object keyed by file name."
 )]
 pub struct RenderArgs {
     /// Files or folders to render; `-` reads file paths from stdin, one per line. Folders are walked
@@ -95,13 +103,16 @@ pub struct RenderArgs {
     /// How strongly the look applies, in percent (default 100).
     #[arg(long, value_name = "PERCENT", value_parser = percent, help_heading = H_LOOK)]
     pub intensity: Option<f64>,
-    /// Display rendering: `aces2`, or `arri` (an imported ARRI display LUT: the one chosen in the
-    /// app, else the only one imported; or give its id).
-    #[arg(long, value_name = "aces2|arri", help_heading = H_LOOK)]
+    /// Removed: Yellowmoon always uses its own display rendering. The option is still read, and
+    /// hidden from the help, so that a script that passes it gets a usage error that says what to
+    /// do instead of "unexpected argument" ([`crate::render::DISPLAY_REMOVED`]). A value needs `=`,
+    /// so that `--display aces2 photo.ARW` is read whole and the usage error comes before any photo.
+    #[arg(long, value_name = "WORD", num_args = 0..=1, require_equals = true, default_missing_value = "", hide = true, help_heading = H_LOOK)]
     pub display: Option<String>,
-    /// A JSON file of settings (the `ym:Settings` schema), or `-` for stdin. It covers what these
-    /// options can't: colour balance (`{ "kind": "auto" }` puts a shadows or highlights wheel back
-    /// to Auto), curves, crop, orientation, white pick.
+    /// A JSON file of settings, or `-` for stdin: a graph of nodes (the `ym:Settings` of an export's XMP is one).
+    /// It covers what these options can't: other nodes and their masks, links, colour balance
+    /// (`{ "kind": "auto" }` puts a shadows or highlights wheel of Main back to Auto), curves, crop,
+    /// orientation, white pick.
     #[arg(long, value_name = "FILE", help_heading = H_LOOK)]
     pub settings: Option<PathBuf>,
 
@@ -130,11 +141,6 @@ pub struct RenderArgs {
     /// Black point, -100 to 100, or `auto` (the default: 0, or the value Apple Auto chose).
     #[arg(long, value_name = "auto|N", value_parser = percent_or_auto, allow_negative_numbers = true, help_heading = H_LIGHT)]
     pub black: Option<PercentArg>,
-    /// Stops added to each photo's automatic white lift, -3 to 3. 0 is the automatic amount; an
-    /// offset that takes the lift to 0 or below switches it off (`--white-offset -3` always does).
-    /// The lift only acts with the built-in ACES 2 display rendering, and a DNG carries it.
-    #[arg(long, value_name = "EV", value_parser = white_offset, allow_negative_numbers = true, help_heading = H_LIGHT)]
-    pub white_offset: Option<f64>,
 
     /// White balance: `auto`, or a temperature in kelvin (2000 to 11000) with an optional tint
     /// (-50 to 50), as `5200` or `5200,4`.
@@ -147,6 +153,22 @@ pub struct RenderArgs {
     /// stronger, less makes them greyer; brightness stays.
     #[arg(long, value_name = "auto|N", value_parser = percent_or_auto, allow_negative_numbers = true, help_heading = H_COLOR)]
     pub saturation: Option<PercentArg>,
+
+    /// Give the photo the look of another lens (`ym lenses list`). Flares and Edges take the lens's starting
+    /// amounts unless --flares or --edges is given, as when the lens is chosen in the app.
+    #[arg(long, value_enum, ignore_case = true, value_name = "LENS", help_heading = H_LENS)]
+    pub lens: Option<LensArg>,
+    /// Flares, 0 to 100: glow around bright light, veiling glare, ghosts and starbursts.
+    #[arg(long, value_name = "N", value_parser = lens_amount, help_heading = H_LENS)]
+    pub flares: Option<f64>,
+    /// Edges, 0 to 100: softer and darker edges, colour fringes and the lens's distortion.
+    #[arg(long, value_name = "N", value_parser = lens_amount, help_heading = H_LENS)]
+    pub edges: Option<f64>,
+    /// Anamorphic, 0 to 100: an anamorphic attachment in front of the lens, with taller out-of-focus highlights
+    /// that take the lens's own swirl and cat's-eye shapes, horizontal flare streaks and the anamorphic bend. It
+    /// works with every lens.
+    #[arg(long, value_name = "N", value_parser = lens_amount, help_heading = H_LENS)]
+    pub anamorphic: Option<f64>,
 
     /// Noise reduction: `auto`, or luminance, colour and detail strengths (0 to 100 each).
     #[arg(long, value_name = "auto|L,C,D", value_parser = noise_reduction, help_heading = H_DETAIL)]
@@ -171,7 +193,7 @@ pub struct RenderArgs {
     /// Switch the chromatic-aberration correction off.
     #[arg(long, help_heading = H_RAW)]
     pub no_ca: bool,
-    /// Highlight range and low-light toe, 0 to 1 each, as `1,0.5` (the defaults). Highlights: where the camera's
+    /// Highlight range and low-light toe, 0 to 1 each, as `0.6,0.5` (the defaults). Highlights: where the camera's
     /// clipping point lands, from where it was recorded (0) to white, the clip of an ALEXA at EI 800 (1).
     #[arg(long, value_name = "HIGHLIGHTS,LOW-LIGHT", value_parser = rolloff, help_heading = H_RAW)]
     pub rolloff: Option<RolloffArg>,
@@ -188,7 +210,7 @@ pub struct RenderArgs {
     /// Bits per channel for TIFF and PNG, 8 or 16 (default 16).
     #[arg(long, value_name = "BITS", value_parser = bits, help_heading = H_OUTPUT)]
     pub bits: Option<BitDepth>,
-    /// TIFF compression (default lzw).
+    /// TIFF compression (default zip).
     #[arg(long, value_enum, ignore_case = true, value_name = "METHOD", help_heading = H_OUTPUT)]
     pub compression: Option<CompressionArg>,
     /// Colour space of JPEG, TIFF and PNG files (default srgb).
@@ -213,8 +235,10 @@ pub struct RenderArgs {
     /// Photos read and analysed at the same time. The export itself renders one photo at a time.
     #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..=64), help_heading = H_RUN)]
     pub jobs: Option<u32>,
-    /// Print one JSON object per file on stdout, as each file finishes.
-    #[arg(long, help_heading = H_RUN)]
+    /// Print one JSON object per file on stdout, as each file finishes. Hidden from the help and
+    /// not promised to users: Yellowmoon's own tools (`tools/golden`) and tests use it
+    /// (`docs/13-testing.md`).
+    #[arg(long, hide = true, help_heading = H_RUN)]
     pub json: bool,
     /// Stop with exit code 4 when there is no usable GPU, instead of using the CPU.
     #[arg(long, conflicts_with = "cpu", help_heading = H_RUN)]
@@ -223,16 +247,45 @@ pub struct RenderArgs {
     /// Beats YELLOWMOON_GPU.
     #[arg(long, help_heading = H_RUN)]
     pub cpu: bool,
-    /// Apple Auto for this run. On a Mac with Apple Intelligence, Apple's on-device model grades each photo:
-    /// it sets the automatic exposure, highlights, shadows, black, contrast, warmth, tint and saturation and
-    /// the colours of the shadows and highlights. Default: the app's setting where Apple Auto is available,
-    /// off elsewhere.
+    /// Who grades each photo's Auto for this run: yellowmoon (Default Auto, the rule), apple (Apple's
+    /// on-device model, on a Mac with Apple Intelligence), claude (the Claude Code installed on this computer)
+    /// or agy (the Antigravity installed on this computer). A provider sets the automatic exposure, highlights,
+    /// shadows, black, contrast, warmth, tint and saturation and the colours of the shadows and highlights.
+    /// Default: the app's setting, which acts where that provider is available and, for claude and agy, where
+    /// you agreed to it in Preferences; otherwise Default Auto. Naming claude or agy is your consent
+    /// for this run: ym then sends a 768 px picture of each photo and the instructions to that service,
+    /// through the program installed on this computer. Answers from Claude Code and Antigravity can differ
+    /// from run to run.
+    #[arg(
+        long,
+        value_enum,
+        ignore_case = true,
+        value_name = "yellowmoon|apple|claude|agy",
+        hide_possible_values = true,
+        help_heading = H_RUN
+    )]
+    pub auto_provider: Option<AutoProviderArg>,
+    /// The old name of --auto-provider: on is apple, off is yellowmoon. Not with --auto-provider.
     #[arg(long, value_enum, ignore_case = true, value_name = "on|off", hide_possible_values = true, help_heading = H_RUN)]
     pub apple_auto: Option<AppleAutoArg>,
-    /// A text file with instructions for Apple's model, used for this run instead of those in Preferences
-    /// (at most 2000 characters; an empty file is the default instructions).
-    #[arg(long, value_name = "FILE", help_heading = H_RUN)]
-    pub apple_auto_instructions: Option<PathBuf>,
+    /// A text file with instructions for the model, used for this run instead of those in Preferences
+    /// (at most 2000 characters; an empty file is the default instructions). Also called
+    /// --apple-auto-instructions.
+    #[arg(long, alias = "apple-auto-instructions", value_name = "FILE", help_heading = H_RUN)]
+    pub auto_instructions: Option<PathBuf>,
+    /// Crop each photo as the Crop panel's Auto does: its straighten angle and its first frame for an aspect
+    /// (original, free, 1:1, 4:5 or 16:9; original when none is given), at the photo's orientation. Replaces a
+    /// crop from --settings.
+    #[arg(
+        long,
+        value_name = "ASPECT",
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "original",
+        value_parser = parse_crop_aspect,
+        help_heading = H_LOOK
+    )]
+    pub auto_crop: Option<CropAspect>,
 }
 
 impl RenderArgs {
@@ -321,24 +374,57 @@ impl From<ColorSpaceArg> for ColorSpace {
     }
 }
 
-/// `--apple-auto` (`docs/19` section 8).
+/// `--auto-provider` (`docs/22` section 13.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum AutoProviderArg {
+    /// Default Auto: the rule.
+    Yellowmoon,
+    /// Apple Intelligence's on-device model, where it is available.
+    Apple,
+    /// The Claude Code installed on this computer. Naming it is the consent for this run.
+    Claude,
+    /// The Antigravity (agy) installed on this computer. Naming it is the consent for this run.
+    Agy,
+}
+
+impl AutoProviderArg {
+    /// The provider the option names.
+    #[must_use]
+    pub fn provider(self) -> AutoProvider {
+        match self {
+            Self::Yellowmoon => AutoProvider::Yellowmoon,
+            Self::Apple => AutoProvider::Apple,
+            Self::Claude => AutoProvider::Claude,
+            Self::Agy => AutoProvider::Agy,
+        }
+    }
+}
+
+/// `--apple-auto`, the old name of `--auto-provider` (`docs/19` section 8, `docs/22` section 13.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum AppleAutoArg {
-    /// Apple Auto acts where it is available, whatever the app's setting says.
+    /// Same as `--auto-provider apple`.
     On,
-    /// Auto is Yellowmoon's own for this run.
+    /// Same as `--auto-provider yellowmoon`.
     Off,
 }
 
-impl AppleAutoArg {
-    /// The core's mode for the option, given or not: without it the app's setting decides.
-    #[must_use]
-    pub fn mode(arg: Option<Self>) -> AppleAutoMode {
-        match arg {
-            None => AppleAutoMode::FromPreference,
-            Some(Self::On) => AppleAutoMode::On,
-            Some(Self::Off) => AppleAutoMode::Off,
-        }
+/// The choice a run makes from `--auto-provider` and `--apple-auto` (`docs/22` section 10.3): the
+/// saved choice when neither is given, else the provider named.
+///
+/// # Errors
+///
+/// "Use --auto-provider or --apple-auto, not both." (a usage error) when both are given.
+pub fn auto_choice(
+    provider: Option<AutoProviderArg>,
+    apple_auto: Option<AppleAutoArg>,
+) -> Result<AutoChoice, String> {
+    match (provider, apple_auto) {
+        (Some(_), Some(_)) => Err("Use --auto-provider or --apple-auto, not both.".to_owned()),
+        (Some(p), None) => Ok(AutoChoice::Provider(p.provider())),
+        (None, Some(AppleAutoArg::On)) => Ok(AutoChoice::Provider(AutoProvider::Apple)),
+        (None, Some(AppleAutoArg::Off)) => Ok(AutoChoice::Provider(AutoProvider::Yellowmoon)),
+        (None, None) => Ok(AutoChoice::FromPreference),
     }
 }
 
@@ -357,6 +443,39 @@ pub enum LightArg {
     Led,
     /// Fluorescent light at the estimated colour.
     Fluorescent,
+}
+
+/// `--lens` (`docs/21` section 8): the ids of `data/lenses/`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum LensArg {
+    /// Clean and modern: even sharpness, faint glow.
+    Default,
+    /// Warm and gentle: soft glow, amber flares, smooth falloff.
+    Classic,
+    /// Glows wide open, lower contrast, soft edges, a little swirl.
+    Vintage,
+    /// Very sharp centre, strong swirl, fast falloff.
+    Petzval,
+    /// Soft corners, busy flares, a crisp centre.
+    Triplet,
+    /// Smooth and glowing, with gentle edges.
+    Sonnar,
+    /// Sharp only in the centre, with smeared flares.
+    Detuned,
+}
+
+impl From<LensArg> for LensKind {
+    fn from(l: LensArg) -> Self {
+        match l {
+            LensArg::Default => Self::Default,
+            LensArg::Classic => Self::Classic,
+            LensArg::Vintage => Self::Vintage,
+            LensArg::Petzval => Self::Petzval,
+            LensArg::Triplet => Self::Triplet,
+            LensArg::Sonnar => Self::Sonnar,
+            LensArg::Detuned => Self::Detuned,
+        }
+    }
 }
 
 /// `--exposure`.
@@ -530,12 +649,12 @@ fn sharpen(text: &str) -> Result<SharpenArg, String> {
     })
 }
 
-fn output_sharpening(text: &str) -> Result<f64, String> {
-    in_range(text, "the output sharpening", 0.0, 200.0)
+fn lens_amount(text: &str) -> Result<f64, String> {
+    in_range(text, "the amount", 0.0, 100.0)
 }
 
-fn white_offset(text: &str) -> Result<f64, String> {
-    in_range(text, "the white offset", -3.0, 3.0)
+fn output_sharpening(text: &str) -> Result<f64, String> {
+    in_range(text, "the output sharpening", 0.0, 200.0)
 }
 
 fn rolloff(text: &str) -> Result<RolloffArg, String> {
@@ -565,16 +684,27 @@ pub struct InfoArgs {
     #[arg(required = true, value_name = "FILES")]
     pub files: Vec<PathBuf>,
     /// Print one JSON object per file instead of text (the shape of `render --json` without
-    /// `output` and `timings_ms`).
-    #[arg(long)]
+    /// `output` and `timings_ms`). Hidden from the help and not promised to users
+    /// (`docs/13-testing.md`).
+    #[arg(long, hide = true)]
     pub json: bool,
     /// Force a camera profile, for comparisons (for example `sony-ilce-7rm4`).
     #[arg(long, value_name = "ID")]
     pub profile: Option<String>,
-    /// Apple Auto for this run. On a Mac with Apple Intelligence, Apple's on-device model grades each photo:
-    /// it sets the automatic exposure, highlights, shadows, black, contrast, warmth, tint and saturation and
-    /// the colours of the shadows and highlights. Default: the app's setting where Apple Auto is available,
-    /// off elsewhere.
+    /// Who grades each photo's Auto for this run: yellowmoon (Default Auto), apple (Apple Intelligence),
+    /// claude (Claude Code) or agy (Antigravity). Default: the app's setting. Naming claude or agy is your
+    /// consent for this run: ym sends a 768 px picture of each photo and the instructions to that service,
+    /// through the program installed on this computer. Answers from Claude Code and Antigravity can differ
+    /// from run to run.
+    #[arg(
+        long,
+        value_enum,
+        ignore_case = true,
+        value_name = "yellowmoon|apple|claude|agy",
+        hide_possible_values = true
+    )]
+    pub auto_provider: Option<AutoProviderArg>,
+    /// The old name of --auto-provider: on is apple, off is yellowmoon. Not with --auto-provider.
     #[arg(
         long,
         value_enum,
@@ -583,10 +713,37 @@ pub struct InfoArgs {
         hide_possible_values = true
     )]
     pub apple_auto: Option<AppleAutoArg>,
-    /// A text file with instructions for Apple's model, used for this run instead of those in Preferences
-    /// (at most 2000 characters; an empty file is the default instructions).
-    #[arg(long, value_name = "FILE")]
-    pub apple_auto_instructions: Option<PathBuf>,
+    /// A text file with instructions for the model, used for this run instead of those in Preferences
+    /// (at most 2000 characters; an empty file is the default instructions). Also called
+    /// --apple-auto-instructions.
+    #[arg(long, alias = "apple-auto-instructions", value_name = "FILE")]
+    pub auto_instructions: Option<PathBuf>,
+    /// Also print Auto crop's proposal: the straighten angle and the frame for an aspect (original, free, 1:1,
+    /// 4:5 or 16:9; original when none is given), for the photo as the camera turned it.
+    #[arg(
+        long,
+        value_name = "ASPECT",
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "original",
+        value_parser = parse_crop_aspect
+    )]
+    pub suggest_crop: Option<CropAspect>,
+}
+
+/// An Auto crop aspect as `ym info --suggest-crop` and `ym render --auto-crop` take it
+/// (`docs/20-auto-crop.md` §8).
+fn parse_crop_aspect(text: &str) -> Result<CropAspect, String> {
+    match text.trim().to_ascii_lowercase().as_str() {
+        "original" => Ok(CropAspect::Original),
+        "free" => Ok(CropAspect::Free),
+        "1:1" | "square" => Ok(CropAspect::Square),
+        "4:5" | "5:4" => Ok(CropAspect::FourByFive),
+        "16:9" | "9:16" => Ok(CropAspect::SixteenByNine),
+        other => Err(format!(
+            "{other} is not an aspect. Use original, free, 1:1, 4:5 or 16:9."
+        )),
+    }
 }
 
 /// Arguments of `ym doctor`.
@@ -619,6 +776,36 @@ pub enum LooksCommand {
     Default(LooksDefaultArgs),
     /// Developer tool: bake a parametric look to a 33-point LUT and render a contact sheet.
     Bake(LooksBakeArgs),
+}
+
+/// Subcommands of `ym film`.
+#[derive(Debug, Subcommand)]
+pub enum FilmCommand {
+    /// List the film stocks and papers with their ids, kinds, ISO numbers and matching papers.
+    List(FilmListArgs),
+}
+
+/// Arguments of `ym film list`.
+#[derive(Debug, Args)]
+pub struct FilmListArgs {
+    /// Print the list as JSON.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// Subcommands of `ym lenses`.
+#[derive(Debug, Subcommand)]
+pub enum LensesCommand {
+    /// List the lenses with their ids, names, lines, starting amounts and the design each was computed from.
+    List(LensesListArgs),
+}
+
+/// Arguments of `ym lenses list`.
+#[derive(Debug, Args)]
+pub struct LensesListArgs {
+    /// Print the list as JSON.
+    #[arg(long)]
+    pub json: bool,
 }
 
 /// Arguments of `ym looks list`.
@@ -707,33 +894,101 @@ mod tests {
     }
 
     #[test]
-    fn apple_auto_is_on_off_or_the_apps_setting_in_any_case() {
-        let mode = |args: &[&str]| -> AppleAutoMode {
+    fn the_auto_provider_is_named_in_any_case_or_follows_the_apps_setting() {
+        let choice = |args: &[&str]| -> Result<AutoChoice, String> {
             let cli = Cli::try_parse_from(args).expect("parses");
             match cli.command {
-                Command::Render(r) => AppleAutoArg::mode(r.apple_auto),
-                Command::Info(i) => AppleAutoArg::mode(i.apple_auto),
+                Command::Render(r) => auto_choice(r.auto_provider, r.apple_auto),
+                Command::Info(i) => auto_choice(i.auto_provider, i.apple_auto),
                 other => panic!("{other:?}"),
             }
         };
+        let named = |p| Ok(AutoChoice::Provider(p));
         assert_eq!(
-            mode(&["ym", "render", "a.ARW"]),
-            AppleAutoMode::FromPreference
+            choice(&["ym", "render", "a.ARW"]),
+            Ok(AutoChoice::FromPreference)
         );
         assert_eq!(
-            mode(&["ym", "render", "a.ARW", "--apple-auto", "on"]),
-            AppleAutoMode::On
+            choice(&["ym", "info", "a.ARW"]),
+            Ok(AutoChoice::FromPreference)
+        );
+        for (word, provider) in [
+            ("yellowmoon", AutoProvider::Yellowmoon),
+            ("apple", AutoProvider::Apple),
+            ("claude", AutoProvider::Claude),
+            ("agy", AutoProvider::Agy),
+            ("Claude", AutoProvider::Claude),
+            ("AGY", AutoProvider::Agy),
+        ] {
+            assert_eq!(
+                choice(&["ym", "render", "a.ARW", "--auto-provider", word]),
+                named(provider),
+                "{word}"
+            );
+            assert_eq!(
+                choice(&["ym", "info", "a.ARW", "--auto-provider", word]),
+                named(provider),
+                "{word}"
+            );
+        }
+        // The old name is an alias: on is apple, off is yellowmoon, in any case.
+        assert_eq!(
+            choice(&["ym", "render", "a.ARW", "--apple-auto", "on"]),
+            named(AutoProvider::Apple)
         );
         assert_eq!(
-            mode(&["ym", "info", "a.ARW", "--apple-auto", "OFF"]),
-            AppleAutoMode::Off
+            choice(&["ym", "info", "a.ARW", "--apple-auto", "OFF"]),
+            named(AutoProvider::Yellowmoon)
         );
+        // Both together are a usage error.
         assert_eq!(
-            mode(&["ym", "info", "a.ARW"]),
-            AppleAutoMode::FromPreference
+            choice(&[
+                "ym",
+                "render",
+                "a.ARW",
+                "--apple-auto",
+                "on",
+                "--auto-provider",
+                "claude"
+            ]),
+            Err("Use --auto-provider or --apple-auto, not both.".to_owned())
         );
+        // A name that is no provider, or no name, is a usage error.
+        assert!(
+            Cli::try_parse_from(["ym", "render", "a.ARW", "--auto-provider", "gemini"]).is_err()
+        );
+        assert!(Cli::try_parse_from(["ym", "render", "a.ARW", "--auto-provider"]).is_err());
         assert!(Cli::try_parse_from(["ym", "render", "a.ARW", "--apple-auto", "maybe"]).is_err());
         assert!(Cli::try_parse_from(["ym", "render", "a.ARW", "--apple-auto"]).is_err());
+    }
+
+    #[test]
+    fn the_instructions_file_has_two_names_and_not_both() {
+        let file = |args: &[&str]| match Cli::try_parse_from(args).expect("parses").command {
+            Command::Render(r) => r.auto_instructions,
+            Command::Info(i) => i.auto_instructions,
+            other => panic!("{other:?}"),
+        };
+        for name in ["--auto-instructions", "--apple-auto-instructions"] {
+            for command in ["render", "info"] {
+                assert_eq!(
+                    file(&["ym", command, "a.ARW", name, "words.txt"]),
+                    Some(PathBuf::from("words.txt"))
+                );
+            }
+        }
+        assert!(
+            Cli::try_parse_from([
+                "ym",
+                "render",
+                "a.ARW",
+                "--auto-instructions",
+                "a.txt",
+                "--apple-auto-instructions",
+                "b.txt"
+            ])
+            .is_err()
+        );
     }
 
     #[test]

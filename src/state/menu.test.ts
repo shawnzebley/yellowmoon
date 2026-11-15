@@ -1,7 +1,9 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createMockApi } from "../api.mock";
+import type { MenuAction } from "../api/types";
 import { checkNotice, runMenuAction } from "./menu";
 import { createStore } from "./store";
+import { mainGradePatch } from "./settingsGraph";
 
 /** A manual contrast or saturation (`docs/19` section 5: Auto or a value). */
 const manual = (value: number) => ({ kind: "manual", value }) as const;
@@ -46,7 +48,7 @@ describe("the Edit menu's settings items", () => {
     await vi.waitFor(() => expect(store.getState().session?.photos.every((p) => p.status.kind === "ready")).toBe(true));
     await store.openPhotos();
     await vi.waitFor(() => expect(store.currentSettings()).not.toBeNull());
-    await store.update({ contrast: manual(30) });
+    await store.update(mainGradePatch({ contrast: manual(30) }));
     const copy = vi.spyOn(store, "copySettings");
     const paste = vi.spyOn(store, "pasteSettings");
 
@@ -71,5 +73,51 @@ describe("the Edit menu's settings items", () => {
       api.emitEvent("menu_action", { action });
       expect(handler).toHaveBeenLastCalledWith(action);
     }
+  });
+});
+
+describe("the View menu's Nodes item", () => {
+  it("asks the Photos screen to toggle the node view, unless a dialog is open or no screen listens", async () => {
+    const store = createStore(createMockApi({ speed: Number.POSITIVE_INFINITY }), 0);
+    // No Photos screen: nothing happens, and nothing throws.
+    await runMenuAction(store, "nodes");
+    const command = vi.fn(() => true);
+    store.shortcutCommand = command;
+    await runMenuAction(store, "nodes");
+    expect(command).toHaveBeenCalledTimes(1);
+    store.openOverlay("preferences");
+    await runMenuAction(store, "nodes");
+    expect(command).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("the menu items of the single keys (docs/28 A-P11)", () => {
+  const ITEMS: [MenuAction, { action: string; look?: number }][] = [
+    ["crop", { action: "crop" }],
+    ["auto_crop", { action: "auto-crop" }],
+    ["pick_white", { action: "pick-white" }],
+    ["remove_photo", { action: "remove-photo" }],
+    ["bypass_node", { action: "bypass-node" }],
+    ["mask_view", { action: "mask-view" }],
+    ["look_1", { action: "pick-look", look: 1 }],
+    ["look_5", { action: "pick-look", look: 5 }],
+    ["look_9", { action: "pick-look", look: 9 }],
+  ];
+
+  it.each(ITEMS)("%s runs the key's own handler, whatever the switch says, and not under a dialog", async (item, shortcut) => {
+    const store = createStore(createMockApi({ speed: Number.POSITIVE_INFINITY }), 0);
+    await store.setPreferences({ single_key_shortcuts: false });
+    const command = vi.fn(() => true);
+    store.shortcutCommand = command;
+    await runMenuAction(store, item);
+    expect(command).toHaveBeenCalledExactlyOnceWith(shortcut);
+    store.openOverlay("preferences");
+    await runMenuAction(store, item);
+    expect(command).toHaveBeenCalledTimes(1);
+  });
+
+  it("do nothing, and throw nothing, with no Photos screen", async () => {
+    const store = createStore(createMockApi({ speed: Number.POSITIVE_INFINITY }), 0);
+    for (const [item] of ITEMS) await runMenuAction(store, item);
   });
 });

@@ -1,17 +1,28 @@
 //! Apple Auto: on Macs where Apple Intelligence's on-device model can look at a photo, that model
 //! grades it: it sets Auto's exposure, highlights, shadows, black level, contrast, warmth, tint and
-//! saturation and the colours of the shadows and the highlights (`docs/19-apple-auto.md`). This module
-//! is the platform-free half: the [`AutoAdvisor`] the app and `ym` hand to the core, the answer's
-//! steps and the table that turns them into values, the instructions the model reads, the burst rule,
-//! the states a photo goes through and a deterministic [`FakeAdvisor`] for tests. The Swift bridge
-//! that talks to Apple's model is `ym-apple`.
+//! saturation and the colours of the shadows and the highlights (`docs/19-apple-auto.md`). Since
+//! `docs/22-auto-providers.md` the same machinery grades with Claude Code and Antigravity (`agy`)
+//! too, so in this module "apple" means "the chosen provider's grading" (decision D3: the names stay,
+//! [`AdvisorInfo::provider`] says whose). This module is the platform-free half: the [`AutoAdvisor`] the
+//! app and `ym` hand to the core, the answer's steps and the table that turns them into values, the
+//! instructions the model reads, the burst rule, the states a photo goes through and a deterministic
+//! [`FakeAdvisor`] for tests. The providers, the consent and the status are in
+//! [`crate::auto_provider`]; the Swift bridge that talks to Apple's model is `ym-apple`, the two
+//! programs are `ym-agents`.
 //!
 //! Nothing here persists (hard rule 4): answers live in the session's memory.
 
 use std::fmt;
 
+use std::time::Duration;
+
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+
+use crate::auto_provider::{
+    AdvisorDetails, AutoConsent, AutoProvider, ChangeListener, IMAGE_ENCODING, SCHEMA_VERSION,
+    ToolInfo,
+};
 
 /// The version of the prompt and the answer's schema the bridge sends (`docs/19` section 4). Part
 /// of "version" under hard rule 8: change it whenever the words or the schema change. Version 1
@@ -292,7 +303,7 @@ pub fn check_instructions(text: &str) -> Result<(), String> {
     let n = text.chars().count();
     if n > INSTRUCTIONS_MAX_CHARS {
         return Err(format!(
-            "The instructions for Apple Intelligence are {n} characters long. At most {INSTRUCTIONS_MAX_CHARS} fit, because the model must also see the photo."
+            "The instructions are {n} characters long. At most {INSTRUCTIONS_MAX_CHARS} fit, because the model must also see the photo."
         ));
     }
     Ok(())
@@ -368,11 +379,28 @@ pub enum UnavailableReason {
     Unavailable,
     /// The model on this Mac cannot take pictures.
     NoImageInput,
+    /// No usable program was found (Claude Code, Antigravity; also: no advisor is registered for
+    /// the provider, `docs/22` section 10.4).
+    NotInstalled,
+    /// The program runs but its version is below the minimum.
+    TooOld,
+    /// The program runs and is not signed in.
+    SignedOut,
+    /// The program was found but its check failed, timed out or printed what cannot be read.
+    ProbeFailed,
+    /// Windows: only a `.cmd` or `.bat` shim was found, and no real program next to it.
+    UnsafeLauncher,
+    /// The first probe has not finished, or `agy`'s sign-in check has not been asked for yet.
+    Checking,
+    /// The provider is available but the person has not agreed to send photos through it
+    /// ([`Activity::decide`] only; never a provider's own reading).
+    NotConsented,
 }
 
 impl UnavailableReason {
     /// The reason in words, for `ym` and the logs ("Apple Auto is not available on this computer
-    /// (`<words>`).").
+    /// (`<words>`)."). The reasons of the two programs have their own words with the program's name
+    /// ([`crate::auto_provider::unavailable_words`]); these are the neutral ones.
     #[must_use]
     pub fn words(self) -> &'static str {
         match self {
@@ -385,6 +413,15 @@ impl UnavailableReason {
             Self::ModelNotReady => "Apple Intelligence is still downloading its model",
             Self::Unavailable => "Apple Intelligence is not available",
             Self::NoImageInput => "Apple's model on this Mac can't look at pictures",
+            Self::NotInstalled => "it isn't installed",
+            Self::TooOld => "it is too old",
+            Self::SignedOut => "it isn't signed in",
+            Self::ProbeFailed => "it didn't answer its check",
+            Self::UnsafeLauncher => {
+                "it was found only as a script that Yellowmoon can't run safely"
+            }
+            Self::Checking => "Yellowmoon is still checking",
+            Self::NotConsented => "you haven't agreed to send photos through it yet",
         }
     }
 }
@@ -421,10 +458,16 @@ pub enum FailureKind {
     BadAnswer,
     /// Anything else; the message says what.
     Other,
+    /// The program turned out not to be signed in (Claude Code, Antigravity).
+    NotSignedIn,
+    /// The program reported an error, could not be started, or ended without an answer (Claude
+    /// Code, Antigravity).
+    CliFailed,
 }
 
 impl FailureKind {
-    /// The failure in words, for `ym info` and the logs.
+    /// The failure in words, Apple Intelligence's (for `ym info` and the logs); the two programs'
+    /// are [`crate::auto_provider::failure_words`].
     #[must_use]
     pub fn words(self) -> &'static str {
         match self {
@@ -439,37 +482,79 @@ impl FailureKind {
             Self::ConcurrentRequests => "another request was running",
             Self::BadAnswer => "the answer could not be read",
             Self::Other => "an error",
+            Self::NotSignedIn => "the program isn't signed in",
+            Self::CliFailed => "the program reported an error",
         }
     }
 
-    /// Whether the request is tried again ([`RETRIES`] times, [`RETRY_PAUSE_MS`] apart).
+    /// Whether the request is tried again ([`RETRIES`] times, [`RETRY_PAUSE_MS`] apart): only for
+    /// Apple Intelligence and only for the failures macOS asks to wait after. The two programs
+    /// retry transient errors themselves and are never retried (`docs/22` section 9.2).
     #[must_use]
-    pub fn retried(self) -> bool {
-        matches!(self, Self::RateLimited | Self::ConcurrentRequests)
+    pub fn retried(self, provider: AutoProvider) -> bool {
+        provider == AutoProvider::Apple
+            && matches!(self, Self::RateLimited | Self::ConcurrentRequests)
     }
 }
 
-/// Which model answers, and with which instructions, for reports and `ym:AppleAuto`. JSON:
-/// `{ "model", "os", "instructions", "instructions_sha256" }`.
+/// Which model answers, and with which instructions, for reports and `ym:AutoAdvisor`. JSON:
+/// `{ "provider", "model", "os", "tool"?, "prompt", "instructions", "instructions_sha256" }`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AdvisorInfo {
-    /// The model variant's display name (`AFM 3 Core`).
+    /// Whose grading it is (`docs/22` D3). Apple Intelligence for [`AdvisorInfo::new`].
+    #[serde(default = "default_provider")]
+    pub provider: AutoProvider,
+    /// The model: Apple's variant display name (`AFM 3 Core`), or for the programs the id that
+    /// answered (`claude-sonnet-5-5`), the alias or slug asked for until one answered (`sonnet`), or
+    /// `default`.
     pub model: String,
-    /// The macOS version and build (`27.0.1 (27A404)`).
+    /// The macOS version and build (`27.0.1 (27A404)`); `""` for the programs.
     pub os: String,
+    /// What the program says about itself; `None` for Apple Intelligence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool: Option<ToolInfo>,
+    /// The version of the prompt the provider is asked with ([`AutoProvider::prompt_version`]).
+    #[serde(default = "default_prompt")]
+    pub prompt: u32,
     /// The instructions it read ([`DEFAULT_INSTRUCTIONS`] until the session says otherwise).
     #[serde(flatten)]
     pub instructions: InstructionsId,
 }
 
+fn default_provider() -> AutoProvider {
+    AutoProvider::Apple
+}
+
+fn default_prompt() -> u32 {
+    PROMPT_VERSION
+}
+
 impl AdvisorInfo {
-    /// A model on a macOS, with the default instructions (the session sets the ones it sends,
-    /// [`AdvisorInfo::with_instructions`]).
+    /// Apple Intelligence's model on a macOS, with the default instructions (the session sets the
+    /// ones it sends, [`AdvisorInfo::with_instructions`]).
     #[must_use]
     pub fn new(model: impl Into<String>, os: impl Into<String>) -> Self {
         Self {
+            provider: AutoProvider::Apple,
             model: model.into(),
             os: os.into(),
+            tool: None,
+            prompt: PROMPT_VERSION,
+            instructions: InstructionsId::default(),
+        }
+    }
+
+    /// A program's answers: `provider` (Claude Code or Antigravity), the model, and what the
+    /// program says about itself. The prompt is the provider's ([`AutoProvider::prompt_version`]),
+    /// the instructions the default ones.
+    #[must_use]
+    pub fn cli(provider: AutoProvider, model: impl Into<String>, tool: ToolInfo) -> Self {
+        Self {
+            provider,
+            model: model.into(),
+            os: String::new(),
+            tool: Some(tool),
+            prompt: provider.prompt_version(),
             instructions: InstructionsId::default(),
         }
     }
@@ -481,15 +566,41 @@ impl AdvisorInfo {
         self
     }
 
-    /// The version string of `docs/19` section 7:
-    /// `Apple Intelligence · AFM 3 Core · macOS 27.0.1 (27A404) · prompt 3 · table 2`, with
-    /// ` · edited instructions (<12 hex digits>)` when the person wrote their own.
+    /// The same info with the model that answered (a program says which model it used).
+    #[must_use]
+    pub fn with_model(mut self, model: impl Into<String>) -> Self {
+        self.model = model.into();
+        self
+    }
+
+    /// The version string of `docs/19` section 7 and `docs/22` section 14.3:
+    ///
+    /// * `Apple Intelligence · AFM 3 Core · macOS 27.0.1 (27A404) · prompt 3 · table 2`
+    /// * `Claude Code 2.1.310 · claude-sonnet-5-5 · prompt 1 · schema 1 · table 2`
+    /// * `Antigravity 1.4.7 · default · prompt 1 · schema 1 · table 2`
+    ///
+    /// each with ` · edited instructions (<12 hex digits>)` when the person wrote their own.
     #[must_use]
     pub fn version_string(&self) -> String {
-        let mut text = format!(
-            "Apple Intelligence · {} · macOS {} · prompt {PROMPT_VERSION} · table {TABLE_VERSION}",
-            self.model, self.os
-        );
+        let mut text = match self.provider {
+            AutoProvider::Apple => format!(
+                "Apple Intelligence · {} · macOS {} · prompt {} · table {TABLE_VERSION}",
+                self.model, self.os, self.prompt
+            ),
+            AutoProvider::Claude | AutoProvider::Agy => {
+                let version = self
+                    .tool
+                    .as_ref()
+                    .map_or(String::new(), |t| format!(" {}", t.version));
+                format!(
+                    "{}{version} · {} · prompt {} · schema {SCHEMA_VERSION} · table {TABLE_VERSION}",
+                    self.provider.name(),
+                    self.model,
+                    self.prompt
+                )
+            }
+            AutoProvider::Yellowmoon => format!("{} · table {TABLE_VERSION}", self.provider.name()),
+        };
         if self.instructions.instructions == InstructionsKind::Edited {
             text.push_str(&format!(
                 " · edited instructions ({})",
@@ -733,6 +844,11 @@ pub struct AdvisorAnswer {
     /// characters).
     #[serde(default)]
     pub plan: String,
+    /// The model id the program says answered (Claude Code's `modelUsage`, `docs/22` section 7.3);
+    /// `None` for Apple Intelligence and for `agy`, whose answers name none. The session writes it
+    /// into the photo's `info.model`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub served_model: Option<String>,
 }
 
 /// `text` trimmed and cut to `max` characters.
@@ -800,26 +916,78 @@ impl AdvisorError {
     }
 }
 
-/// Something that looks at a photo and grades it: Apple's on-device model through `ym-apple`, or
-/// [`FakeAdvisor`] in tests. The app and `ym` hand one to the core; every other caller hands none,
-/// which is the same as one that is unavailable.
+/// Something that looks at a photo and grades it: Apple's on-device model through `ym-apple`, the
+/// person's own Claude Code or Antigravity through `ym-agents`, or [`FakeAdvisor`] and
+/// [`crate::auto_provider::FakeProvider`] in tests. The app and `ym` hand a
+/// [`crate::auto_provider::ProviderAdvisors`] to the core; every other caller hands none, which is the
+/// same as advisors that are not installed.
+///
+/// The methods after [`AutoAdvisor::ask`] have defaults, so an advisor that probes nothing and runs
+/// no process (Apple's, [`FakeAdvisor`]) implements only the first two.
 pub trait AutoAdvisor: Send + Sync {
-    /// Whether it can answer now. Cheap; called at launch, when Preferences opens, when a session
-    /// opens and before each export.
+    /// Whether it can answer now: the last result, at once, never waiting for a process (property
+    /// reads, a lock). Called at launch, when Preferences opens, when a session opens and before each
+    /// export.
     fn availability(&self) -> Availability;
 
     /// Asks about one picture with `instructions` (the text the model reads before the photo,
-    /// [`effective_instructions`]: never empty). Blocks until the answer, a failure or
-    /// [`REQUEST_TIMEOUT_MS`]; called from one worker thread at a time, never from the main thread.
-    /// Retries are the caller's.
+    /// [`effective_instructions`]: never empty). Blocks until the answer, a failure or the provider's
+    /// hard stop ([`AutoProvider::timeout_s`]); called from a worker thread, never from the main
+    /// thread, and from up to [`AutoAdvisor::concurrency`] of them at once. Retries are the caller's
+    /// ([`FailureKind::retried`]).
     fn ask(
         &self,
         picture: &AdvisorPicture,
         instructions: &str,
     ) -> Result<AdvisorAnswer, AdvisorError>;
+
+    /// How many requests it takes at once (`docs/22` D6): Apple 1, Claude Code 2, Antigravity 1.
+    fn concurrency(&self) -> usize {
+        1
+    }
+
+    /// Starts a new probe of the program on a background thread and returns at once (`docs/22`
+    /// section 3.3). A call within [`crate::auto_provider::PROBE_MIN_INTERVAL_S`] of the last probe's
+    /// end, or while one runs, does nothing.
+    fn refresh(&self) {}
+
+    /// As [`AutoAdvisor::refresh`], for a check that the person asked for (Preferences opening, `ym
+    /// doctor`) and not one the app started by itself (a session opening, a change of the
+    /// preferences, before an export). The difference: an advisor that holds a sign-out its own
+    /// request found, against probes that only read the local sign-in state, lets go of it now
+    /// (`docs/22` sections 3.3 and 9.2). The default is [`AutoAdvisor::refresh`].
+    fn refresh_asked(&self) {
+        self.refresh();
+    }
+
+    /// Waits until no probe runs, or `timeout` has passed. Only `ym` uses it.
+    fn settle(&self, _timeout: Duration) {}
+
+    /// Kills the requests that are running; they return without a result (`docs/22` section 9.4).
+    fn cancel(&self) {}
+
+    /// Waits until no request or probe this advisor started is still running, that is every child it
+    /// started has been reaped and its temporary folder removed, or until `timeout` has passed;
+    /// returns whether it became idle. The core calls it after [`AutoAdvisor::cancel`] when the app
+    /// quits, and `ym`'s Ctrl-C handler does too. The default returns `true` (an advisor that runs no
+    /// process is always idle).
+    fn wait_idle(&self, _timeout: Duration) -> bool {
+        true
+    }
+
+    /// Registers the listener to call when the cached availability changes (`docs/22` section 3.3).
+    /// It runs on the advisor's probe thread and must not block.
+    fn on_change(&self, _listener: ChangeListener) {}
+
+    /// What the advisor knows besides its availability: the program's path and version, how it is
+    /// signed in, the breaker's sentence while it is open.
+    fn details(&self) -> AdvisorDetails {
+        AdvisorDetails::default()
+    }
 }
 
-/// Where a photo stands with Apple Auto (`docs/19` sections 6 and 12).
+/// Where a photo stands with the chosen provider's Auto (`docs/19` sections 6 and 12; `docs/22`
+/// section 10.4).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum AppleAuto {
@@ -880,20 +1048,23 @@ impl AppleAuto {
 }
 
 impl AppleAuto {
-    /// The `ym:AppleAuto` property of an export (`docs/19` section 9): compact JSON with sorted keys,
-    /// written only when Apple Auto was on for the photo, so `None` for [`AppleAuto::Off`],
+    /// The `ym:AutoAdvisor` property of an export (`docs/22` section 14.2): compact JSON with sorted
+    /// keys, written only when a provider acted on the photo, so `None` for [`AppleAuto::Off`],
     /// [`AppleAuto::Unavailable`] and [`AppleAuto::Pending`] (an export waits for the answer; only a
     /// photo whose session closed under its export can still be pending). A step the model left
-    /// empty is `null`.
+    /// empty is `null`; a key without a value is left out. The program's path, its messages and the
+    /// working folder are never written.
     ///
     /// ```text
+    /// {"api":"firstParty","image":"jpeg444q92@768","instructions":"default","instructions_sha256":"…",
+    ///  "model":"claude-sonnet-5-5","plan":"…","prompt":1,"provider":"claude","reproducible":false,
+    ///  "result":"answered","scene":"…","schema":1,"steps":{"blacks":null,…},"table":2,"tool_version":"2.1.310"}
     /// {"instructions":"default","instructions_sha256":"…","model":"AFM 3 Core","os":"27.0.1 (27A404)",
-    ///  "plan":"…","prompt":3,"result":"answered","scene":"…","steps":{"blacks":null,"contrast":1,…},"table":2}
-    /// {"instructions":"default","instructions_sha256":"…","model":"…","os":"…","prompt":3,
-    ///  "reason":"rate_limited","result":"failed","table":2}
+    ///  "plan":"…","prompt":3,"provider":"apple","reproducible":true,"result":"answered","scene":"…",
+    ///  "steps":{…},"table":2}
     /// ```
     #[must_use]
-    pub fn xmp_json(&self) -> Option<String> {
+    pub fn advisor_json(&self) -> Option<String> {
         use serde_json::{Value, json};
         use std::collections::BTreeMap;
         let mut map: BTreeMap<&'static str, Value> = BTreeMap::new();
@@ -912,8 +1083,21 @@ impl AppleAuto {
                 info
             }
         };
+        map.insert("provider", json!(info.provider.id()));
         map.insert("model", json!(info.model));
-        map.insert("os", json!(info.os));
+        if !info.os.is_empty() {
+            map.insert("os", json!(info.os));
+        }
+        if let Some(tool) = &info.tool {
+            map.insert("tool_version", json!(tool.version));
+            if let Some(api) = &tool.api {
+                map.insert("api", json!(api));
+            }
+        }
+        if info.provider.is_cloud() {
+            map.insert("schema", json!(SCHEMA_VERSION));
+            map.insert("image", json!(IMAGE_ENCODING));
+        }
         map.insert(
             "instructions",
             serde_json::to_value(info.instructions.instructions).ok()?,
@@ -922,8 +1106,9 @@ impl AppleAuto {
             "instructions_sha256",
             json!(info.instructions.instructions_sha256),
         );
-        map.insert("prompt", json!(PROMPT_VERSION));
+        map.insert("prompt", json!(info.prompt));
         map.insert("table", json!(TABLE_VERSION));
+        map.insert("reproducible", json!(info.provider == AutoProvider::Apple));
         serde_json::to_string(&map).ok()
     }
 }
@@ -946,53 +1131,53 @@ pub fn steps_json(steps: &AutoSteps) -> serde_json::Value {
     }
 }
 
-/// How a run decides whether Apple Auto is used (`docs/19` sections 2 and 8): the app follows the
-/// preference; `ym --apple-auto on|off` overrides it for one run.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AppleAutoMode {
-    /// The `apple_auto` preference decides (the app, and `ym` without `--apple-auto`).
-    #[default]
-    FromPreference,
-    /// On for this run, whatever the preference says (still only where it is available).
-    On,
-    /// Off for this run: Auto is the rule.
-    Off,
-}
-
-/// Whether Apple Auto acts for a session now, and if not, why (`docs/19` sections 1 and 2).
+/// Whether the chosen provider acts for a session now, and if not, why (`docs/22` section 10.4).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Activity {
     /// It acts: photos are asked, answers change Auto. Which model answers.
     Active(AdvisorInfo),
-    /// Off: no advisor was given, `--apple-auto off`, or the preference is off.
+    /// Off: no advisor was given at all, or Default Auto is chosen.
     Off,
-    /// Not available on this computer.
+    /// The chosen provider cannot act: not available, not installed, or not consented.
     Unavailable(UnavailableReason),
 }
 
 impl Activity {
-    /// Decides the activity. In this order: no advisor is off (tests, the golden tool); a run with
-    /// `--apple-auto off` is off; where Apple Auto is not available it is unavailable whatever the
-    /// preference says (the preference is kept and ignored there, `docs/19` section 2); the
-    /// preference off is off (unless the run says `on`); else it acts. `availability` is the last
-    /// one read; none read yet counts as unavailable.
+    /// Decides the activity. The first rule that applies decides (`docs/22` section 10.4):
+    ///
+    /// 1. no advisor was given at all (`has_advisors` false: the golden tool, most tests): off;
+    /// 2. Default Auto is chosen: off;
+    /// 3. the chosen provider has no advisor, or its availability has not been read (`availability`
+    ///    is `None`): unavailable, reason `not_installed`;
+    /// 4. its availability is `Unavailable(reason)`: unavailable with that reason (the choice is
+    ///    kept and ignored, `docs/19` section 2); except that a cloud provider the run did not name
+    ///    and whose consent is not saved is never probed (`docs/22` section 13.1), so it still reads
+    ///    `checking` and no answer is coming: that reads `not_consented`, as the next rule says;
+    /// 5. the provider is a cloud one, the run did not name it (`explicit` false) and the saved
+    ///    consent does not cover it: unavailable, reason `not_consented`;
+    /// 6. otherwise it acts.
     #[must_use]
     pub fn decide(
-        has_advisor: bool,
-        mode: AppleAutoMode,
-        preference: bool,
+        has_advisors: bool,
+        chosen: AutoProvider,
+        explicit: bool,
+        consent: &AutoConsent,
         availability: Option<&Availability>,
     ) -> Self {
-        if !has_advisor || mode == AppleAutoMode::Off {
+        if !has_advisors || chosen == AutoProvider::Yellowmoon {
             return Self::Off;
         }
         match availability {
-            None => Self::Unavailable(UnavailableReason::Unavailable),
+            None => Self::Unavailable(UnavailableReason::NotInstalled),
+            Some(Availability::Unavailable(UnavailableReason::Checking))
+                if chosen.is_cloud() && !explicit && !consent.get(chosen) =>
+            {
+                Self::Unavailable(UnavailableReason::NotConsented)
+            }
             Some(Availability::Unavailable(reason)) => Self::Unavailable(*reason),
             Some(Availability::Available(info)) => {
-                if mode == AppleAutoMode::FromPreference && !preference {
-                    Self::Off
+                if chosen.is_cloud() && !explicit && !consent.get(chosen) {
+                    Self::Unavailable(UnavailableReason::NotConsented)
                 } else {
                     Self::Active(info.clone())
                 }
@@ -1000,15 +1185,15 @@ impl Activity {
         }
     }
 
-    /// Whether Apple Auto acts.
+    /// Whether a provider acts.
     #[must_use]
     pub fn is_active(&self) -> bool {
         matches!(self, Self::Active(_))
     }
 
-    /// The state of a photo under this activity: its own result while Apple Auto acts (pending until
+    /// The state of a photo under this activity: its own result while a provider acts (pending until
     /// there is one), else off or unavailable. `result` is [`AppleAuto::Answered`] or
-    /// [`AppleAuto::Failed`] when the photo was asked; answers are kept while Apple Auto is off.
+    /// [`AppleAuto::Failed`] when the photo was asked; answers are kept while the provider is off.
     #[must_use]
     pub fn photo_state(&self, result: Option<&AppleAuto>) -> AppleAuto {
         match self {
@@ -1017,42 +1202,6 @@ impl Activity {
             Self::Active(_) => result.cloned().unwrap_or(AppleAuto::Pending),
         }
     }
-}
-
-/// What the app's Preferences and `ym doctor` show about Apple Auto (`docs/19` sections 1, 2 and 8).
-/// JSON, snake_case: `{ "available": true, "reason": null, "info": { "model": "…", "os": "…", … },
-/// "preference": true, "mode": "from_preference", "active": true, "prompt": 3, "table": 2,
-/// "instructions": "default", "instructions_sha256": "…", "own_instructions": "",
-/// "default_instructions": "…", "instructions_max_chars": 2000 }`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AppleAutoStatus {
-    /// Whether Apple Auto is available on this computer now (read again for this answer). False when
-    /// the core was given no advisor.
-    pub available: bool,
-    /// Why it is not available; `None` when it is, and when the core was given no advisor.
-    pub reason: Option<UnavailableReason>,
-    /// Which model answers, when it is available.
-    pub info: Option<AdvisorInfo>,
-    /// The `apple_auto` preference.
-    pub preference: bool,
-    /// How this run decides ([`AppleAutoMode`]).
-    pub mode: AppleAutoMode,
-    /// Whether Apple Auto acts for the session now ([`Activity::decide`]).
-    pub active: bool,
-    /// [`PROMPT_VERSION`].
-    pub prompt: u32,
-    /// [`TABLE_VERSION`].
-    pub table: u32,
-    /// Which instructions the model reads: default or edited, and their short digest.
-    #[serde(flatten)]
-    pub instructions: InstructionsId,
-    /// The person's own instructions, `""` when they use the default (the
-    /// `apple_auto_instructions` preference, or `ym --apple-auto-instructions`).
-    pub own_instructions: String,
-    /// [`DEFAULT_INSTRUCTIONS`], for Preferences' text field and its Reset to default.
-    pub default_instructions: String,
-    /// [`INSTRUCTIONS_MAX_CHARS`].
-    pub instructions_max_chars: usize,
 }
 
 /// The median of the values that are set, the lower of the two middle ones for an even count;
@@ -1226,6 +1375,7 @@ impl AutoAdvisor for FakeAdvisor {
             },
             scene: "Test picture".to_owned(),
             plan: Self::plan_for(instructions),
+            served_model: None,
         })
     }
 }
@@ -1453,6 +1603,7 @@ mod tests {
             steps: AutoSteps::keep(),
             scene: long.clone(),
             plan: long,
+            served_model: None,
         }
         .checked()
         .unwrap();
@@ -1462,6 +1613,7 @@ mod tests {
             steps: steps(0, 0, 5, 0),
             scene: String::new(),
             plan: String::new(),
+            served_model: None,
         }
         .checked()
         .unwrap_err();
@@ -1478,6 +1630,7 @@ mod tests {
                 steps: empty,
                 scene: "A scene".to_owned(),
                 plan: "A plan".to_owned(),
+                served_model: None,
             }
             .checked()
             .unwrap_err();
@@ -1492,6 +1645,7 @@ mod tests {
             },
             scene: String::new(),
             plan: String::new(),
+            served_model: None,
         }
         .checked()
         .unwrap();
@@ -1689,6 +1843,34 @@ mod tests {
     }
 
     #[test]
+    fn the_version_strings_of_the_two_programs() {
+        let tool = |v: &str| ToolInfo {
+            version: v.to_owned(),
+            api: Some("firstParty".to_owned()),
+            auth: None,
+        };
+        let claude = AdvisorInfo::cli(AutoProvider::Claude, "claude-sonnet-5-5", tool("2.1.310"));
+        assert_eq!(
+            claude.version_string(),
+            "Claude Code 2.1.310 · claude-sonnet-5-5 · prompt 1 · schema 1 · table 2"
+        );
+        let agy = AdvisorInfo::cli(AutoProvider::Agy, "default", tool("1.4.7"));
+        assert_eq!(
+            agy.version_string(),
+            "Antigravity 1.4.7 · default · prompt 1 · schema 1 · table 2"
+        );
+        let digest = InstructionsId::of("Moody.").instructions_sha256;
+        assert_eq!(
+            agy.with_instructions("Moody.").version_string(),
+            format!(
+                "Antigravity 1.4.7 · default · prompt 1 · schema 1 · table 2 · edited instructions ({digest})"
+            )
+        );
+        assert_eq!(claude.clone().with_model("sonnet").model, "sonnet");
+        assert_eq!((claude.os.as_str(), claude.prompt), ("", 1));
+    }
+
+    #[test]
     fn instructions_resolve_check_and_digest() {
         assert_eq!(effective_instructions(""), DEFAULT_INSTRUCTIONS);
         assert_eq!(effective_instructions("  \n "), DEFAULT_INSTRUCTIONS);
@@ -1717,12 +1899,33 @@ mod tests {
         assert_eq!(
             serde_json::to_value(AdvisorInfo::new("m", "o")).unwrap(),
             serde_json::json!({
+                "provider": "apple",
                 "model": "m",
                 "os": "o",
+                "prompt": 3,
                 "instructions": "default",
                 "instructions_sha256": d.instructions_sha256,
             })
         );
+        // A program's info carries its tool; an info written before providers reads as Apple's.
+        let cli = AdvisorInfo::cli(
+            AutoProvider::Claude,
+            "sonnet",
+            ToolInfo {
+                version: "2.1.310".to_owned(),
+                api: None,
+                auth: None,
+            },
+        );
+        let json = serde_json::to_value(&cli).unwrap();
+        assert_eq!(json["provider"], "claude");
+        assert_eq!(json["tool"]["version"], "2.1.310");
+        assert_eq!(serde_json::from_value::<AdvisorInfo>(json).unwrap(), cli);
+        let old: AdvisorInfo = serde_json::from_value(serde_json::json!({
+            "model": "m", "os": "o", "instructions": "default", "instructions_sha256": d.instructions_sha256,
+        }))
+        .unwrap();
+        assert_eq!(old, AdvisorInfo::new("m", "o"));
     }
 
     #[test]
@@ -1745,30 +1948,54 @@ mod tests {
     }
 
     #[test]
-    fn the_xmp_property_is_compact_sorted_json_for_an_answer_or_a_failure_only() {
-        let answered = AppleAuto::Answered {
-            answer: AdvisorAnswer {
-                steps: AutoSteps {
-                    exposure: Some(1),
-                    white: Some(-1),
-                    contrast: Some(1),
-                    saturation: Some(0),
-                    shadow_color: Some(ShadowColor::Teal),
-                    shadow_color_strength: Some(2),
-                    ..AutoSteps::default()
-                },
-                scene: "Backlit portrait \"at\" dusk".to_owned(),
-                plan: "Teal shadows, warm skin".to_owned(),
+    fn the_advisor_property_is_compact_sorted_json_for_an_answer_or_a_failure_only() {
+        let answer = |plan: &str| AdvisorAnswer {
+            steps: AutoSteps {
+                exposure: Some(1),
+                white: Some(-1),
+                contrast: Some(1),
+                saturation: Some(0),
+                shadow_color: Some(ShadowColor::Teal),
+                shadow_color_strength: Some(2),
+                ..AutoSteps::default()
             },
+            scene: "Backlit portrait \"at\" dusk".to_owned(),
+            plan: plan.to_owned(),
+            served_model: None,
+        };
+        let answered = AppleAuto::Answered {
+            answer: answer("Teal shadows, warm skin"),
             info: info(),
         };
         let sha = InstructionsId::default().instructions_sha256;
         assert_eq!(
-            answered.xmp_json().unwrap(),
+            answered.advisor_json().unwrap(),
             format!(
-                r#"{{"instructions":"default","instructions_sha256":"{sha}","model":"AFM 3 Core","os":"27.0.1 (27A404)","plan":"Teal shadows, warm skin","prompt":3,"result":"answered","scene":"Backlit portrait \"at\" dusk","steps":{{"blacks":null,"contrast":1,"exposure":1,"highlight_color":null,"highlight_color_strength":null,"highlights":null,"saturation":0,"shadow_color":"teal","shadow_color_strength":2,"shadows":null,"tint":null,"white":-1}},"table":2}}"#
+                r#"{{"instructions":"default","instructions_sha256":"{sha}","model":"AFM 3 Core","os":"27.0.1 (27A404)","plan":"Teal shadows, warm skin","prompt":3,"provider":"apple","reproducible":true,"result":"answered","scene":"Backlit portrait \"at\" dusk","steps":{{"blacks":null,"contrast":1,"exposure":1,"highlight_color":null,"highlight_color_strength":null,"highlights":null,"saturation":0,"shadow_color":"teal","shadow_color_strength":2,"shadows":null,"tint":null,"white":-1}},"table":2}}"#
             )
         );
+        let claude_info = AdvisorInfo::cli(
+            AutoProvider::Claude,
+            "claude-sonnet-5-5",
+            ToolInfo {
+                version: "2.1.310".to_owned(),
+                api: Some("firstParty".to_owned()),
+                auth: Some("oauth_token".to_owned()),
+            },
+        );
+        let claude = AppleAuto::Answered {
+            answer: answer("Cool, crisp"),
+            info: claude_info.clone(),
+        };
+        assert_eq!(
+            claude.advisor_json().unwrap(),
+            format!(
+                r#"{{"api":"firstParty","image":"jpeg444q92@768","instructions":"default","instructions_sha256":"{sha}","model":"claude-sonnet-5-5","plan":"Cool, crisp","prompt":1,"provider":"claude","reproducible":false,"result":"answered","scene":"Backlit portrait \"at\" dusk","schema":1,"steps":{{"blacks":null,"contrast":1,"exposure":1,"highlight_color":null,"highlight_color_strength":null,"highlights":null,"saturation":0,"shadow_color":"teal","shadow_color_strength":2,"shadows":null,"tint":null,"white":-1}},"table":2,"tool_version":"2.1.310"}}"#
+            )
+        );
+        // The program's path, its messages and its auth method are never written.
+        let json = claude.advisor_json().unwrap();
+        assert!(!json.contains("oauth_token") && !json.contains("\"os\""));
         let failed = AppleAuto::Failed {
             kind: FailureKind::RateLimited,
             message: "busy".to_owned(),
@@ -1776,9 +2003,20 @@ mod tests {
         };
         let edited = InstructionsId::of("Moody.").instructions_sha256;
         assert_eq!(
-            failed.xmp_json().unwrap(),
+            failed.advisor_json().unwrap(),
             format!(
-                r#"{{"instructions":"edited","instructions_sha256":"{edited}","model":"AFM 3 Core","os":"27.0.1 (27A404)","prompt":3,"reason":"rate_limited","result":"failed","table":2}}"#
+                r#"{{"instructions":"edited","instructions_sha256":"{edited}","model":"AFM 3 Core","os":"27.0.1 (27A404)","prompt":3,"provider":"apple","reason":"rate_limited","reproducible":true,"result":"failed","table":2}}"#
+            )
+        );
+        let timed_out = AppleAuto::Failed {
+            kind: FailureKind::Timeout,
+            message: "no answer".to_owned(),
+            info: claude_info.with_model("sonnet"),
+        };
+        assert_eq!(
+            timed_out.advisor_json().unwrap(),
+            format!(
+                r#"{{"api":"firstParty","image":"jpeg444q92@768","instructions":"default","instructions_sha256":"{sha}","model":"sonnet","prompt":1,"provider":"claude","reason":"timeout","reproducible":false,"result":"failed","schema":1,"table":2,"tool_version":"2.1.310"}}"#
             )
         );
         for none in [
@@ -1788,42 +2026,126 @@ mod tests {
                 reason: UnavailableReason::NotAMac,
             },
         ] {
-            assert_eq!(none.xmp_json(), None);
+            assert_eq!(none.advisor_json(), None);
         }
     }
 
     #[test]
-    fn the_activity_follows_the_advisor_the_mode_the_availability_and_the_preference() {
+    fn the_activity_follows_the_six_rules_in_order() {
+        use AutoProvider::{Agy, Apple, Claude, Yellowmoon};
         let available = Availability::Available(info());
+        let claude_available = Availability::Available(AdvisorInfo::cli(
+            Claude,
+            "sonnet",
+            ToolInfo {
+                version: "2.1.310".to_owned(),
+                api: None,
+                auth: None,
+            },
+        ));
         let off_here = Availability::Unavailable(UnavailableReason::AppleIntelligenceOff);
-        use AppleAutoMode::{FromPreference, Off, On};
-        // No advisor, or a run that says off: off.
+        let none = AutoConsent::default();
+        let claude_ok = AutoConsent {
+            claude: true,
+            agy: false,
+        };
+        // 1. No advisor at all: off, whatever else holds.
         assert_eq!(
-            Activity::decide(false, On, true, Some(&available)),
+            Activity::decide(false, Apple, true, &claude_ok, Some(&available)),
             Activity::Off
         );
+        // 2. Default Auto: off.
         assert_eq!(
-            Activity::decide(true, Off, true, Some(&available)),
+            Activity::decide(true, Yellowmoon, true, &claude_ok, Some(&available)),
             Activity::Off
         );
-        // Not available: unavailable, whatever the preference.
-        for (mode, pref) in [(FromPreference, true), (FromPreference, false), (On, false)] {
+        // 3. No advisor for the chosen provider, or not read yet: unavailable, not installed.
+        for chosen in [Apple, Claude, Agy] {
             assert_eq!(
-                Activity::decide(true, mode, pref, Some(&off_here)),
-                Activity::Unavailable(UnavailableReason::AppleIntelligenceOff)
+                Activity::decide(true, chosen, false, &claude_ok, None),
+                Activity::Unavailable(UnavailableReason::NotInstalled),
+                "{chosen:?}"
             );
         }
+        // 4. Not available: unavailable with its reason, whatever the consent or the run says.
+        for explicit in [false, true] {
+            assert_eq!(
+                Activity::decide(true, Apple, explicit, &none, Some(&off_here)),
+                Activity::Unavailable(UnavailableReason::AppleIntelligenceOff)
+            );
+            assert_eq!(
+                Activity::decide(
+                    true,
+                    Claude,
+                    explicit,
+                    &claude_ok,
+                    Some(&Availability::Unavailable(UnavailableReason::SignedOut))
+                ),
+                Activity::Unavailable(UnavailableReason::SignedOut)
+            );
+        }
+        let checking = Availability::Unavailable(UnavailableReason::Checking);
+        let agy_ok = AutoConsent {
+            claude: false,
+            agy: true,
+        };
         assert_eq!(
-            Activity::decide(true, FromPreference, true, None),
-            Activity::Unavailable(UnavailableReason::Unavailable)
+            Activity::decide(true, Agy, false, &agy_ok, Some(&checking)),
+            Activity::Unavailable(UnavailableReason::Checking)
         );
-        // Available: the preference decides, unless the run says on.
-        assert!(Activity::decide(true, FromPreference, true, Some(&available)).is_active());
+        // A cloud provider that was never probed because nothing allows it to act (no consent saved,
+        // the run did not name it) reads `checking` for ever: that is `not_consented`, every time.
+        for chosen in [Claude, Agy] {
+            assert_eq!(
+                Activity::decide(true, chosen, false, &none, Some(&checking)),
+                Activity::Unavailable(UnavailableReason::NotConsented),
+                "{chosen:?}"
+            );
+            // Named by the run: it is being probed, so it is `checking`.
+            assert_eq!(
+                Activity::decide(true, chosen, true, &none, Some(&checking)),
+                Activity::Unavailable(UnavailableReason::Checking),
+                "{chosen:?}"
+            );
+        }
+        // Other reasons keep their words, consent or not (the program was probed).
         assert_eq!(
-            Activity::decide(true, FromPreference, false, Some(&available)),
-            Activity::Off
+            Activity::decide(
+                true,
+                Claude,
+                false,
+                &none,
+                Some(&Availability::Unavailable(UnavailableReason::SignedOut))
+            ),
+            Activity::Unavailable(UnavailableReason::SignedOut)
         );
-        assert!(Activity::decide(true, On, false, Some(&available)).is_active());
+        // 5. A cloud provider needs its saved consent unless the run named it.
+        assert_eq!(
+            Activity::decide(true, Claude, false, &none, Some(&claude_available)),
+            Activity::Unavailable(UnavailableReason::NotConsented)
+        );
+        assert_eq!(
+            Activity::decide(
+                true,
+                Claude,
+                false,
+                &AutoConsent {
+                    claude: false,
+                    agy: true
+                },
+                Some(&claude_available)
+            ),
+            Activity::Unavailable(UnavailableReason::NotConsented)
+        );
+        assert!(Activity::decide(true, Claude, true, &none, Some(&claude_available)).is_active());
+        // 6. Otherwise it acts; Apple needs no consent.
+        assert!(
+            Activity::decide(true, Claude, false, &claude_ok, Some(&claude_available)).is_active()
+        );
+        assert_eq!(
+            Activity::decide(true, Apple, false, &none, Some(&available)),
+            Activity::Active(info())
+        );
         // A photo's state: its result while active, pending without one; off or unavailable else.
         let active = Activity::Active(info());
         assert_eq!(active.photo_state(None), AppleAuto::Pending);
@@ -1835,16 +2157,57 @@ mod tests {
         assert_eq!(active.photo_state(Some(&failed)), failed);
         assert_eq!(Activity::Off.photo_state(Some(&failed)), AppleAuto::Off);
         assert_eq!(
-            serde_json::to_value(AppleAutoMode::FromPreference).unwrap(),
-            serde_json::json!("from_preference")
+            Activity::Unavailable(UnavailableReason::NotConsented).photo_state(Some(&failed)),
+            AppleAuto::Unavailable {
+                reason: UnavailableReason::NotConsented
+            }
         );
     }
 
     #[test]
-    fn only_waiting_failures_are_retried() {
-        assert!(FailureKind::RateLimited.retried());
-        assert!(FailureKind::ConcurrentRequests.retried());
-        assert!(!FailureKind::Timeout.retried());
-        assert!(!FailureKind::Refused.retried());
+    fn only_apples_waiting_failures_are_retried() {
+        use AutoProvider::{Agy, Apple, Claude};
+        assert!(FailureKind::RateLimited.retried(Apple));
+        assert!(FailureKind::ConcurrentRequests.retried(Apple));
+        assert!(!FailureKind::Timeout.retried(Apple));
+        assert!(!FailureKind::Refused.retried(Apple));
+        // The two programs retry transient errors themselves and are never retried.
+        for provider in [Claude, Agy] {
+            for kind in [
+                FailureKind::RateLimited,
+                FailureKind::ConcurrentRequests,
+                FailureKind::Timeout,
+                FailureKind::CliFailed,
+                FailureKind::NotSignedIn,
+            ] {
+                assert!(!kind.retried(provider), "{provider:?} {kind:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_new_reasons_and_failures_have_wire_names() {
+        for (reason, wire) in [
+            (UnavailableReason::NotInstalled, "not_installed"),
+            (UnavailableReason::TooOld, "too_old"),
+            (UnavailableReason::SignedOut, "signed_out"),
+            (UnavailableReason::ProbeFailed, "probe_failed"),
+            (UnavailableReason::UnsafeLauncher, "unsafe_launcher"),
+            (UnavailableReason::Checking, "checking"),
+            (UnavailableReason::NotConsented, "not_consented"),
+        ] {
+            assert_eq!(
+                serde_json::to_value(reason).unwrap(),
+                serde_json::json!(wire)
+            );
+        }
+        assert_eq!(
+            serde_json::to_value(FailureKind::NotSignedIn).unwrap(),
+            serde_json::json!("not_signed_in")
+        );
+        assert_eq!(
+            serde_json::to_value(FailureKind::CliFailed).unwrap(),
+            serde_json::json!("cli_failed")
+        );
     }
 }

@@ -1,17 +1,29 @@
 //! What every command that develops photos needs: the core with the CLI's options, the Ctrl-C
-//! flag, the graphics device, opened by `ym_core::app::gpu::open_gpu` like the app's, and Apple
-//! Auto's advisor (`ym_apple::system_advisor`, the app's too, `docs/19`).
+//! flag, the graphics device, opened by `ym_core::app::gpu::open_gpu` like the app's, and the Auto
+//! providers' advisors (Apple's `ym_apple::system_advisor`, the app's too, `docs/19`, and the two
+//! programs' `ym_agents::system_advisors`, `docs/22`).
+
+// The WebAssembly build (the iPhone web app) has no signals and starts no programs, so the Ctrl-C
+// and agent parts below go unused there.
+#![cfg_attr(target_family = "wasm", allow(unused))]
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, mpsc};
+use std::sync::{Mutex, OnceLock, mpsc};
 use std::time::Duration;
 
-use ym_core::app::gpu::{GpuPolicy, GpuSlot, open_gpu};
+use ym_agents::StartProbe;
+use ym_core::app::gpu::{GpuPolicy, GpuSlot};
 use ym_core::app::{Core, CoreError, CoreOptions};
-use ym_core::apple_auto::{AppleAutoMode, UnavailableReason};
+use ym_core::apple_auto::UnavailableReason;
+use ym_core::auto_provider::{
+    AutoChoice, AutoProvider, AutoStatus, ProviderAdvisors, ProviderState, cloud_notice,
+    unavailable_hint,
+};
 use ym_core::export_queue::{ExportEvent, ExportSink};
+use ym_core::preferences::PreferencesStore;
 use ym_core::scheduler::MemoryBudget;
 use ym_core::session::SessionError;
+use ym_core::vision::VisionMasks;
 use ym_gpu::device::GpuInfo;
 
 use crate::exit::{self, Failure};
@@ -19,6 +31,53 @@ use crate::exit::{self, Failure};
 static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 /// The running command looks at [`interrupted`] itself and cleans up after itself.
 static POLLING: AtomicBool = AtomicBool::new(false);
+/// The Ctrl-C handler has begun and has not yet ended the process or handed the interruption to the
+/// command: it is stopping the Auto programs and waiting for them. A command that was waiting for one of
+/// them (`ym doctor`'s probes) returns as soon as the handler has cancelled it, which is before the
+/// handler has done, so `main` waits on this flag ([`wait_for_interrupt_handler`]) rather than end
+/// the process with its own status.
+static HANDLING: AtomicBool = AtomicBool::new(false);
+/// The advisors of the run, so that Ctrl-C can kill the programs they started: a child is not
+/// stopped by its parent's death on Unix (`docs/22` section 9.4).
+static RUNNING_ADVISORS: OnceLock<ProviderAdvisors> = OnceLock::new();
+
+/// Tells the Ctrl-C handler which advisors the run has, so that a signal kills the programs they
+/// started (`docs/22` section 9.4). The first registration wins: a process has one run.
+pub fn register_advisors(advisors: &ProviderAdvisors) {
+    let _ = RUNNING_ADVISORS.set(advisors.clone());
+}
+
+/// How long the Ctrl-C handler waits for the programs of the Auto advisors to be reaped and their
+/// temporary folders removed (`docs/22` section 9.4). A program that ignores the polite stop is killed
+/// after 2 s of grace (`ym-agents`, `process.rs`, `TERM_GRACE`) and is gone a few milliseconds later;
+/// the handler's own bound is that grace plus 2 s, so a loaded machine has a whole 2 s of margin. A
+/// program that stops on `SIGTERM` is not waited for any longer than it takes to be reaped, and `ym`
+/// ends with 130 either way.
+pub const INTERRUPT_WAIT: Duration = Duration::from_secs(4);
+
+/// Stops the programs the Auto advisors of this run started and waits for them (up to
+/// [`INTERRUPT_WAIT`]): every request and probe is cancelled, each program is told to stop before
+/// this returns, no new one is started, and the temporary folders are gone when it returns, so that
+/// `ym` may end the process at once. Does nothing before [`register_advisors`].
+fn stop_auto_programs() {
+    let Some(advisors) = RUNNING_ADVISORS.get() else {
+        return;
+    };
+    advisors.halt();
+    if !advisors.wait_idle(INTERRUPT_WAIT) {
+        tracing::warn!(
+            "an Auto program did not stop within {} s; quitting anyway",
+            INTERRUPT_WAIT.as_secs_f64()
+        );
+    }
+}
+
+/// Whether the Ctrl-C handler has begun to stop the Auto programs (the registered advisors are halted).
+fn auto_programs_stopping() -> bool {
+    RUNNING_ADVISORS
+        .get()
+        .is_some_and(ProviderAdvisors::is_halted)
+}
 
 /// Installs the Ctrl-C handler (and SIGTERM and SIGHUP).
 ///
@@ -27,16 +86,41 @@ static POLLING: AtomicBool = AtomicBool::new(false);
 /// partial file and exits 130. Everywhere else (waiting for a list on stdin, opening the library,
 /// `doctor`) nothing would ever look at the flag and Ctrl-C would seem dead until it was pressed
 /// again, so the process ends at once with 130: nothing is half-written there. A second signal
-/// always ends the process at once.
+/// always ends the process at once. Before any of that the handler stops the Auto programs and
+/// waits for them ([`stop_auto_programs`]): a program is not stopped by its parent's death on Unix.
 pub fn install_interrupt_handler() {
+    // A WebAssembly build (the iPhone web app) has no signals to catch.
+    #[cfg(target_family = "wasm")]
+    return;
+    #[cfg(not(target_family = "wasm"))]
     let result = ctrlc::set_handler(|| {
+        // Before anything that can wake the command up (stopping the programs cancels the probe a
+        // command waits for): `main` must see that a signal is being handled.
+        HANDLING.store(true, Ordering::SeqCst);
+        // First of all: the programs a request or a probe started must not outlive `ym`, and the
+        // process must not end, or tell the command to end, before they are gone.
+        stop_auto_programs();
         let again = INTERRUPTED.swap(true, Ordering::SeqCst);
         if again || !POLLING.load(Ordering::SeqCst) {
             std::process::exit(i32::from(exit::INTERRUPTED));
         }
+        HANDLING.store(false, Ordering::SeqCst);
     });
+    #[cfg(not(target_family = "wasm"))]
     if let Err(error) = result {
         tracing::warn!(%error, "could not install the Ctrl-C handler");
+    }
+}
+
+/// Called by `main` when the command has returned: while the Ctrl-C handler is still stopping the Auto
+/// programs, waits for it. A command that does not poll [`interrupted`] (`ym doctor`) is ended by the
+/// handler with 130, so this does not return in that case; for one that polls, the handler hands the
+/// interruption over and this returns. Without it a command that returned because the handler had
+/// cancelled its probes would end the process with 0 before the handler reached its `exit(130)`
+/// (`docs/22` section 9.4).
+pub fn wait_for_interrupt_handler() {
+    while HANDLING.load(Ordering::SeqCst) {
+        std::thread::sleep(Duration::from_millis(5));
     }
 }
 
@@ -68,19 +152,39 @@ pub struct CoreSettings {
     pub jobs: Option<u32>,
     /// A camera profile that replaces the detected one (`--profile`).
     pub forced_profile: Option<String>,
-    /// Apple Auto (`docs/19`): `Some(mode)` hands the core this computer's advisor, as the app does,
-    /// with the mode of `--apple-auto` ([`AppleAutoMode::FromPreference`] without it); `None` hands it
-    /// none, which is Apple Auto off (`doctor --bench`, which times the render path only).
-    pub apple_auto: Option<AppleAutoMode>,
-    /// Instructions for Apple Auto's model for this run instead of the `apple_auto_instructions`
-    /// preference (`--apple-auto-instructions FILE`, read by [`read_instructions`]).
-    pub apple_auto_instructions: Option<String>,
+    /// The Auto providers (`docs/22`): `Some(choice)` hands the core the advisors of this computer,
+    /// as the app does, with the choice of `--auto-provider` ([`AutoChoice::FromPreference`] without
+    /// it); `None` hands it none, which is Default Auto (`doctor --bench`, which times the
+    /// render path only).
+    pub auto: Option<AutoChoice>,
+    /// Instructions for the model for this run instead of the `apple_auto_instructions` preference
+    /// (`--auto-instructions FILE`, read by [`read_instructions`]).
+    pub auto_instructions: Option<String>,
 }
 
-/// Reads `--apple-auto-instructions FILE` (`docs/19` section 8): the file's text as UTF-8, at most
-/// 2000 characters (`ym_core::apple_auto::INSTRUCTIONS_MAX_CHARS`). The file's final line break
-/// (`\n` or `\r\n`, which text editors add) is not part of the instructions, so a file holding the
-/// default text is the default. An empty file is the default instructions.
+/// How long `ym` waits for the program it is going to use to say whether it can answer (`docs/22`
+/// section 13.1).
+pub const AUTO_SETTLE: Duration = Duration::from_secs(30);
+
+/// The advisors of this computer, as the app builds them (`docs/22` section 13.1): Apple's, and the
+/// two programs' without a first probe (`StartProbe::Never`), so a run that does not use a program
+/// never starts one.
+#[must_use]
+pub fn system_provider_advisors() -> ProviderAdvisors {
+    let mut advisors =
+        ProviderAdvisors::default().with(AutoProvider::Apple, ym_apple::system_advisor());
+    // A WebAssembly build (the iPhone web app) starts no other programs, so it has no agent advisors.
+    #[cfg(not(target_family = "wasm"))]
+    for (provider, advisor) in ym_agents::system_advisors(StartProbe::Never) {
+        advisors = advisors.with(provider, advisor);
+    }
+    advisors
+}
+
+/// Reads `--auto-instructions FILE` (`docs/19` section 8, `docs/22` section 13.1): the file's text as
+/// UTF-8, at most 2000 characters (`ym_core::apple_auto::INSTRUCTIONS_MAX_CHARS`). The file's final
+/// line break (`\n` or `\r\n`, which text editors add) is not part of the instructions, so a file
+/// holding the default text is the default. An empty file is the default instructions.
 ///
 /// # Errors
 ///
@@ -88,7 +192,7 @@ pub struct CoreSettings {
 pub fn read_instructions(path: &std::path::Path) -> Result<String, Failure> {
     let mut text = std::fs::read_to_string(path).map_err(|e| {
         Failure::usage(format!(
-            "Can't read the instructions for Apple Intelligence from {}: {e}.",
+            "Can't read the instructions from {}: {e}.",
             path.display()
         ))
     })?;
@@ -108,25 +212,37 @@ pub struct Runtime {
     pub core: Core,
     /// The export queue's events.
     pub events: mpsc::Receiver<ExportEvent>,
-    /// What the run knows about Apple Auto for its notice ([`Runtime::apple_auto_notice`]).
-    apple_watch: Mutex<AppleAutoWatch>,
+    /// What the run knows about the Auto providers for its notices ([`Runtime::auto_notices`]).
+    auto_watch: Mutex<AutoWatch>,
 }
 
-/// What a run knows about Apple Auto for its notice, which it prints once at most (`docs/19`
-/// section 8).
+/// What a run knows about the Auto providers for its notices, each of which it prints once at most
+/// (`docs/22` section 13.2).
 #[derive(Debug, Clone, Copy, Default)]
-struct AppleAutoWatch {
-    /// The run wants Apple Auto: `--apple-auto on`, or no option and the preference on.
+struct AutoWatch {
+    /// How the run chose its provider.
+    choice: AutoChoice,
+    /// The run wants a provider other than Default Auto to act: it named one, or the saved
+    /// choice is one whose consent is saved.
     wanted: bool,
-    /// Apple Auto was available when it was last read.
+    /// The chosen provider was available when it was last read.
     available: bool,
-    /// The notice has been printed.
+    /// The "not available" sentence has been printed.
     noticed: bool,
+    /// The sentence of the cloud provider has been printed.
+    cloud_noticed: bool,
+    /// The breaker's sentence has been printed.
+    breaker_noticed: bool,
 }
 
 impl Runtime {
     /// Opens the core without thumbnails: the CLI shows no pictures, and an export waits for any
     /// thumbnail work that is queued.
+    ///
+    /// With `settings.auto` the advisors of this computer go to the core; when the provider the run
+    /// will use is Claude Code or Antigravity (named, or saved with its consent), it is probed and
+    /// waited for (up to [`AUTO_SETTLE`]) before the core opens, so no run starts with `checking`
+    /// and no run touches a program it does not use.
     ///
     /// # Errors
     ///
@@ -143,77 +259,153 @@ impl Runtime {
             options.decode_threads = jobs.max(1) as usize;
         }
         options.forced_profile.clone_from(&settings.forced_profile);
-        if let Some(mode) = settings.apple_auto {
-            // The app's advisor: Apple's model where it can look at photos, the reason it cannot
-            // everywhere else, the test advisor with `YELLOWMOON_TEST_APPLE_AUTO=fake`.
-            options.advisor = Some(ym_apple::system_advisor());
-            options.apple_auto = mode;
+        if let Some(choice) = settings.auto {
+            // The app's advisors: Apple's model where it can look at photos, the reason it cannot
+            // everywhere else, the test advisor with `YELLOWMOON_TEST_APPLE_AUTO=fake`; the two
+            // programs, or what `YELLOWMOON_TEST_AUTO_PROVIDERS` says they are.
+            let advisors = system_provider_advisors();
+            // Ctrl-C kills the programs a request or a probe started: registered before the start-up
+            // probe below, so a Ctrl-C while it runs stops it too.
+            register_advisors(&advisors);
+            let prefs = PreferencesStore::open(&options.app_root).get();
+            let chosen = choice.chosen(prefs.auto_provider);
+            if chosen.is_cloud() && (choice.is_explicit() || prefs.auto_consent.get(chosen)) {
+                advisors.refresh(Some(chosen));
+                advisors.settle_provider(chosen, AUTO_SETTLE);
+            }
+            options.advisors = advisors;
+            options.auto_choice = choice;
         }
         options
             .apple_auto_instructions
-            .clone_from(&settings.apple_auto_instructions);
+            .clone_from(&settings.auto_instructions);
+        // Subject and People masks (`docs/23` sections 3.10 and 4.5): this computer's Vision framework, or what
+        // `YELLOWMOON_TEST_VISION` says. The probe runs when something asks (a Subject or People row, `ym doctor`).
+        options.render.vision = Some(VisionMasks::new(ym_apple::system_vision()));
         let core = Core::open(options).map_err(|e| core_failure(&e))?;
-        Ok(Self::over(core, events))
+        let choice = settings.auto.unwrap_or_default();
+        Ok(Self::over(core, events, choice))
     }
 
     /// A runtime over a core that is already open.
-    fn over(core: Core, events: mpsc::Receiver<ExportEvent>) -> Self {
+    fn over(core: Core, events: mpsc::Receiver<ExportEvent>, choice: AutoChoice) -> Self {
         Self {
             core,
             events,
-            apple_watch: Mutex::new(AppleAutoWatch::default()),
+            auto_watch: Mutex::new(AutoWatch {
+                choice,
+                ..AutoWatch::default()
+            }),
         }
     }
 
-    /// What `--apple-auto on` says where Apple Auto is not available (`docs/19` section 8): one
-    /// warning per run, and the run goes on with Yellowmoon's own Auto and the same exit code.
-    /// `None` when the run did not ask for it or it is available (the availability is read again).
-    /// Call it once, after the core opens: it also notes whether the run wants Apple Auto and
-    /// whether it is available, for [`Runtime::apple_auto_notice_before_export`].
-    #[must_use]
-    pub fn apple_auto_notice(&self, mode: AppleAutoMode) -> Option<String> {
-        let status = self.core.apple_auto_status();
-        let mut watch = self.watch();
-        watch.wanted = match mode {
-            AppleAutoMode::On => true,
-            AppleAutoMode::FromPreference => status.preference,
-            AppleAutoMode::Off => false,
-        };
-        watch.available = status.available;
-        if mode != AppleAutoMode::On || status.available {
-            return None;
-        }
-        watch.noticed = true;
-        Some(unavailable_notice(
-            status.reason.unwrap_or(UnavailableReason::Unavailable),
-        ))
+    fn watch(&self) -> std::sync::MutexGuard<'_, AutoWatch> {
+        self.auto_watch
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Reads Apple Auto's availability again just before the export starts (`docs/19` section 1),
-    /// with the same refresh the app's `Core::export_start` makes, so the export's photos wait for
-    /// the answers of an Apple Auto that is available now and use the rule where it no longer is.
-    /// Returns the notice of [`Runtime::apple_auto_notice`] when the run wanted Apple Auto (`--apple-auto
-    /// on`, or the preference on), it was available and is not any more, and the run has not said
-    /// so yet: once per run.
+    /// The Auto status as the advisors last said it, without asking any program to probe again.
     #[must_use]
-    pub fn apple_auto_notice_before_export(&self) -> Option<String> {
-        let status = self.core.apple_auto_status();
+    pub fn auto_status(&self) -> AutoStatus {
+        self.core.session.auto_status_cached()
+    }
+
+    /// What the run says on stderr once, after the core opens (`docs/22` section 13.2), each as a
+    /// warning (`--quiet` hides them):
+    ///
+    /// * the chosen provider is not available, but only when the run **named** it (`--auto-provider`,
+    ///   `--apple-auto on`): a run that only follows the saved choice says nothing, as the app hides
+    ///   its row;
+    /// * a cloud provider acts: where the picture goes ([`cloud_notice`]).
+    ///
+    /// Call it once: it also notes whether the run wants a provider and whether it is available, for
+    /// [`Runtime::auto_notice_before_export`].
+    #[must_use]
+    pub fn auto_notices(&self) -> Vec<String> {
+        let status = self.auto_status();
         let mut watch = self.watch();
-        let lost = watch.wanted && watch.available && !status.available && !watch.noticed;
-        watch.available = status.available;
+        let chosen = status.chosen;
+        watch.wanted = chosen != AutoProvider::Yellowmoon
+            && (watch.choice.is_explicit() || status.consent.get(chosen));
+        watch.available = chosen_state(&status) == ProviderState::Available;
+        let mut notices = Vec::new();
+        if watch.choice.is_explicit()
+            && chosen != AutoProvider::Yellowmoon
+            && status.effective != chosen
+        {
+            watch.noticed = true;
+            notices.push(unavailable_notice(&status, chosen));
+        }
+        if status.effective.is_cloud() && !watch.cloud_noticed {
+            watch.cloud_noticed = true;
+            let api = status
+                .provider(status.effective)
+                .and_then(|p| p.info.as_ref())
+                .and_then(|i| i.tool.as_ref())
+                .and_then(|t| t.api.as_deref());
+            notices.extend(cloud_notice(status.effective, api));
+        }
+        notices
+    }
+
+    /// Reads the chosen provider's availability again just before the export starts (`docs/19`
+    /// section 1, `docs/22` section 3.3), with the same read the app's `Core::export_start` makes (the
+    /// program is asked to check only when it was never checked, and the same wait of up to 5 s while
+    /// it still reads `checking`), so the export's photos wait for the answers of a provider that is
+    /// available now and use the rule where it no longer is.
+    /// Returns the sentence of [`Runtime::auto_notices`] when the run wanted a provider (named, or
+    /// saved with its consent), it was available and is not any more, and the run has not said so yet:
+    /// once per run.
+    #[must_use]
+    pub fn auto_notice_before_export(&self) -> Option<String> {
+        if matches!(
+            self.core.session.refresh_auto_for_export(),
+            Some(ym_core::apple_auto::Availability::Unavailable(
+                UnavailableReason::Checking
+            ))
+        ) {
+            self.core
+                .settle_auto(ym_core::app::AUTO_SETTLE_BEFORE_EXPORT);
+        }
+        let status = self.auto_status();
+        let mut watch = self.watch();
+        let now = chosen_state(&status) == ProviderState::Available;
+        let lost = watch.wanted && watch.available && !now && !watch.noticed;
+        watch.available = now;
         if !lost {
             return None;
         }
         watch.noticed = true;
-        Some(unavailable_notice(
-            status.reason.unwrap_or(UnavailableReason::Unavailable),
-        ))
+        Some(unavailable_notice(&status, status.chosen))
     }
 
-    fn watch(&self) -> std::sync::MutexGuard<'_, AppleAutoWatch> {
-        self.apple_watch
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    /// The breaker's sentence (`docs/22` section 9.2), once, when an advisor stopped asking after three
+    /// failures in a row during the run: "Claude Code failed three times in a row (`<the last failure
+    /// in words>`). Photos it doesn't answer use Default Auto." Read it after the run's waits.
+    #[must_use]
+    pub fn breaker_notice(&self) -> Option<String> {
+        let mut watch = self.watch();
+        if watch.breaker_noticed {
+            return None;
+        }
+        let sentence = [AutoProvider::Claude, AutoProvider::Agy]
+            .into_iter()
+            .find_map(|p| self.core.session.advisor_details(p)?.breaker)?;
+        watch.breaker_noticed = true;
+        Some(sentence)
+    }
+
+    /// Whether the run named its provider (`--auto-provider`, `--apple-auto`).
+    #[must_use]
+    pub fn explicit_choice(&self) -> bool {
+        self.watch().choice.is_explicit()
+    }
+
+    /// The provider whose Auto the run asks, for the progress line ("Asking Claude Code").
+    #[must_use]
+    pub fn asking(&self) -> AutoProvider {
+        self.core.session.chosen_provider()
     }
 
     /// Waits until the session has developed every photo and, when Apple Auto acts, until every
@@ -224,7 +416,10 @@ impl Runtime {
         handle_interrupts();
         loop {
             if self.core.session.wait_idle(Duration::from_millis(100)) {
-                return true;
+                // Ctrl-C halted the Auto advisors: the session reads as idle because it asks nothing
+                // more, not because every photo has its answer. The flag follows as soon as the
+                // programs are gone (`stop_auto_programs`).
+                return !(interrupted() || auto_programs_stopping());
             }
             if interrupted() {
                 return false;
@@ -235,7 +430,7 @@ impl Runtime {
                 matches!(p.status, PhotoStatus::Ready | PhotoStatus::Skipped { .. })
             };
             let ready = state.photos.iter().filter(done).count();
-            // Every photo developed and the session still busy: Apple Auto's answers, when it acts.
+            // Every photo developed and the session still busy: the provider's answers, when it acts.
             let answers = (ready == total && self.core.session.apple_auto_active()).then(|| {
                 let developed: Vec<_> = state
                     .photos
@@ -269,16 +464,40 @@ pub struct Waiting {
     pub ready: usize,
     /// Photos open.
     pub total: usize,
-    /// While every photo is developed and Apple Auto acts: the photos that have Apple's answer (or a
+    /// While every photo is developed and a provider acts: the photos that have its answer (or a
     /// failure) and the photos developed.
     pub answers: Option<(usize, usize)>,
 }
 
-/// The sentence `--apple-auto on` prints where Apple Auto is not available.
+/// Where the provider chosen for the run stands.
+fn chosen_state(status: &AutoStatus) -> ProviderState {
+    status
+        .provider(status.chosen)
+        .map_or(ProviderState::NotInstalled, |p| p.state)
+}
+
+/// The sentence a run that named a provider prints where it is not available (`docs/22` section 13.2).
+/// Apple Intelligence: "Apple Auto is not available on this computer (`<reason in words>`). Default
+/// Auto is used." The two programs: "Claude Code is not available on this computer (it isn't
+/// installed). Default Auto is used.", or for a program that is there but cannot be used the hint of
+/// `docs/22` section 3.4 followed by " Default Auto is used.".
 #[must_use]
-pub fn unavailable_notice(reason: UnavailableReason) -> String {
+pub fn unavailable_notice(status: &AutoStatus, provider: AutoProvider) -> String {
+    let provider_status = status.provider(provider);
+    let reason = provider_status
+        .and_then(|p| p.reason)
+        .unwrap_or(UnavailableReason::NotInstalled);
+    let version = provider_status.and_then(|p| p.tool_version.as_deref());
+    let hint = unavailable_hint(provider, reason, version, std::env::consts::OS);
+    if provider.is_cloud() && !hint.is_empty() && reason != UnavailableReason::NotInstalled {
+        return format!("{hint} Default Auto is used.");
+    }
+    let what = match provider {
+        AutoProvider::Apple => "Apple Auto",
+        other => other.name(),
+    };
     format!(
-        "Apple Auto is not available on this computer ({}). Auto uses Yellowmoon's own settings.",
+        "{what} is not available on this computer ({}). Default Auto is used.",
         reason.words()
     )
 }
@@ -302,7 +521,7 @@ impl BackgroundGpu {
             std::thread::Builder::new()
                 .name("ym-gpu-open".to_owned())
                 .spawn(move || {
-                    let slot = open_gpu(policy, budget);
+                    let slot = ym_apple::gpu_opener(policy, budget).open();
                     // The handle is not kept: the job runs on the device thread, its result is
                     // only a count, and a failing kernel shows again when its stage runs.
                     drop(slot.warm_up_for_exports());
@@ -338,7 +557,16 @@ pub fn gpu_line(info: &GpuInfo) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ym_core::apple_auto::Availability;
+    use ym_core::auto_provider::{AdvisorDetails, AutoConsent, StatusInput};
     use ym_core::data_dir::DataDirError;
+
+    /// The wait covers the 2 s of grace a program that ignores `SIGTERM` has before the `SIGKILL`
+    /// (`ym-agents`' `TERM_GRACE`), plus 2 s for a loaded machine (`docs/22` section 9.4).
+    #[test]
+    fn the_interrupt_wait_is_the_sigterm_grace_plus_two_seconds() {
+        assert!(INTERRUPT_WAIT >= Duration::from_secs(2) + Duration::from_secs(2));
+    }
 
     #[test]
     fn a_missing_data_folder_is_a_usage_error_with_the_message_of_docs_01() {
@@ -350,11 +578,79 @@ mod tests {
         );
     }
 
+    /// A status where the advisors say these things (Apple, Claude Code, Antigravity), the choice and
+    /// the consent as given.
+    fn status_with(
+        readings: [Option<Availability>; 3],
+        choice: AutoChoice,
+        preference: AutoProvider,
+        consent: AutoConsent,
+    ) -> AutoStatus {
+        AutoStatus::build(&StatusInput {
+            has_advisors: true,
+            readings: readings.map(|r| {
+                r.map(|a| {
+                    (
+                        a,
+                        AdvisorDetails {
+                            tool_version: Some("2.1.100".to_owned()),
+                            ..AdvisorDetails::default()
+                        },
+                    )
+                })
+            }),
+            preference,
+            choice,
+            consent,
+            own_instructions: "",
+        })
+    }
+
     #[test]
-    fn the_apple_auto_notice_names_the_reason_in_words() {
+    fn the_notice_of_a_named_provider_that_is_not_available_says_why_in_words() {
+        use UnavailableReason as R;
+        let status = |reason: R| {
+            status_with(
+                [
+                    Some(Availability::Unavailable(R::AppleIntelligenceOff)),
+                    Some(Availability::Unavailable(reason)),
+                    None,
+                ],
+                AutoChoice::FromPreference,
+                AutoProvider::Apple,
+                AutoConsent::default(),
+            )
+        };
+        let s = status(R::NotInstalled);
         assert_eq!(
-            unavailable_notice(UnavailableReason::AppleIntelligenceOff),
-            "Apple Auto is not available on this computer (Apple Intelligence is off in System Settings). Auto uses Yellowmoon's own settings."
+            unavailable_notice(&s, AutoProvider::Apple),
+            "Apple Auto is not available on this computer (Apple Intelligence is off in System Settings). Default Auto is used."
+        );
+        assert_eq!(
+            unavailable_notice(&s, AutoProvider::Claude),
+            "Claude Code is not available on this computer (it isn't installed). Default Auto is used."
+        );
+        // Not installed at all (no advisor registered): the same words.
+        assert_eq!(
+            unavailable_notice(&s, AutoProvider::Agy),
+            "Antigravity is not available on this computer (it isn't installed). Default Auto is used."
+        );
+        let signed_out = status(R::SignedOut);
+        let hint = unavailable_notice(&signed_out, AutoProvider::Claude);
+        assert!(
+            hint.starts_with("Claude Code is installed but not signed in. Open ")
+                && hint.ends_with(" Default Auto is used."),
+            "{hint}"
+        );
+        let old = unavailable_notice(&status(R::TooOld), AutoProvider::Claude);
+        assert!(
+            old.starts_with("Claude Code 2.1.100 is too old. Update it: "),
+            "{old}"
+        );
+        // A reason with no hint falls back to the sentence with the reason in words.
+        assert_eq!(
+            unavailable_notice(&status(R::Checking), AutoProvider::Claude),
+            "Claude Code is not available on this computer (Yellowmoon is still checking). Default Auto is used."
         );
     }
 
@@ -362,15 +658,11 @@ mod tests {
     struct Switch(AtomicBool);
 
     impl ym_core::apple_auto::AutoAdvisor for Switch {
-        fn availability(&self) -> ym_core::apple_auto::Availability {
+        fn availability(&self) -> Availability {
             if self.0.load(Ordering::SeqCst) {
-                ym_core::apple_auto::Availability::Available(ym_core::apple_auto::AdvisorInfo::new(
-                    "Switch", "test",
-                ))
+                Availability::Available(ym_core::apple_auto::AdvisorInfo::new("Switch", "test"))
             } else {
-                ym_core::apple_auto::Availability::Unavailable(
-                    UnavailableReason::AppleIntelligenceOff,
-                )
+                Availability::Unavailable(UnavailableReason::AppleIntelligenceOff)
             }
         }
 
@@ -383,15 +675,16 @@ mod tests {
                 steps: ym_core::apple_auto::AutoSteps::keep(),
                 scene: String::new(),
                 plan: String::new(),
+                served_model: None,
             })
         }
     }
 
-    /// A runtime over a core with the switchable advisor, in a new app folder (the preference on),
-    /// as `Runtime::open` makes it for `ym render` with `mode`.
+    /// A runtime over a core with the switchable advisor as Apple's, in a new app folder (the
+    /// preference Apple Intelligence), as `Runtime::open` makes it for `ym render` with `choice`.
     fn runtime_with(
         advisor: &std::sync::Arc<Switch>,
-        mode: AppleAutoMode,
+        choice: AutoChoice,
         app: &std::path::Path,
     ) -> Runtime {
         let data = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data");
@@ -400,55 +693,61 @@ mod tests {
         options.thumbnails = false;
         options.export_events = sink;
         options.decode_threads = 1;
-        options.advisor = Some(advisor.clone());
-        options.apple_auto = mode;
-        Runtime::over(Core::open(options).expect("core"), events)
+        options.advisors = ProviderAdvisors::default().with(AutoProvider::Apple, advisor.clone());
+        options.auto_choice = choice;
+        Runtime::over(Core::open(options).expect("core"), events, choice)
     }
 
     #[test]
-    fn apple_auto_is_read_again_before_the_export_and_its_loss_is_said_once() {
-        let words = unavailable_notice(UnavailableReason::AppleIntelligenceOff);
+    fn a_provider_is_read_again_before_the_export_and_its_loss_is_said_once() {
+        let sentence = "Apple Auto is not available on this computer (Apple Intelligence is off in System Settings). Default Auto is used.";
+        let apple = AutoChoice::Provider(AutoProvider::Apple);
         let app = tempfile::tempdir().expect("app folder");
         let advisor = std::sync::Arc::new(Switch(AtomicBool::new(true)));
-        // The preference on (a new app folder), no option: available at the start, then gone
+        // The saved choice is Apple (a new app folder), no option: available at the start, then gone
         // before the export. The export's re-read sees it (the session now uses the rule) and the
         // run says so, once.
-        let rt = runtime_with(&advisor, AppleAutoMode::FromPreference, app.path());
-        assert_eq!(rt.apple_auto_notice(AppleAutoMode::FromPreference), None);
+        let rt = runtime_with(&advisor, AutoChoice::FromPreference, app.path());
+        assert!(rt.auto_notices().is_empty());
         assert!(rt.core.session.apple_auto_active());
         advisor.0.store(false, Ordering::SeqCst);
-        assert_eq!(rt.apple_auto_notice_before_export(), Some(words.clone()));
+        assert_eq!(rt.auto_notice_before_export().as_deref(), Some(sentence));
         assert!(!rt.core.session.apple_auto_active(), "the session was told");
-        assert_eq!(rt.apple_auto_notice_before_export(), None, "once per run");
-        // `--apple-auto on` where it is not available: said after the core opens, not again.
-        let rt = runtime_with(&advisor, AppleAutoMode::On, app.path());
-        assert_eq!(rt.apple_auto_notice(AppleAutoMode::On), Some(words.clone()));
-        assert_eq!(rt.apple_auto_notice_before_export(), None);
-        // `--apple-auto on`, available at the start and gone before the export.
+        assert_eq!(rt.auto_notice_before_export(), None, "once per run");
+        // `--auto-provider apple` where it is not available: said after the core opens, not again.
+        let rt = runtime_with(&advisor, apple, app.path());
+        assert_eq!(rt.auto_notices(), vec![sentence.to_owned()]);
+        assert_eq!(rt.auto_notice_before_export(), None);
+        // The same, available at the start and gone before the export.
         advisor.0.store(true, Ordering::SeqCst);
-        let rt = runtime_with(&advisor, AppleAutoMode::On, app.path());
-        assert_eq!(rt.apple_auto_notice(AppleAutoMode::On), None);
+        let rt = runtime_with(&advisor, apple, app.path());
+        assert!(rt.auto_notices().is_empty());
         advisor.0.store(false, Ordering::SeqCst);
-        assert_eq!(rt.apple_auto_notice_before_export(), Some(words));
+        assert_eq!(rt.auto_notice_before_export().as_deref(), Some(sentence));
         // Available again before the export: nothing to say, and the session uses it again.
         advisor.0.store(true, Ordering::SeqCst);
-        let rt = runtime_with(&advisor, AppleAutoMode::FromPreference, app.path());
-        assert_eq!(rt.apple_auto_notice(AppleAutoMode::FromPreference), None);
+        let rt = runtime_with(&advisor, AutoChoice::FromPreference, app.path());
+        assert!(rt.auto_notices().is_empty());
         advisor.0.store(false, Ordering::SeqCst);
         rt.core.session.refresh_apple_auto();
         advisor.0.store(true, Ordering::SeqCst);
-        assert_eq!(rt.apple_auto_notice_before_export(), None);
+        assert_eq!(rt.auto_notice_before_export(), None);
         assert!(rt.core.session.apple_auto_active());
-        // Never available without the option, or off for the run: nothing is said.
+        // Never available without the option: nothing is said, the app hides its row.
         advisor.0.store(false, Ordering::SeqCst);
-        let rt = runtime_with(&advisor, AppleAutoMode::FromPreference, app.path());
-        assert_eq!(rt.apple_auto_notice(AppleAutoMode::FromPreference), None);
-        assert_eq!(rt.apple_auto_notice_before_export(), None);
+        let rt = runtime_with(&advisor, AutoChoice::FromPreference, app.path());
+        assert!(rt.auto_notices().is_empty());
+        assert_eq!(rt.auto_notice_before_export(), None);
+        // Default Auto for the run: nothing is wanted, nothing is said.
         advisor.0.store(true, Ordering::SeqCst);
-        let rt = runtime_with(&advisor, AppleAutoMode::Off, app.path());
-        assert_eq!(rt.apple_auto_notice(AppleAutoMode::Off), None);
+        let rt = runtime_with(
+            &advisor,
+            AutoChoice::Provider(AutoProvider::Yellowmoon),
+            app.path(),
+        );
+        assert!(rt.auto_notices().is_empty());
         advisor.0.store(false, Ordering::SeqCst);
-        assert_eq!(rt.apple_auto_notice_before_export(), None);
+        assert_eq!(rt.auto_notice_before_export(), None);
     }
 
     #[test]

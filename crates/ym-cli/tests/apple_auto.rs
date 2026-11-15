@@ -1,7 +1,8 @@
-//! Apple Auto on the command line (`docs/19` section 8, `docs/10`): `--apple-auto on|off`, the
-//! `auto_source` and `apple_auto` of `render --json`, the Apple Auto row and object of `ym info`, the
-//! `apple_auto` of `ym doctor`, `--contrast auto` and `--saturation auto`, the XMP of an export and
-//! determinism, with the test advisor (`YELLOWMOON_TEST_APPLE_AUTO=fake`) on every machine.
+//! Apple Auto on the command line (`docs/19` section 8, `docs/10`, `docs/22` section 13): `--apple-auto
+//! on|off`, the `auto_source`, `apple_auto` (kept one version) and `auto_advisor` of `render --json`, the
+//! Auto grading row and objects of `ym info`, the `apple_auto` and `auto` of `ym doctor`, `--contrast auto`
+//! and `--saturation auto`, the XMP of an export and determinism, with the test advisor
+//! (`YELLOWMOON_TEST_APPLE_AUTO=fake`) on every machine. The two programs are in `auto_providers.rs`.
 //!
 //! The test advisor answers from the picture's statistics (`ym_core::apple_auto::FakeAdvisor`): on
 //! the synthetic photos it asks for a darker picture with more contrast, so the answer changes the
@@ -57,6 +58,26 @@ fn render_json_says_apple_made_the_auto_values_and_what_it_answered() {
     let v = render_json(sb.ym_fake(), &arw, &[], &sb.root().join("out"));
     assert_eq!(v["auto_source"], "apple");
     assert_eq!(v["auto"]["source"], "apple");
+    assert_eq!(v["auto"]["provider"], "apple");
+    // The new object says the same, with the provider and that the answer repeats on one Mac.
+    let adv = &v["auto_advisor"];
+    assert_eq!(
+        (
+            adv["provider"].clone(),
+            adv["state"].clone(),
+            adv["model"].clone()
+        ),
+        (json!("apple"), json!("answered"), json!("Test advisor"))
+    );
+    assert_eq!(
+        (
+            adv["reproducible"].clone(),
+            adv["prompt"].clone(),
+            adv["schema"].clone()
+        ),
+        (json!(true), json!(3), Value::Null)
+    );
+    assert_eq!(adv["steps"], v["apple_auto"]["steps"]);
     let a = &v["apple_auto"];
     assert_eq!(a["state"], "answered", "{a}");
     assert_eq!(a["reason"], Value::Null);
@@ -72,12 +93,16 @@ fn render_json_says_apple_made_the_auto_values_and_what_it_answered() {
         ym_core::apple_auto::InstructionsId::default().instructions_sha256
     );
     let steps = steps_of(a);
-    // The test advisor's answer on this photo: darker, darker highlights, more contrast, teal
-    // shadows; it leaves the blacks, the tint and the highlights' colour empty.
+    // The test advisor's answer on this photo: darker highlights, more contrast, teal shadows; it leaves
+    // the exposure, the blacks, the tint and the highlights' colour alone. (Its exposure follows the mean
+    // luma of the picture: with ACES 2 and its placement this photo's picture was over 0.65 and the
+    // advisor said "darker" (-1); the cine rendering shows it about three quarters of a stop darker, so
+    // the advisor leaves the exposure at 0. The picture's bytes are not pinned anywhere; this answer is
+    // what pinned them.)
     assert_eq!(
         steps,
         AutoSteps {
-            exposure: Some(-1),
+            exposure: Some(0),
             highlights: Some(-1),
             shadows: Some(0),
             blacks: None,
@@ -95,30 +120,33 @@ fn render_json_says_apple_made_the_auto_values_and_what_it_answered() {
     assert_eq!(a["steps"]["blacks"], Value::Null);
     assert_eq!(a["steps"]["shadow_color"], "teal");
     // The new Auto values.
-    assert_eq!(v["auto"]["highlights"], TABLE.highlights[1]);
-    assert_eq!(v["auto"]["black"], 0.0);
+    assert_eq!(v["auto"]["main"]["highlights"], TABLE.highlights[1]);
+    assert_eq!(v["auto"]["main"]["black"], 0.0);
     assert_eq!(
-        v["auto"]["balance_shadows"],
+        v["auto"]["main"]["balance_shadows"],
         json!([-0.866 * 0.3, -0.5 * 0.3])
     );
-    assert_eq!(v["auto"]["balance_highlights"], json!([0.0, 0.0]));
+    assert_eq!(v["auto"]["main"]["balance_highlights"], json!([0.0, 0.0]));
     assert_eq!(
-        v["settings"]["highlights"],
+        common::node(&v, 1)["grade"]["highlights"],
         json!({ "kind": "manual", "value": -20.0 })
     );
     assert_eq!(
-        v["settings"]["color_balance"]["shadows"],
+        common::node(&v, 1)["grade"]["color_balance"]["shadows"],
         json!({ "kind": "manual", "point": [-0.866 * 0.3, -0.5 * 0.3] })
     );
     // The answer is in the Auto values and in the settings the file records, pinned to them.
-    assert_eq!(v["auto"]["contrast"], TABLE.contrast[3]);
-    assert_eq!(v["auto"]["saturation"], 0.0);
+    assert_eq!(v["auto"]["main"]["contrast"], TABLE.contrast[3]);
+    assert_eq!(v["auto"]["main"]["saturation"], 0.0);
     assert_eq!(
-        v["settings"]["contrast"],
+        common::node(&v, 1)["grade"]["contrast"],
         json!({ "kind": "manual", "value": 15.0 })
     );
-    assert_eq!(v["settings"]["exposure"]["ev"], v["auto"]["exposure_ev"]);
-    // The same photo with Yellowmoon's own Auto: the exposure is the table's step brighter.
+    assert_eq!(
+        common::node(&v, "input")["exposure"]["ev"],
+        v["auto"]["input"]["exposure_ev"]
+    );
+    // The same photo with Default Auto: the exposure is the table's step brighter.
     let rule = render_json(
         sb.ym_fake(),
         &arw,
@@ -126,17 +154,20 @@ fn render_json_says_apple_made_the_auto_values_and_what_it_answered() {
         &sb.root().join("rule"),
     );
     let (apple_ev, rule_ev) = (
-        v["auto"]["exposure_ev"].as_f64().expect("ev"),
-        rule["auto"]["exposure_ev"].as_f64().expect("ev"),
+        v["auto"]["input"]["exposure_ev"].as_f64().expect("ev"),
+        rule["auto"]["input"]["exposure_ev"].as_f64().expect("ev"),
     );
     assert!(
-        (apple_ev - (rule_ev + TABLE.exposure_ev[2])).abs() < 1e-9,
+        (apple_ev - (rule_ev + TABLE.exposure_ev[3])).abs() < 1e-9,
         "{apple_ev} against {rule_ev}"
     );
     // The white was kept, so the Kelvin and the tint are the rule's.
-    assert_eq!(v["auto"]["kelvin"], rule["auto"]["kelvin"]);
-    assert_eq!(v["auto"]["tint"], rule["auto"]["tint"]);
-    // Keys: `auto_source` and `apple_auto` after `auto`, before `settings`.
+    assert_eq!(
+        v["auto"]["input"]["kelvin"],
+        rule["auto"]["input"]["kelvin"]
+    );
+    assert_eq!(v["auto"]["input"]["tint"], rule["auto"]["input"]["tint"]);
+    // Keys: `auto_source`, `apple_auto` and `auto_advisor` after `auto`, before `settings`.
     let line = serde_json::to_string(&v).expect("json");
     assert!(line.contains("\"auto_source\":\"apple\""));
 }
@@ -161,11 +192,13 @@ fn apple_auto_off_is_the_rule_and_render_json_has_no_apple_auto() {
     assert_eq!(v["auto_source"], "rule");
     assert_eq!(v["auto"]["apple"], json!({ "state": "off" }));
     assert!(v.get("apple_auto").is_none(), "{v}");
-    assert_eq!(v["auto"]["contrast"], 0.0);
+    assert_eq!(v["auto"]["main"]["contrast"], 0.0);
     assert_eq!(
-        v["settings"]["contrast"],
+        common::node(&v, 1)["grade"]["contrast"],
         json!({ "kind": "manual", "value": 0.0 })
     );
+    assert!(v.get("auto_advisor").is_none(), "{v}");
+    assert_eq!(v["auto"]["provider"], "yellowmoon");
     // The key order of docs/10, with `auto_source` after `auto`.
     let line = text(&assert.get_output().stdout);
     let at = |key: &str| line.find(&format!("\"{key}\":")).expect(key);
@@ -194,14 +227,11 @@ fn apple_auto_on_where_it_is_not_available_says_so_once_and_uses_the_rule() {
     let stderr = text(&assert.get_output().stderr);
     let notice = "Apple Auto is not available on this computer (";
     assert_eq!(stderr.matches(notice).count(), 1, "once per run: {stderr}");
-    assert!(
-        stderr.contains("). Auto uses Yellowmoon's own settings."),
-        "{stderr}"
-    );
+    assert!(stderr.contains("). Default Auto is used."), "{stderr}");
     if cfg!(not(target_os = "macos")) {
         assert!(
             stderr.contains(
-                "Warning: Apple Auto is not available on this computer (this is not a Mac). Auto uses Yellowmoon's own settings."
+                "Warning: Apple Auto is not available on this computer (this is not a Mac). Default Auto is used."
             ),
             "{stderr}"
         );
@@ -251,14 +281,18 @@ fn the_apple_auto_preference_decides_unless_the_run_says_otherwise() {
     );
     assert_eq!(on["auto_source"], "apple");
     assert_eq!(on["apple_auto"]["state"], "answered");
-    // And `ym doctor` shows the preference.
+    // And `ym doctor` shows the saved choice: the old switch off reads as Default Auto.
     let doctor = sb.ym_fake().args(["doctor", "--json"]).assert().success();
     let doctor: Value = serde_json::from_slice(&doctor.get_output().stdout).expect("JSON");
     assert_eq!(doctor["apple_auto"]["preference"], false);
+    assert_eq!(doctor["auto"]["preference"], "yellowmoon");
+    assert_eq!(doctor["auto"]["effective"], "yellowmoon");
     let text_report = sb.ym_fake().arg("doctor").assert().success();
     let text_report = text(&text_report.get_output().stdout);
     assert!(
-        text_report.contains("table 2 · turned off in Preferences"),
+        text_report
+            .lines()
+            .any(|l| l.starts_with("Auto grading") && l.ends_with("Default Auto")),
         "{text_report}"
     );
 }
@@ -300,12 +334,18 @@ fn info_json_has_the_apple_auto_object_and_the_auto_values_in_effect() {
     assert_eq!(a["model"], "Test advisor");
     assert_eq!(v["auto_source"], "apple");
     assert_eq!(v["auto"]["source"], "apple");
-    assert_eq!(v["auto"]["contrast"], 15.0);
-    assert_eq!(v["auto"]["saturation"], 0.0);
+    assert_eq!(v["auto"]["main"]["contrast"], 15.0);
+    assert_eq!(v["auto"]["main"]["saturation"], 0.0);
     assert_eq!(v["auto"]["apple"]["answer"]["steps"], a["steps"]);
     // `info` and `render` report the same photo the same way.
     let render = render_json(sb.ym_fake(), &arw, &[], &sb.root().join("out"));
-    for key in ["auto", "auto_source", "apple_auto", "settings"] {
+    for key in [
+        "auto",
+        "auto_source",
+        "apple_auto",
+        "auto_advisor",
+        "settings",
+    ] {
         assert_eq!(v[key], render[key], "{key}");
     }
     // Off, and where it is not available, the object says so with no steps and no scene.
@@ -316,11 +356,10 @@ fn info_json_has_the_apple_auto_object_and_the_auto_values_in_effect() {
         .assert()
         .success();
     let off = json_lines(&off.get_output().stdout).remove(0);
-    assert_eq!(
-        off["apple_auto"],
-        json!({ "state": "off", "reason": null, "model": null, "os": null,
-                "instructions": null, "instructions_sha256": null, "prompt": 3, "table": 2 })
-    );
+    // The old object is Apple's view: for any other provider (here Default Auto) it is `off`.
+    assert_eq!(off["apple_auto"], json!({ "state": "off" }));
+    assert_eq!(off["auto_advisor"]["provider"], "yellowmoon");
+    assert_eq!(off["auto_advisor"]["state"], "off");
     assert_eq!(off["auto_source"], "rule");
     if cfg!(not(target_os = "macos")) {
         let here = sb
@@ -339,11 +378,14 @@ fn info_json_has_the_apple_auto_object_and_the_auto_values_in_effect() {
             here["auto"]["apple"],
             json!({ "state": "unavailable", "reason": "not_a_mac" })
         );
+        assert_eq!(here["auto_advisor"]["provider"], "apple");
+        assert_eq!(here["auto_advisor"]["state"], "unavailable");
+        assert_eq!(here["auto_advisor"]["reason"], "not_a_mac");
     }
 }
 
 #[test]
-fn info_text_has_an_apple_auto_row() {
+fn info_text_has_an_auto_grading_row() {
     let sb = Sandbox::new();
     let arw = photo(&sb);
     let row = |cmd: assert_cmd::Command, flags: &[&str]| -> String {
@@ -351,18 +393,22 @@ fn info_text_has_an_apple_auto_row() {
         let out = cmd.arg("info").args(flags).arg(&arw).assert().success();
         let out = text(&out.get_output().stdout);
         out.lines()
-            .find(|l| l.trim_start().starts_with("Apple Auto"))
-            .unwrap_or_else(|| panic!("no Apple Auto row:\n{out}"))
+            .find(|l| l.trim_start().starts_with("Auto grading"))
+            .unwrap_or_else(|| panic!("no Auto grading row:\n{out}"))
             .trim_start()
-            .trim_start_matches("Apple Auto")
+            .trim_start_matches("Auto grading")
             .trim()
             .to_owned()
     };
     assert_eq!(
         row(sb.ym_fake(), &[]),
-        "Darker -0.3 EV · highlights -20 · contrast +15 · teal shadows (subtle) · scene \"Test picture\" · plan \"Test plan: You\""
+        "Apple Intelligence · Highlights -20 · contrast +15 · teal shadows (subtle) · scene \"Test picture\" · plan \"Test plan: You\""
     );
-    assert_eq!(row(sb.ym_fake(), &["--apple-auto", "off"]), "Off");
+    assert_eq!(row(sb.ym_fake(), &["--apple-auto", "off"]), "Default Auto");
+    assert_eq!(
+        row(sb.ym_fake(), &["--auto-provider", "yellowmoon"]),
+        "Default Auto"
+    );
     if cfg!(not(target_os = "macos")) {
         assert_eq!(row(sb.ym(), &[]), "Not available (this is not a Mac)");
     }
@@ -370,7 +416,8 @@ fn info_text_has_an_apple_auto_row() {
     let out = sb.ym_fake().arg("info").arg(&arw).assert().success();
     let out = text(&out.get_output().stdout);
     let at = |label: &str| out.find(label).unwrap_or_else(|| panic!("{label}:\n{out}"));
-    assert!(at("Auto white") < at("Apple Auto") && at("Apple Auto") < at("Noise model"));
+    assert!(at("Auto white") < at("Auto grading") && at("Auto grading") < at("Noise model"));
+    assert!(!out.contains("Apple Auto"), "the row was renamed:\n{out}");
 }
 
 #[test]
@@ -389,16 +436,40 @@ fn doctor_reports_apple_auto_and_the_model() {
     );
     let out = sb.ym_fake().arg("doctor").assert().success();
     let report = text(&out.get_output().stdout);
+    let row = |label: &str| -> String {
+        report
+            .lines()
+            .find(|l| l.starts_with(label))
+            .unwrap_or_else(|| panic!("no {label} row:\n{report}"))
+            .trim_start_matches(label)
+            .trim()
+            .to_owned()
+    };
+    assert_eq!(
+        row("Apple Intelligence"),
+        "available · Apple Intelligence · Test advisor · macOS test · prompt 3 · table 2"
+    );
+    assert_eq!(
+        row("Auto grading"),
+        "Apple Intelligence (saved in Preferences)"
+    );
+    assert_eq!(row("Claude Code"), "not installed");
+    assert_eq!(row("Antigravity (agy)"), "not installed");
     assert!(
         report.contains(
-            "Apple Auto         available · Apple Intelligence · Test advisor · macOS test · prompt 3 · table 2\n"
+            "whether Apple Intelligence, Claude Code and Antigravity are available (with the places where Claude Code and Antigravity were found)"
         ),
         "{report}"
     );
-    assert!(
-        report.contains("whether Apple Auto is available"),
-        "{report}"
-    );
+    // The new object lists every provider.
+    let out = sb.ym_fake().args(["doctor", "--json"]).assert().success();
+    let v: Value = serde_json::from_slice(&out.get_output().stdout).expect("JSON");
+    assert_eq!(v["auto"]["preference"], "apple");
+    assert_eq!(v["auto"]["effective"], "apple");
+    assert_eq!(v["auto"]["providers"]["apple"]["state"], "available");
+    assert_eq!(v["auto"]["providers"]["apple"]["model"], "Test advisor");
+    assert_eq!(v["auto"]["providers"]["claude"]["state"], "not_installed");
+    assert_eq!(v["auto"]["providers"]["agy"]["reason"], "not_installed");
     if cfg!(not(target_os = "macos")) {
         let out = sb.ym().args(["doctor", "--json"]).assert().success();
         let v: Value = serde_json::from_slice(&out.get_output().stdout).expect("JSON");
@@ -414,7 +485,8 @@ fn doctor_reports_apple_auto_and_the_model() {
         let out = sb.ym().arg("doctor").assert().success();
         let report = text(&out.get_output().stdout);
         assert!(
-            report.contains("Apple Auto         not available (this is not a Mac)\n"),
+            report.lines().any(|l| l.starts_with("Apple Intelligence")
+                && l.ends_with("not available (this is not a Mac)")),
             "{report}"
         );
     }
@@ -427,7 +499,11 @@ fn contrast_and_saturation_take_auto() {
     let sb = Sandbox::new();
     let arw = photo(&sb);
     let file = sb.root().join("settings.json");
-    std::fs::write(&file, r#"{ "contrast": 30, "saturation": 10 }"#).expect("write");
+    std::fs::write(
+        &file,
+        common::field_doc(json!({ "contrast": 30, "saturation": 10 })).to_string(),
+    )
+    .expect("write");
     let settings = file.to_str().expect("utf-8");
     // `auto` puts back what a settings file set by hand: the Auto value, pinned in the settings.
     let flags = [
@@ -440,22 +516,22 @@ fn contrast_and_saturation_take_auto() {
     ];
     let apple = render_json(sb.ym_fake(), &arw, &flags, &sb.root().join("apple"));
     assert_eq!(
-        apple["settings"]["contrast"],
+        common::node(&apple, 1)["grade"]["contrast"],
         json!({ "kind": "manual", "value": 15.0 })
     );
     assert_eq!(
-        apple["settings"]["saturation"],
+        common::node(&apple, 1)["grade"]["saturation"],
         json!({ "kind": "manual", "value": 0.0 })
     );
     let mut rule_flags = flags.to_vec();
     rule_flags.extend(["--apple-auto", "off"]);
     let rule = render_json(sb.ym_fake(), &arw, &rule_flags, &sb.root().join("rule"));
     assert_eq!(
-        rule["settings"]["contrast"],
+        common::node(&rule, 1)["grade"]["contrast"],
         json!({ "kind": "manual", "value": 0.0 })
     );
     assert_eq!(
-        rule["settings"]["saturation"],
+        common::node(&rule, 1)["grade"]["saturation"],
         json!({ "kind": "manual", "value": 0.0 })
     );
     // A number stays a manual value, whatever Apple Auto says.
@@ -466,15 +542,15 @@ fn contrast_and_saturation_take_auto() {
         &sb.root().join("manual"),
     );
     assert_eq!(
-        manual["settings"]["contrast"],
+        common::node(&manual, 1)["grade"]["contrast"],
         json!({ "kind": "manual", "value": -20.0 })
     );
     assert_eq!(
-        manual["settings"]["saturation"],
+        common::node(&manual, 1)["grade"]["saturation"],
         json!({ "kind": "manual", "value": 12.0 })
     );
     assert_eq!(
-        manual["auto"]["contrast"], 15.0,
+        manual["auto"]["main"]["contrast"], 15.0,
         "the Auto value is still Apple's"
     );
     // Anything else is a usage error.
@@ -502,13 +578,15 @@ fn an_export_records_which_auto_made_it_in_its_xmp() {
     assert!(xmp.contains("<ym:Auto>apple</ym:Auto>"), "ym:Auto");
     let sha = ym_core::apple_auto::InstructionsId::default().instructions_sha256;
     let want = format!(
-        r#"{{"instructions":"default","instructions_sha256":"{sha}","model":"Test advisor","os":"test","plan":"Test plan: You","prompt":3,"result":"answered","scene":"Test picture","steps":{{"blacks":null,"contrast":1,"exposure":-1,"highlight_color":null,"highlight_color_strength":null,"highlights":-1,"saturation":0,"shadow_color":"teal","shadow_color_strength":1,"shadows":0,"tint":null,"white":0}},"table":2}}"#
+        r#"{{"instructions":"default","instructions_sha256":"{sha}","model":"Test advisor","os":"test","plan":"Test plan: You","prompt":3,"provider":"apple","reproducible":true,"result":"answered","scene":"Test picture","steps":{{"blacks":null,"contrast":1,"exposure":0,"highlight_color":null,"highlight_color_strength":null,"highlights":-1,"saturation":0,"shadow_color":"teal","shadow_color_strength":1,"shadows":0,"tint":null,"white":0}},"table":2}}"#
     )
     .replace('"', "&quot;");
     assert!(
-        xmp.contains(&format!("<ym:AppleAuto>{want}</ym:AppleAuto>")),
-        "ym:AppleAuto in {xmp}"
+        xmp.contains(&format!("<ym:AutoAdvisor>{want}</ym:AutoAdvisor>")),
+        "ym:AutoAdvisor in {xmp}"
     );
+    // `ym:AppleAuto` is no longer written (docs/22 section 14.2).
+    assert!(!xmp.contains("ym:AppleAuto"), "{xmp}");
     let rule = render_json(
         sb.ym_fake(),
         &arw,
@@ -517,7 +595,7 @@ fn an_export_records_which_auto_made_it_in_its_xmp() {
     );
     let xmp = xmp_of(&rule);
     assert!(xmp.contains("<ym:Auto>rule</ym:Auto>"));
-    assert!(!xmp.contains("ym:AppleAuto"));
+    assert!(!xmp.contains("ym:AutoAdvisor") && !xmp.contains("ym:AppleAuto"));
     assert_ne!(bytes(&output_of(&apple)), bytes(&output_of(&rule)));
 }
 
@@ -547,10 +625,11 @@ fn the_json_of_a_file_with_apple_auto_has_this_shape() {
     let arw = photo(&sb);
     let v = render_json(sb.ym_fake(), &arw, &[], &sb.root().join("out"));
     let keep = |key: &str| (key.to_owned(), common::shape(&v[key]));
-    let picked: serde_json::Map<String, Value> = ["auto", "auto_source", "apple_auto"]
-        .map(keep)
-        .into_iter()
-        .collect();
+    let picked: serde_json::Map<String, Value> =
+        ["auto", "auto_source", "apple_auto", "auto_advisor"]
+            .map(keep)
+            .into_iter()
+            .collect();
     insta::assert_json_snapshot!("render_json_shape_apple_auto", Value::Object(picked));
 }
 
@@ -579,7 +658,7 @@ fn the_instructions_come_from_the_preference_or_a_file_for_one_run() {
     // A file for one run wins over the preference, in `render` and `info`.
     let file = sb.root().join("instructions.txt");
     std::fs::write(&file, "Bright, airy and warm.").expect("write");
-    let flag = ["--apple-auto-instructions", file.to_str().expect("utf-8")];
+    let flag = ["--auto-instructions", file.to_str().expect("utf-8")];
     let v = render_json(sb.ym_fake(), &arw, &flag, &sb.root().join("file"));
     assert_eq!(v["apple_auto"]["plan"], "Test plan: Bright,");
     let info = sb
@@ -597,7 +676,7 @@ fn the_instructions_come_from_the_preference_or_a_file_for_one_run() {
     let v = render_json(
         sb.ym_fake(),
         &arw,
-        &["--apple-auto-instructions", empty.to_str().expect("utf-8")],
+        &["--auto-instructions", empty.to_str().expect("utf-8")],
         &sb.root().join("empty"),
     );
     assert_eq!(v["apple_auto"]["plan"], "Test plan: You");
@@ -613,7 +692,7 @@ fn the_instructions_come_from_the_preference_or_a_file_for_one_run() {
     let v = render_json(
         sb.ym_fake(),
         &arw,
-        &["--apple-auto-instructions", saved.to_str().expect("utf-8")],
+        &["--auto-instructions", saved.to_str().expect("utf-8")],
         &sb.root().join("saved"),
     );
     assert_eq!(v["apple_auto"]["instructions"], "default");
@@ -658,19 +737,19 @@ fn highlights_shadows_and_black_take_auto() {
     let settings = sb.root().join("s.json");
     std::fs::write(
         &settings,
-        json!({ "highlights": 30, "shadows": -10, "black": 5,
-                "color_balance": { "shadows": [0.2, 0.1] } })
+        common::field_doc(json!({ "highlights": 30, "shadows": -10, "black": 5,
+                "color_balance": { "shadows": [0.2, 0.1] } }))
         .to_string(),
     )
     .expect("write");
     let s = settings.to_str().expect("utf-8");
     let manual = render_json(sb.ym_fake(), &arw, &["--settings", s], &sb.root().join("m"));
     assert_eq!(
-        manual["settings"]["highlights"],
+        common::node(&manual, 1)["grade"]["highlights"],
         json!({ "kind": "manual", "value": 30.0 })
     );
     assert_eq!(
-        manual["settings"]["color_balance"]["shadows"],
+        common::node(&manual, 1)["grade"]["color_balance"]["shadows"],
         json!({ "kind": "manual", "point": [0.2, 0.1] })
     );
     let auto = render_json(
@@ -690,15 +769,15 @@ fn highlights_shadows_and_black_take_auto() {
     );
     // Pinned to the numbers Apple Auto's answer resolved to.
     assert_eq!(
-        auto["settings"]["highlights"],
+        common::node(&auto, 1)["grade"]["highlights"],
         json!({ "kind": "manual", "value": TABLE.highlights[1] })
     );
     assert_eq!(
-        auto["settings"]["shadows"],
+        common::node(&auto, 1)["grade"]["shadows"],
         json!({ "kind": "manual", "value": 0.0 })
     );
     assert_eq!(
-        auto["settings"]["black"],
+        common::node(&auto, 1)["grade"]["black"],
         json!({ "kind": "manual", "value": 0.0 })
     );
     for bad in ["autos", "101", ""] {

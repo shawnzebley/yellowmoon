@@ -1,8 +1,10 @@
 import { useEffect, useState } from "react";
-import type { AppInfo } from "../../api/types";
+import type { AppInfo, FilmCatalogue } from "../../api/types";
 import { Item, ItemContent } from "@/components/glass/item";
 import { Button, LinkButton, MoonMark } from "../../components";
 import { useStore } from "../../state/context";
+import { FILM_CREDIT, FILM_TRADEMARKS } from "../../fixtures/filmCredit";
+import { FilmCredit } from "../nodes/FilmCredit";
 import { ADOBE_NOTICE } from "../export/ExportOptionsForm";
 import { Dialog } from "./Dialog";
 
@@ -20,7 +22,6 @@ export const TRADEMARK_NOTICE =
 export const CREDITS: ReadonlyArray<string> = [
   "ALEXA colour matrices from the Academy's aces-dev (AMPAS licence).",
   "Sony camera spectral measurements by Weta Digital, from rawtoaces-data (Apache License 2.0).",
-  "ACES 2.0 output transform from aces-output (Apache License 2.0).",
   "The Figtree typeface (SIL Open Font License 1.1).",
 ];
 
@@ -32,6 +33,20 @@ export const CREDITS: ReadonlyArray<string> = [
 export function About() {
   const store = useStore();
   const [info, setInfo] = useState<AppInfo | null>(null);
+  // The credit line of the film data comes from the core with the list of stocks; until it has (or when the data is missing) the page's own copy stands.
+  const [film, setFilm] = useState<FilmCatalogue | null>(null);
+  useEffect(() => {
+    let live = true;
+    store.filmCatalogue().then(
+      (value) => {
+        if (live) setFilm(value);
+      },
+      () => {},
+    );
+    return () => {
+      live = false;
+    };
+  }, [store]);
   useEffect(() => {
     let live = true;
     store.api.appInfo().then(
@@ -73,6 +88,11 @@ export function About() {
           A raw processor for Sony ARW files. Every photo is developed automatically, with ALEXA-style colour. Free and open
           source. Nothing is saved besides the files you export.
         </p>
+      </section>
+      <section className="ym-about-dialog__section" aria-label="Film">
+        <h3>Film</h3>
+        <FilmCredit store={store} credit={film?.credit ?? FILM_CREDIT} licenceLink className="ym-about-dialog__film-credit" />
+        <p className="ym-about-dialog__film-legal">{film?.trademarks ?? FILM_TRADEMARKS}</p>
       </section>
       <section className="ym-about-dialog__section" aria-label="Licence">
         <h3>Licence</h3>

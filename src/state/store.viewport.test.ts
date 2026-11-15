@@ -8,6 +8,7 @@ import type { MockApi, MockOptions } from "../api.mock";
 import type { RenderStats, ViewportInput } from "../api/types";
 import { installManualRaf } from "../test/raf";
 import type { ManualRaf } from "../test/raf";
+import { holdGesture } from "./gestureHold";
 import { isSuperseded } from "./requestLimiter";
 import { createStore, HISTOGRAM_THROTTLE_MS, LOOK_THUMBNAIL_CONCURRENCY } from "./store";
 import type { AppStore } from "./store";
@@ -214,6 +215,45 @@ describe("the histogram", () => {
     unwatch();
   });
 
+  it("waits for the hand: nothing is asked for while a gesture is held, and the extras come back once when it ends (U-02)", async () => {
+    const { api, store } = await opened({ current: 3 });
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const histogram = vi.spyOn(api, "histogram");
+    const sample = vi.spyOn(api, "samplePixel");
+    const scatter = vi.spyOn(api, "chromaScatter");
+    const stopHistogram = store.watchHistogram({ readout: true });
+    const stopScatter = store.watchChromaScatter();
+    await vi.advanceTimersByTimeAsync(0);
+    histogram.mockClear();
+    sample.mockClear();
+    scatter.mockClear();
+
+    const release = holdGesture();
+    await frames(api, 1000);
+    expect(histogram, "a drag of a knob does not ask for the histogram").not.toHaveBeenCalled();
+    expect(sample).not.toHaveBeenCalled();
+    expect(scatter).not.toHaveBeenCalled();
+
+    release();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(histogram).toHaveBeenCalledTimes(1);
+    expect(sample).toHaveBeenCalledTimes(1);
+    expect(scatter).toHaveBeenCalledTimes(1);
+
+    // Two gestures at once (a knob and a pin): the extras wait for the last.
+    histogram.mockClear();
+    const a = holdGesture();
+    const b = holdGesture();
+    a();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(histogram).not.toHaveBeenCalled();
+    b();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(histogram).toHaveBeenCalledTimes(1);
+    stopHistogram();
+    stopScatter();
+  });
+
   it("is not asked for once nobody watches, or while nobody has", async () => {
     const { api, store } = await opened({ current: 3 });
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
@@ -411,5 +451,24 @@ describe("look tiles", () => {
     expect(t.asked).toHaveLength(2);
     t.answer(1, "blob:again");
     await expect(second).resolves.toBe("blob:again");
+  });
+});
+
+describe("Home on the zoomed photo (docs/28 A-10)", () => {
+  it("sets Fit and then the zoom again, with the mask view as it is, and leaves the zoom mirror where it was", async () => {
+    const { api, store } = await opened({ current: 3 });
+    await store.setZoom({ kind: "percent", value: 200 });
+    const order: string[] = [];
+    vi.spyOn(api, "viewportSetMode").mockImplementation(async (m) => void order.push(m.kind === "fit" ? "fit" : `percent:${m.value}`));
+    await store.recentreView();
+    expect(order).toEqual(["fit", "percent:200"]);
+    expect(store.getState().zoom).toEqual({ kind: "percent", value: 200 });
+  });
+
+  it("does nothing at Fit, where the picture is already in the middle", async () => {
+    const { api, store } = await opened({ current: 3 });
+    const mode = vi.spyOn(api, "viewportSetMode");
+    await store.recentreView();
+    expect(mode).not.toHaveBeenCalled();
   });
 });

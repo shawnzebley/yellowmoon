@@ -11,6 +11,10 @@
 //! 2. [`import`] (step 4, "Import") copies only those files into the library, grouped as ARRI
 //!    groups them, hashes each, and writes the manifest. [`import_path`] does both for the CLI.
 //!
+//! ARRI's display LUTs are recognised but never imported: Yellowmoon uses its own display rendering
+//! (`docs/02-colour-pipeline.md`, C12), so [`inspect`] says there is nothing to import for a
+//! source that holds only those, and [`import`] leaves them out of a source that also holds looks.
+//!
 //! What import guarantees:
 //!
 //! * **Originals are read-only** and the copies are byte-for-byte identical (the SHA-256 recorded
@@ -65,7 +69,7 @@ use crate::manifest::{
 use crate::recognize::{
     CubeSummary, FileFacts, LookFileFacts, Outcome, PackageDb, Recognition, Verdict, recognize,
 };
-use plan::{EntryData, Slot, Spec, SpecKind, apply, assign};
+use plan::{EntryData, Slot, Spec, apply, assign};
 use source::{ReadFailure, Source};
 
 /// Which phase a [`Progress`] report belongs to.
@@ -190,12 +194,29 @@ pub enum ImportError {
     /// The manifest could not be read or written.
     #[error(transparent)]
     Manifest(#[from] ManifestError),
-    /// A file operation failed.
-    #[error("Could not read or write {}: {source}", .path.display())]
+    /// A file or folder of the source could not be read. What the system said is in the
+    /// [`source`](std::error::Error::source), for the log, not in the sentence.
+    #[error(
+        "Yellowmoon couldn't read {}. Check that it is still there and that you can open it, then import again.",
+        .path.display()
+    )]
     Io {
         /// The file or folder.
         path: PathBuf,
         /// What the system said.
+        #[source]
+        source: std::io::Error,
+    },
+    /// The looks library could not be written. The rollback has already put everything back, so
+    /// the sentence can say that nothing was changed.
+    #[error(
+        "Yellowmoon couldn't save the looks to {}. Check that you can save there and that the disk has free space, then import again. Nothing was changed.",
+        .folder.display()
+    )]
+    Save {
+        /// The looks folder of the library.
+        folder: PathBuf,
+        /// What the system said (for the log, not the sentence).
         #[source]
         source: std::io::Error,
     },
@@ -226,7 +247,7 @@ pub struct RejectedFile {
     pub reason: String,
 }
 
-/// A look or display LUT touched by an import.
+/// A look touched by an import.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ImportedItem {
     /// Its id in the library.
@@ -235,14 +256,12 @@ pub struct ImportedItem {
     pub name: String,
     /// File, relative to the `looks` folder.
     pub file: String,
-    /// Whether it is a display LUT rather than a look.
-    pub display_lut: bool,
 }
 
 /// What an import did.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize)]
 pub struct ImportReport {
-    /// New looks and display LUTs.
+    /// New looks.
     pub added: Vec<ImportedItem>,
     /// Entries whose file was replaced, repaired, or whose input answer changed.
     pub updated: Vec<ImportedItem>,
@@ -252,8 +271,7 @@ pub struct ImportReport {
     pub rejected: Vec<RejectedFile>,
     /// The person's own looks that an ARRI package has claimed: (the id they had, the ARRI id
     /// they have now). The old id is gone from the library, so whatever still names it (the
-    /// default look, a script's `--look`) has to follow. Display LUTs are not listed: a claimed
-    /// own LUT that becomes a display LUT is not a look any more.
+    /// default look, a script's `--look`) has to follow.
     pub renamed: Vec<(LookId, LookId)>,
     /// Things worth telling the user, for example a damaged looks list that was set aside.
     pub notes: Vec<String>,
@@ -629,12 +647,12 @@ pub fn import(
     let _lock = LibraryLock::acquire(&looks_dir, options.lock_timeout)?;
     let mut manifest = match Manifest::load(&looks_dir) {
         Ok(m) => m,
-        Err(ManifestError::Damaged { path: damaged, .. }) => {
+        Err(ManifestError::Damaged { .. }) => {
             let moved =
                 library
                     .damaged_manifest_quarantined()
-                    .map_err(|source| ImportError::Io {
-                        path: damaged.clone(),
+                    .map_err(|source| ImportError::Save {
+                        folder: looks_dir.clone(),
                         source,
                     })?;
             report.notes.push(format!(
@@ -731,16 +749,12 @@ pub fn import(
                     id,
                     name: spec.name.clone(),
                     file,
-                    display_lut: false,
                 });
                 continue;
             }
             // These bytes are in the library already, under another name or group: the entry
             // stays as it is (a missing or altered file is written again, like for any entry).
-            if let Slot::Same {
-                name, display_lut, ..
-            } = &slot
-            {
+            if let Slot::Same { name, .. } = &slot {
                 let dest = paths.file(&file);
                 // A file staged by this import is not on disk yet and is not damaged either.
                 let repair = !staged_dests.contains(&dest)
@@ -748,13 +762,13 @@ pub fn import(
                 if repair && staged_dests.insert(dest.clone()) {
                     let existed_before = dest.exists();
                     if let Some(parent) = dest.parent() {
-                        std::fs::create_dir_all(parent).map_err(|source| ImportError::Io {
-                            path: parent.to_path_buf(),
+                        std::fs::create_dir_all(parent).map_err(|source| ImportError::Save {
+                            folder: looks_dir.clone(),
                             source,
                         })?;
                     }
-                    let temp = stage_write(&dest, &bytes).map_err(|source| ImportError::Io {
-                        path: dest.clone(),
+                    let temp = stage_write(&dest, &bytes).map_err(|source| ImportError::Save {
+                        folder: looks_dir.clone(),
                         source,
                     })?;
                     staged.push(Staged {
@@ -768,7 +782,6 @@ pub fn import(
                     id,
                     name: name.clone(),
                     file,
-                    display_lut: *display_lut,
                 };
                 if repair {
                     report.updated.push(item);
@@ -792,9 +805,7 @@ pub fn import(
                     replaced_files.push(old.file.clone());
                     replaces = Some(old.id.clone());
                     claimed += 1;
-                    if matches!(spec.kind, SpecKind::Look { .. }) {
-                        report.renamed.push((old.id.clone(), id.clone()));
-                    }
+                    report.renamed.push((old.id.clone(), id.clone()));
                 }
                 _ => {}
             }
@@ -811,14 +822,14 @@ pub fn import(
             };
             if write && staged_dests.insert(dest.clone()) {
                 if let Some(parent) = dest.parent() {
-                    std::fs::create_dir_all(parent).map_err(|source| ImportError::Io {
-                        path: parent.to_path_buf(),
+                    std::fs::create_dir_all(parent).map_err(|source| ImportError::Save {
+                        folder: looks_dir.clone(),
                         source,
                     })?;
                 }
                 let existed_before = dest.exists();
-                let temp = stage_write(&dest, &bytes).map_err(|source| ImportError::Io {
-                    path: dest.clone(),
+                let temp = stage_write(&dest, &bytes).map_err(|source| ImportError::Save {
+                    folder: looks_dir.clone(),
                     source,
                 })?;
                 staged.push(Staged {
@@ -844,7 +855,6 @@ pub fn import(
                 id,
                 name: spec.name.clone(),
                 file,
-                display_lut: matches!(spec.kind, SpecKind::Display { .. }),
             };
             if matches!(slot, Slot::Claim { .. }) {
                 // Not a new look: the person's entry became ARRI's.
@@ -881,8 +891,8 @@ pub fn import(
                 }
             }
             discard(&staged);
-            return Err(ImportError::Io {
-                path: s.dest.clone(),
+            return Err(ImportError::Save {
+                folder: looks_dir.clone(),
                 source,
             });
         }
@@ -903,7 +913,13 @@ pub fn import(
                 let _ = std::fs::remove_file(&done.dest);
             }
         }
-        return Err(e.into());
+        return Err(match e {
+            ManifestError::Io { source, .. } => ImportError::Save {
+                folder: looks_dir.clone(),
+                source,
+            },
+            other => other.into(),
+        });
     }
     // The look files that a `.cube` has replaced, and the own LUTs that ARRI's package has
     // claimed (their ARRI copy is written), are not in the list any more.
@@ -912,7 +928,6 @@ pub fn import(
             .looks
             .iter()
             .map(|l| l.file.as_str())
-            .chain(manifest.display_luts.iter().map(|d| d.file.as_str()))
             .any(|f| f.eq_ignore_ascii_case(old))
         {
             let path = paths.file(old);

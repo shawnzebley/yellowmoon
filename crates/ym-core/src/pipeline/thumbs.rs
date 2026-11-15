@@ -7,25 +7,42 @@
 //! * **Look tiles** (`look_thumbnail`, an addition to `docs/01`): the same render with one look at
 //!   100 %, for the tiles of the Look tab. Only the grade group differs between looks, so the raw
 //!   group and the colour plan are shared by every tile.
+//! * **Node thumbnails** (`node_thumbnails`, `docs/23` section 5.7): one picture of about
+//!   [`NODE_THUMBNAIL_PX`] for every corrector of the photo, dead ones included, each the plan
+//!   stopped after that node and then run through the Output, so that it looks like the photo the
+//!   person knows. They are kept in memory in the photo's graph, by node and by a key that names
+//!   everything up to the node, so a change late in the graph makes no new picture for the nodes
+//!   before it.
 //! * **Histogram** (`histogram`, an addition to `docs/01`): 64 bins of the LogC4 signal at the
-//!   input of the curve (C10), per channel, scaled so that the tallest bin is 1 (`docs/02` C11:
-//!   "The histogram in the Curve tab is of LogC4 values").
+//!   input of Main's curve (C9b, the warp's output: the curve is in front of the look since pipeline
+//!   0.9.0), per channel, scaled so that the tallest bin is 1 (`docs/02` C11: "The histogram in the
+//!   Curve tab is of LogC4 values").
 //! * **Chroma scatter** (`chroma_scatter`, for the plane of the colour warp, `docs/11`): the photo's
 //!   colours at the input of the warp (the C9 output), projected onto its chroma plane
 //!   (`ym_color::warp::chroma_of`), from the same small view as the histogram, at most
 //!   [`CHROMA_SCATTER_MAX_POINTS`] of them.
+//! * **`at`** (`docs/01`, `docs/23` sections 7.5 and 9): the histogram, the scatter and Pick colour read the
+//!   signal at a node. Left out it is Main's (as before); `input` is the Input's output; a corrector
+//!   is read by the graph rewrite of the node thumbnails ([`settings_ending_at`], with no look and
+//!   the node's own later stages, masks and key input taken out), so no kernel is involved
+//!   (`signal_source`). Pick colour
+//!   has a second place to read, the node's own input (`ChromaTap::NodeInput`, for a Colour range).
 //! * **Scheduled calls**: `spawn_*` put a request on the render queue at the priority `docs/01`
 //!   gives it and return a handle.
 //! * **Apple Auto's picture** (`docs/19` section 3): the photo at its default settings through the
-//!   Signature look at 100 % and ACES 2, at 768 px on the long edge, 8-bit sRGB, on the CPU reference
+//!   Signature look at 100 % and the cine rendering, at 768 px on the long edge, 8-bit sRGB, on the CPU reference
 //!   path ([`AdvisorPictures`], the session's [`PictureRenderer`] hook).
 
+use std::borrow::Cow;
+use std::fmt::Write as _;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use ym_color::display::{ColorChain, OutputTarget};
+use ym_color::display::{ColorChain, OutputTarget, StageTrace};
+use ym_color::logc::LogC4;
 use ym_color::warp::chroma_of;
 use ym_export::DetailStat;
 use ym_gpu::queue::{CancelToken, JobError, JobHandle, Priority};
@@ -33,7 +50,7 @@ use ym_looks::library::LookId;
 
 use super::RenderError;
 use super::color::{
-    LookProblem, LookProvider, PhotoSource, ResolvedLook, raw_fingerprint, with_look,
+    LookProblem, LookProvider, PhotoSource, ResolvedLook, node_plan, raw_fingerprint, with_look,
 };
 use super::frame::{
     FrameOptions, FrameOutput, FullImage, FullRequest, RenderedFrame, Sampled, ViewSpec,
@@ -41,12 +58,16 @@ use super::frame::{
 };
 use super::geometry::Affine;
 use super::graph::{Job, RenderOptions, Renderer};
+use super::object::{OBJECT_PICTURE_PX, object_source};
 use super::viewport::ViewportState;
 use crate::apple_auto::{AdvisorPicture, PICTURE_LONG_EDGE_PX};
 use crate::session::{PhotoId, PictureInput, PictureRenderer, ThumbnailInput, ThumbnailRenderer};
-use crate::settings::DevelopSettings;
-use ym_color::display::DisplayTransform;
+use crate::settings::{
+    ColorWarp, Curves, DevelopSettings, MaskSettings, NodeGrade, NodeId, NodeKind, NodeLink,
+    NodeRef, NodeTrim,
+};
 use ym_color::look::LookTransform;
+use ym_color::plan::Stop;
 
 /// Bins of the histogram.
 pub const HISTOGRAM_BINS: usize = 64;
@@ -144,10 +165,222 @@ fn thumbnail_scale(out: (usize, usize), max_px: usize) -> usize {
     1
 }
 
+/// The long edge of a node's thumbnail, in pixels (`docs/23` section 5.7).
+pub const NODE_THUMBNAIL_PX: usize = 160;
+
+/// Counts up with every node thumbnail made in this run of the program, so that a picture has a
+/// version nobody else has (an unchanged picture keeps its version when it is served again).
+static NODE_THUMBNAIL_VERSION: AtomicU64 = AtomicU64::new(1);
+
+/// One node's thumbnail ([`Renderer::node_thumbnails`]).
+#[derive(Debug, Clone)]
+pub struct NodeThumbnail {
+    /// The corrector.
+    pub node: u32,
+    /// Names this picture: it changes when the picture is made again and stays while it is served
+    /// from memory, so a caller that remembers what it showed knows whether the picture is new.
+    pub version: u64,
+    /// The PNG: sRGB, 8 bits, [`NODE_THUMBNAIL_PX`] on the long edge at most.
+    pub png: Arc<Vec<u8>>,
+    /// Whether this call made the picture (false: it was kept from an earlier call).
+    pub fresh: bool,
+}
+
+/// What a photo's graph keeps of a node's thumbnail.
+#[derive(Debug, Clone)]
+pub(crate) struct NodeThumbnailEntry {
+    /// What the picture was made from (see [`Renderer::node_thumbnails`]).
+    pub(crate) key: String,
+    pub(crate) version: u64,
+    pub(crate) png: Arc<Vec<u8>>,
+}
+
+/// The settings of the graph that ends at `node`: the Output reads the node's picture, in place of
+/// the one it read (the nodes after `node` become dead branches, and a dead `node` is live).
+///
+/// This is the plan stopped after the node's picture, then the Output: the plan of the result is
+/// the plan compiled with [`Stop::Picture`] for `node` (a test compares the two), and the Output's
+/// own settings (the look, the cine rendering, the sharpening) stay.
+#[must_use]
+pub fn settings_ending_at(settings: &DevelopSettings, node: u32) -> DevelopSettings {
+    ending_at_output(settings, NodeRef::picture(NodeId::Corrector(node)))
+}
+
+/// [`settings_ending_at`] for any output port: the Output reads `from`.
+fn ending_at_output(settings: &DevelopSettings, from: NodeRef) -> DevelopSettings {
+    let mut s = settings.clone();
+    let into_output = NodeRef::picture(NodeId::Output);
+    let link = NodeLink {
+        from,
+        to: into_output.clone(),
+    };
+    if !s.nodes.links.contains(&link) {
+        s.nodes.links.retain(|l| l.to != into_output);
+        s.nodes.links.push(link);
+    }
+    s
+}
+
+/// Where in a node a panel reads its signal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(clippy::enum_variant_names)] // each names an input of a stage of the node; "Input" is the point
+pub(crate) enum Tap {
+    /// The input of the node's curve: after its trim, its grade and its colour warp (the histogram,
+    /// `docs/02` C11: "the histogram in the Curve tab is of LogC4 values").
+    CurveInput,
+    /// The input of the node's colour warp: after its trim and its grade (the scatter behind the
+    /// pins and Pick colour, whose pins take hold of these colours).
+    WarpInput,
+    /// The input of the node itself: the picture it reads, before its trim and its grade (what a
+    /// Colour range selects on, `docs/23` section 4.2). Main reads the Input's output (C8): Main
+    /// always takes its picture from the Input.
+    NodeInput,
+}
+
+/// The stage of a [`StageTrace`] that holds a signal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Read {
+    /// The Input's output (C8).
+    InputOutput,
+    /// Main's C9, after its trim and its grade.
+    MainWarpInput,
+    /// Main's C9b, after its colour warp.
+    MainCurveInput,
+    /// The last value of the chain (C10): the graph was rewritten so that this is the node's own
+    /// stage.
+    Last,
+}
+
+impl Read {
+    /// The LogC4 value this stage holds in a trace.
+    pub(crate) fn of(self, trace: &StageTrace) -> LogC4 {
+        match self {
+            Self::InputOutput => trace.c8_logc4,
+            Self::MainWarpInput => trace.c9_logc4,
+            Self::MainCurveInput => trace.c9b_logc4,
+            Self::Last => trace.c10_logc4,
+        }
+    }
+}
+
+/// The photo to read, and the stage of its trace, for the signal at `at` (`None` is Main, node 1:
+/// what the panels read before nodes).
+///
+/// * Main reads its own C9 or C9b, as always.
+/// * The Input reads its output (C8).
+/// * Another corrector `k` is read through a **graph rewrite**: the photo with the Output reading
+///   node `k` ([`settings_ending_at`]; the nodes after it are dead branches), the look taken out
+///   (Neutral, so that C10 is the last node's own value), and the node's later stages made identity
+///   (its curve; for the warp's input also its warp; for the node's input also its trim and its
+///   grade), so that the chain's last value is the signal at that stage of the node. Nothing in the
+///   kernels or the chain changes, and the raw group and its caches are the photo's own.
+/// * For the curve's and the warp's input the node's **masks and key input are taken out** too (its
+///   mask rows, its Invert and the link into its key input): the node's blend would otherwise leave
+///   `in + m (node(in) - in)` as the last value, and the panels read the node's own signal, which
+///   its mask does not change. The node's input is read with every step at its identity, which the
+///   chain skips whole, so its masks take no part there.
+/// * A Parallel, a Layer or a Combiner (`docs/25` section 5.7) reads the picture after it: the same
+///   rewrite with nothing taken out of the node (a mixer has no trim, grade, curve, warp or masks,
+///   so every tap reads the same picture). A Splitter has no picture of its own (its outputs are
+///   single channels); it reads its input picture, the picture on the link into it.
+/// * [`Tap::NodeInput`] reads the picture a node takes in: the Input's output (C8) for Main and the
+///   Input, and for another corrector the rewrite with the node itself at its identity.
+///
+/// # Errors
+///
+/// [`RenderError::Color`] for a node the photo does not have and for the Output, which has no
+/// signal to read.
+pub(crate) fn signal_source(
+    src: &PhotoSource,
+    at: Option<NodeId>,
+    tap: Tap,
+) -> Result<(Cow<'_, PhotoSource>, Read), RenderError> {
+    let main = match tap {
+        Tap::CurveInput => Read::MainCurveInput,
+        Tap::WarpInput => Read::MainWarpInput,
+        Tap::NodeInput => Read::InputOutput,
+    };
+    match at {
+        None => Ok((Cow::Borrowed(src), main)),
+        Some(NodeId::Input) => Ok((Cow::Borrowed(src), Read::InputOutput)),
+        Some(NodeId::Output) => Err(RenderError::Color(
+            "The output has no picture to read here.".to_owned(),
+        )),
+        Some(NodeId::Corrector(1)) => Ok((Cow::Borrowed(src), main)),
+        Some(id @ NodeId::Corrector(k))
+            if matches!(
+                src.settings.nodes.kind_of(id),
+                Some(
+                    NodeKind::Parallel | NodeKind::Layer | NodeKind::Combiner | NodeKind::Splitter
+                )
+            ) =>
+        {
+            let from = if src.settings.nodes.kind_of(id) == Some(NodeKind::Splitter) {
+                let into = NodeRef::picture(id);
+                let Some(link) = src.settings.nodes.links.iter().find(|l| l.to == into) else {
+                    return Err(RenderError::Color(format!(
+                        "Node {k} has no picture to read here."
+                    )));
+                };
+                if link.from.node == NodeId::Input {
+                    return Ok((Cow::Borrowed(src), Read::InputOutput));
+                }
+                link.from.clone()
+            } else {
+                NodeRef::picture(id)
+            };
+            let mut settings = ending_at_output(&src.settings, from);
+            settings.output_mut().look = LookId::neutral();
+            Ok((Cow::Owned(src.with_settings(settings)), Read::Last))
+        }
+        Some(NodeId::Corrector(k)) => {
+            if src.settings.nodes.corrector(k).is_none() {
+                return Err(RenderError::Color(format!("This photo has no node {k}.")));
+            }
+            let mut settings = settings_ending_at(&src.settings, k);
+            settings.output_mut().look = LookId::neutral();
+            if matches!(tap, Tap::CurveInput | Tap::WarpInput) {
+                // The node's own signal is not blended by its mask (the blend is the last thing
+                // a node does): no mask rows, no Invert, nothing linked into its key input.
+                let key_input = NodeRef::key(NodeId::Corrector(k));
+                settings.nodes.links.retain(|l| l.to != key_input);
+            }
+            if let Some(node) = settings.nodes.corrector_mut(k) {
+                match tap {
+                    Tap::CurveInput => {
+                        node.grade.curve = Curves::default();
+                        node.masks = MaskSettings::default();
+                    }
+                    Tap::WarpInput => {
+                        node.grade.curve = Curves::default();
+                        node.grade.color_warp = ColorWarp::default();
+                        node.masks = MaskSettings::default();
+                    }
+                    // Every step of the node at its identity: it passes its picture through
+                    // (`PreparedNode::skips`), so the chain's last value is what it reads.
+                    Tap::NodeInput => {
+                        node.trim = NodeTrim::default();
+                        node.grade = NodeGrade::neutral();
+                    }
+                }
+            }
+            Ok((Cow::Owned(src.with_settings(settings)), Read::Last))
+        }
+    }
+}
+
 impl Renderer {
     fn thumbnail_spec(&self, job: &mut Job<'_>) -> Result<(ViewSpec, (usize, usize)), RenderError> {
+        self.thumbnail_spec_at(job, self.options().thumbnail_px)
+    }
+
+    /// The view of a thumbnail whose long edge is at most `max_px`.
+    fn thumbnail_spec_at(
+        &self,
+        job: &mut Job<'_>,
+        max_px: usize,
+    ) -> Result<(ViewSpec, (usize, usize)), RenderError> {
         let image = job.final_size()?;
-        let max_px = self.options().thumbnail_px;
         let (tw, th) = thumbnail_size(image, max_px);
         // The reduction follows the size of what is shown (a crop to a tenth of the photo needs a
         // finer image than the whole photo does).
@@ -213,6 +446,101 @@ impl Renderer {
         encode_png_rgb8(tw, th, &rgb)
     }
 
+    /// A thumbnail for every corrector of the photo (`docs/23` section 5.7), in the order of the
+    /// cards (the plan's order over all nodes, dead ones included): each is the photo with the plan
+    /// stopped after that node's picture and then run through the Output
+    /// ([`settings_ending_at`]), at most [`NODE_THUMBNAIL_PX`] on its long edge, in sRGB, as a PNG.
+    ///
+    /// The pictures are kept in the photo's graph under a key that holds the raw group, the
+    /// geometry, the view, the Input's and the Output's settings and the plan up to the node
+    /// (`GradeKey`: the nodes the plan runs to it, not the ones after it). A call finds every
+    /// picture whose key is unchanged in memory and renders the others, on the device when the
+    /// renderer has one and on the CPU otherwise ([`NodeThumbnail::fresh`] says which). Nothing
+    /// goes to disk. The thumbnail does not touch the photo's detail statistic.
+    ///
+    /// # Errors
+    ///
+    /// [`RenderError`] for unusable data or a cancelled job. The pictures made before the error are
+    /// kept.
+    pub fn node_thumbnails(
+        &self,
+        src: &PhotoSource,
+        cancel: &CancelToken,
+    ) -> Result<Vec<NodeThumbnail>, RenderError> {
+        let ids: Vec<u32> = node_plan(&src.settings.nodes, Stop::Output)?
+            .cards
+            .iter()
+            // A mixer, a Splitter and a Combiner have no number and no thumbnail (`docs/25` section 5.2).
+            .filter(|card| card.number.is_some())
+            .map(|card| card.id)
+            .collect();
+        // The view, and the part of every key that does not depend on the node: the raw group,
+        // the geometry, the lens, the size and the output sharpening.
+        let (spec, shared) = {
+            let mut job = Job::new(self, src, cancel)?.with_gpu_priority(Priority::Thumbnail);
+            let (spec, _) = self.thumbnail_spec_at(&mut job, NODE_THUMBNAIL_PX)?;
+            let params = job.params()?;
+            let mut shared = format!(
+                "{:?}|{:?}|{:?}|{}x{}|{:?}|os{:?}",
+                params.key(),
+                job.geometry()?,
+                spec.view_to_final,
+                spec.out_w,
+                spec.out_h,
+                spec.k,
+                src.settings.output().output_sharpening,
+            );
+            if let Some(lens) = job.lens_key()? {
+                let _ = write!(shared, "|{lens}");
+            }
+            (spec, shared)
+        };
+        let graph = self.graph(src.id);
+        graph.retain_node_thumbnails(&ids);
+        let mut out = Vec::with_capacity(ids.len());
+        for node in ids {
+            if cancel.is_cancelled() {
+                return Err(RenderError::Cancelled);
+            }
+            let stopped = src.with_settings(settings_ending_at(&src.settings, node));
+            let mut job = Job::new(self, &stopped, cancel)?.with_gpu_priority(Priority::Thumbnail);
+            let key = format!("{shared}|{:?}", job.grade_key(spec.target, true)?);
+            if let Some(kept) = graph.cached_node_thumbnail(node, &key) {
+                out.push(NodeThumbnail {
+                    node,
+                    version: kept.version,
+                    png: kept.png,
+                    fresh: false,
+                });
+                continue;
+            }
+            let frame = render_view(job, &spec)?;
+            let mut rgb = vec![0u8; 3 * spec.out_w * spec.out_h];
+            rgb.par_chunks_mut(3)
+                .zip(frame.rgba.par_chunks(4))
+                .for_each(|(d, s)| {
+                    d.copy_from_slice(&s[..3]);
+                });
+            let png = Arc::new(encode_png_rgb8(spec.out_w, spec.out_h, &rgb)?);
+            let version = NODE_THUMBNAIL_VERSION.fetch_add(1, Ordering::Relaxed);
+            graph.store_node_thumbnail(
+                node,
+                NodeThumbnailEntry {
+                    key,
+                    version,
+                    png: Arc::clone(&png),
+                },
+            );
+            out.push(NodeThumbnail {
+                node,
+                version,
+                png,
+                fresh: true,
+            });
+        }
+        Ok(out)
+    }
+
     /// Apple Auto's picture of a photo (`docs/19` section 3): `src` as it is (its settings, look and
     /// estimates), whole, at [`PICTURE_LONG_EDGE_PX`] on the long edge (a smaller photo is not
     /// enlarged), from the reduced raw group as a thumbnail is, in sRGB, 8 bits, `width * height * 3`
@@ -227,9 +555,65 @@ impl Renderer {
         src: &PhotoSource,
         cancel: &CancelToken,
     ) -> Result<AdvisorPicture, RenderError> {
+        self.whole_picture(src, PICTURE_LONG_EDGE_PX, cancel)
+    }
+
+    /// SAM's picture of a photo (`docs/algorithms/06` section 5.7, [`object_source`]): the Input's picture, whole, in the photo
+    /// frame, at [`OBJECT_PICTURE_PX`] on the long edge, Neutral look, no output sharpening, sRGB, 8 bits. Made on the CPU
+    /// reference path by a renderer of its own that has no device, so that the features, the masks and the exports made from
+    /// them are the same bytes on every machine. Its caches are dropped when the picture is done: the photo's graph in this
+    /// renderer's own memory is no use to anything else. Always made again: [`Renderer::object_picture`] keeps it.
+    ///
+    /// # Errors
+    ///
+    /// [`RenderError`] for unusable data or a cancelled job.
+    pub(crate) fn object_picture_made(
+        &self,
+        src: &PhotoSource,
+        cancel: &CancelToken,
+    ) -> Result<AdvisorPicture, RenderError> {
+        let reference = self.object_reference()?;
+        let picture = reference.whole_picture(&object_source(src), OBJECT_PICTURE_PX, cancel);
+        reference.forget(src.id);
+        picture
+    }
+
+    /// [`Renderer::object_picture_made`], kept: `hash` names the picture (the FNV-1a of [`Renderer::object_key`], which equal
+    /// pictures share) and the latest one is kept, so a photo with Object rows and Subject or People rows makes it once for
+    /// its two workers (the second waits for the first and takes its picture), and an export takes the viewer's.
+    ///
+    /// # Errors
+    ///
+    /// [`RenderError`] for unusable data or a cancelled job.
+    pub(crate) fn object_picture(
+        &self,
+        src: &PhotoSource,
+        hash: u64,
+        cancel: &CancelToken,
+    ) -> Result<Arc<AdvisorPicture>, RenderError> {
+        let mut kept = self.object_picture_slot();
+        if let Some((have, picture)) = kept.as_ref()
+            && *have == hash
+        {
+            return Ok(Arc::clone(picture));
+        }
+        let picture = Arc::new(self.object_picture_made(src, cancel)?);
+        self.count_object_picture();
+        *kept = Some((hash, Arc::clone(&picture)));
+        Ok(picture)
+    }
+
+    /// `src` as it is, whole, at `long_edge` px on the long edge at most, in sRGB, 8 bits (see
+    /// [`Renderer::advisor_picture`]).
+    fn whole_picture(
+        &self,
+        src: &PhotoSource,
+        long_edge: usize,
+        cancel: &CancelToken,
+    ) -> Result<AdvisorPicture, RenderError> {
         let mut job = Job::new(self, src, cancel)?.with_gpu_priority(Priority::Thumbnail);
         let image = job.final_size()?;
-        let (width, height) = thumbnail_size(image, PICTURE_LONG_EDGE_PX);
+        let (width, height) = thumbnail_size(image, long_edge);
         let spec = ViewSpec {
             out_w: width,
             out_h: height,
@@ -239,7 +623,7 @@ impl Renderer {
                 0.0,
                 0.0,
             ),
-            k: thumbnail_scale(image, PICTURE_LONG_EDGE_PX),
+            k: thumbnail_scale(image, long_edge),
             target: OutputTarget::Srgb,
             before: false,
             coarse_only: false,
@@ -282,15 +666,19 @@ impl Renderer {
     }
 
     /// The small view of the whole photo that the histogram and the chroma scatter read, and the
-    /// grade chain of the photo as it is rendered now: `read` gets the sampled camera RGB (with the
-    /// letterbox mask) and the chain.
+    /// grade chain of the photo as it is rendered now (of the graph that [`signal_source`] makes
+    /// for `at`): `read` gets the sampled camera RGB (with the letterbox mask), the chain and the
+    /// stage that holds the signal.
     fn panel_view<T>(
         &self,
         src: &PhotoSource,
+        at: Option<NodeId>,
+        tap: Tap,
         cancel: &CancelToken,
-        read: impl FnOnce(&Sampled, &ColorChain) -> T,
+        read: impl FnOnce(&Sampled, &ColorChain, Read) -> T,
     ) -> Result<T, RenderError> {
-        let mut job = Job::new(self, src, cancel)?.with_gpu_priority(Priority::Thumbnail);
+        let (src, stage) = signal_source(src, at, tap)?;
+        let mut job = Job::new(self, &src, cancel)?.with_gpu_priority(Priority::Thumbnail);
         let image = job.final_size()?;
         let (tw, th) = thumbnail_size(image, HISTOGRAM_LONG_EDGE_PX);
         let spec = ViewSpec {
@@ -316,7 +704,7 @@ impl Renderer {
         // The sample comes from the device group when the sampler is there; the reading stays on
         // the CPU (a few thousand pixels through the f64 trace: `docs/17-gpu.md` section 11).
         let view = sample_view_routed(&mut job, &spec)?;
-        let out = read(&view.sampled, &grade.chain);
+        let out = read(&view.sampled, &grade.chain, stage);
         job.finish(
             view.scale,
             super::graph::ComputeDevice::Cpu,
@@ -335,41 +723,60 @@ impl Renderer {
         src: &PhotoSource,
         cancel: &CancelToken,
     ) -> Result<HistogramData, RenderError> {
-        let counts = self.panel_view(src, cancel, |sampled, chain| {
-            let img = &sampled.img;
-            let n = img.width * img.height;
-            let outside = sampled.outside.as_deref();
-            (0..n)
-                .into_par_iter()
-                .fold(
-                    || [[0u64; HISTOGRAM_BINS]; 3],
-                    |mut acc, i| {
-                        if outside.is_some_and(|o| o[i] != 0) {
-                            return acc;
-                        }
-                        let p = img.pixel(i % img.width, i / img.width);
-                        let t = chain.trace([f64::from(p[0]), f64::from(p[1]), f64::from(p[2])]);
-                        for (c, acc_c) in acc.iter_mut().enumerate() {
-                            let v = t.c10_logc4.0[c].clamp(0.0, 1.0);
-                            let bin =
-                                ((v * HISTOGRAM_BINS as f64) as usize).min(HISTOGRAM_BINS - 1);
-                            acc_c[bin] += 1;
-                        }
-                        acc
-                    },
-                )
-                .reduce(
-                    || [[0u64; HISTOGRAM_BINS]; 3],
-                    |mut a, b| {
-                        for c in 0..3 {
-                            for i in 0..HISTOGRAM_BINS {
-                                a[c][i] += b[c][i];
+        self.histogram_at(src, None, cancel)
+    }
+
+    /// The histogram of the signal at a node (`docs/01`, the `at` argument): the input of its
+    /// curve (after its trim, grade and colour warp), or the Input's output for `Input`; `None` is
+    /// Main, which [`Renderer::histogram`] reads. See `signal_source`.
+    ///
+    /// # Errors
+    ///
+    /// [`RenderError`] for unusable data, a node the photo does not have, the Output, or a
+    /// cancelled job.
+    pub fn histogram_at(
+        &self,
+        src: &PhotoSource,
+        at: Option<NodeId>,
+        cancel: &CancelToken,
+    ) -> Result<HistogramData, RenderError> {
+        let counts =
+            self.panel_view(src, at, Tap::CurveInput, cancel, |sampled, chain, stage| {
+                let img = &sampled.img;
+                let n = img.width * img.height;
+                let outside = sampled.outside.as_deref();
+                (0..n)
+                    .into_par_iter()
+                    .fold(
+                        || [[0u64; HISTOGRAM_BINS]; 3],
+                        |mut acc, i| {
+                            if outside.is_some_and(|o| o[i] != 0) {
+                                return acc;
                             }
-                        }
-                        a
-                    },
-                )
-        })?;
+                            let p = img.pixel(i % img.width, i / img.width);
+                            let t =
+                                chain.trace([f64::from(p[0]), f64::from(p[1]), f64::from(p[2])]);
+                            for (c, acc_c) in acc.iter_mut().enumerate() {
+                                let v = stage.of(&t).0[c].clamp(0.0, 1.0);
+                                let bin =
+                                    ((v * HISTOGRAM_BINS as f64) as usize).min(HISTOGRAM_BINS - 1);
+                                acc_c[bin] += 1;
+                            }
+                            acc
+                        },
+                    )
+                    .reduce(
+                        || [[0u64; HISTOGRAM_BINS]; 3],
+                        |mut a, b| {
+                            for c in 0..3 {
+                                for i in 0..HISTOGRAM_BINS {
+                                    a[c][i] += b[c][i];
+                                }
+                            }
+                            a
+                        },
+                    )
+            })?;
         let peak = counts.iter().flatten().copied().max().unwrap_or(0).max(1) as f64;
         let norm = |c: usize| -> Vec<f64> {
             counts[c]
@@ -400,17 +807,35 @@ impl Renderer {
         src: &PhotoSource,
         cancel: &CancelToken,
     ) -> Result<ChromaScatter, RenderError> {
-        let points = self.panel_view(src, cancel, |sampled, chain| {
-            let img = &sampled.img;
-            every_nth_inside(sampled, CHROMA_SCATTER_MAX_POINTS)
-                .par_iter()
-                .flat_map_iter(|&i| {
-                    let p = img.pixel(i % img.width, i / img.width);
-                    let t = chain.trace([f64::from(p[0]), f64::from(p[1]), f64::from(p[2])]);
-                    chroma_of(t.c9_logc4).map(scatter_coordinate)
-                })
-                .collect::<Vec<f64>>()
-        })?;
+        self.chroma_scatter_at(src, None, cancel)
+    }
+
+    /// The scatter of the colours at the input of a node's colour warp (`docs/01`, the `at`
+    /// argument): after its trim and its grade, or the Input's output for `Input`; `None` is Main,
+    /// which [`Renderer::chroma_scatter`] reads. See `signal_source`.
+    ///
+    /// # Errors
+    ///
+    /// [`RenderError`] for unusable data, a node the photo does not have, the Output, or a
+    /// cancelled job.
+    pub fn chroma_scatter_at(
+        &self,
+        src: &PhotoSource,
+        at: Option<NodeId>,
+        cancel: &CancelToken,
+    ) -> Result<ChromaScatter, RenderError> {
+        let points =
+            self.panel_view(src, at, Tap::WarpInput, cancel, |sampled, chain, stage| {
+                let img = &sampled.img;
+                every_nth_inside(sampled, CHROMA_SCATTER_MAX_POINTS)
+                    .par_iter()
+                    .flat_map_iter(|&i| {
+                        let p = img.pixel(i % img.width, i / img.width);
+                        let t = chain.trace([f64::from(p[0]), f64::from(p[1]), f64::from(p[2])]);
+                        chroma_of(stage.of(&t)).map(scatter_coordinate)
+                    })
+                    .collect::<Vec<f64>>()
+            })?;
         Ok(ChromaScatter { points })
     }
 
@@ -429,6 +854,12 @@ impl Renderer {
             // The device jobs of the viewport and tile renders of the photo left are cancelled
             // too, queued ones at once (they hold the photo's mosaic).
             self.cancel_gpu_navigation(old);
+            // The encoder of the Object masks stops working for the photo left, if it started on its own.
+            self.object_leave(old);
+            // So does the worker of the Subject and People masks.
+            self.vision_leave(old);
+            // And the depth worker.
+            self.depth_leave(old);
         }
         self.scheduler().navigate(photo)
     }
@@ -488,6 +919,24 @@ impl Renderer {
             })
     }
 
+    /// Queues the node thumbnails of a photo ([`Renderer::node_thumbnails`]) at
+    /// [`Priority::Thumbnail`]. Like a look tile it is a request of a panel for the photo on screen,
+    /// and moving to another photo cancels it (see [`Renderer::spawn_look_thumbnail`]).
+    #[must_use]
+    pub fn spawn_node_thumbnails(
+        &self,
+        src: PhotoSource,
+    ) -> JobHandle<Result<Vec<NodeThumbnail>, RenderError>> {
+        let r = self.clone();
+        let id = src.id;
+        self.scheduler().submit_superseded(
+            Priority::Thumbnail,
+            id,
+            move |token| r.node_thumbnails(&src, token),
+            || Err(RenderError::Cancelled),
+        )
+    }
+
     /// Queues a look tile at [`Priority::Thumbnail`]. A tile is a request of the Look tab for the
     /// photo on screen: moving to another photo ([`Renderer::navigate`]) cancels it, pending or
     /// running, and a pending one lets go of the photo's decoded image at once; the handle then
@@ -518,12 +967,22 @@ impl Renderer {
         &self,
         src: PhotoSource,
     ) -> JobHandle<Result<HistogramData, RenderError>> {
+        self.spawn_histogram_at(src, None)
+    }
+
+    /// [`Renderer::spawn_histogram`] for the signal at a node ([`Renderer::histogram_at`]).
+    #[must_use]
+    pub fn spawn_histogram_at(
+        &self,
+        src: PhotoSource,
+        at: Option<NodeId>,
+    ) -> JobHandle<Result<HistogramData, RenderError>> {
         let r = self.clone();
         let id = src.id;
         self.scheduler().submit_superseded(
             Priority::Thumbnail,
             id,
-            move |token| r.histogram(&src, token),
+            move |token| r.histogram_at(&src, at, token),
             || Err(RenderError::Cancelled),
         )
     }
@@ -536,12 +995,22 @@ impl Renderer {
         &self,
         src: PhotoSource,
     ) -> JobHandle<Result<ChromaScatter, RenderError>> {
+        self.spawn_chroma_scatter_at(src, None)
+    }
+
+    /// [`Renderer::spawn_chroma_scatter`] for the colours at a node ([`Renderer::chroma_scatter_at`]).
+    #[must_use]
+    pub fn spawn_chroma_scatter_at(
+        &self,
+        src: PhotoSource,
+        at: Option<NodeId>,
+    ) -> JobHandle<Result<ChromaScatter, RenderError>> {
         let r = self.clone();
         let id = src.id;
         self.scheduler().submit_superseded(
             Priority::Thumbnail,
             id,
-            move |token| r.chroma_scatter(&src, token),
+            move |token| r.chroma_scatter_at(&src, at, token),
             || Err(RenderError::Cancelled),
         )
     }
@@ -593,9 +1062,9 @@ impl Renderer {
     }
 }
 
-/// The looks Apple Auto's picture is rendered with: the Signature look the white lift is sized for
-/// (`<data>/looks/builtin/signature.json`, `SessionEnv::reference_look`), and Neutral. No display LUT:
-/// the picture's display rendering is ours, ACES 2.
+/// The looks Apple Auto's picture is rendered with: the Signature look
+/// (`<data>/looks/builtin/signature.json`, `SessionEnv::reference_look`), and Neutral. The picture's
+/// display rendering is ours, the cine rendering.
 struct PictureLooks {
     signature: Option<Arc<LookTransform>>,
 }
@@ -614,21 +1083,15 @@ impl LookProvider for PictureLooks {
             _ => Err(LookProblem(format!("The look {id} is not in the library."))),
         }
     }
-
-    fn display_transform(&self, id: &LookId) -> Result<(DisplayTransform, String), LookProblem> {
-        Err(LookProblem(format!(
-            "The display LUT {id} is not in the library."
-        )))
-    }
 }
 
 /// The session's [`PictureRenderer`] hook: Apple Auto's pictures (`docs/19` section 3), made by a
-/// renderer of their own that has no graphics device, no display LUT and only the Signature and
-/// Neutral looks, so the app and `ym` give the model the same bytes on every Mac whatever the GPU
-/// policy, the display rendering and the look library say. Each picture is the photo at its default
+/// renderer of their own that has no graphics device and only the Signature and Neutral looks, so the
+/// app and `ym` give the model the same bytes on every Mac whatever the GPU policy and the look
+/// library say. Each picture is the photo at its default
 /// settings (every Auto the rule's: the photo's own estimates), no crop, no straightening, no turn by
 /// the user and the camera's orientation applied, through the Signature look at 100 % (Neutral when
-/// the data folder has none) and ACES 2. Its caches are dropped after each picture.
+/// the data folder has none) and the cine rendering. Its caches are dropped after each picture.
 pub struct AdvisorPictures {
     renderer: Renderer,
     look: LookId,

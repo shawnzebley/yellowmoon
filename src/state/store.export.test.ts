@@ -122,7 +122,7 @@ describe("running an export", () => {
     api.exportStart = async (job) => {
       const id = await real(job);
       // The core's first event beats the answer.
-      api.emitEvent("export_progress", { job_id: id, file: names[0]!, done: 1, total: 3, file_percent: 10, error: null, skipped: false });
+      api.emitEvent("export_progress", { job_id: id, file: names[0]!, done: 1, total: 3, file_percent: 10, error: null, skipped: false, stopped: false });
       events.push({ job_id: id } as ExportProgress);
       return id;
     };
@@ -145,7 +145,7 @@ describe("running an export", () => {
       seen = store.getState().exportRun;
     });
     for (let percent = 1; percent <= 40; percent++) {
-      api.emitEvent("export_progress", { job_id: jobId, file: names[0]!, done: 0, total: 3, file_percent: percent, error: null, skipped: false });
+      api.emitEvent("export_progress", { job_id: jobId, file: names[0]!, done: 0, total: 3, file_percent: percent, error: null, skipped: false, stopped: false });
     }
     expect(changes, "nothing is drawn per event").toBe(0);
     await vi.waitFor(() => expect(changes).toBe(1));
@@ -157,7 +157,7 @@ describe("running an export", () => {
     const { api, store } = await opened({ exportHoldAt: 0 });
     await store.startExport(names, "~/x");
     const jobId = store.getState().exportRun?.jobId ?? -1;
-    api.emitEvent("export_progress", { job_id: jobId, file: names[0]!, done: 0, total: 3, file_percent: 5, error: null, skipped: false });
+    api.emitEvent("export_progress", { job_id: jobId, file: names[0]!, done: 0, total: 3, file_percent: 5, error: null, skipped: false, stopped: false });
     await store.cancelExport();
     await Promise.resolve();
     await Promise.resolve();
@@ -257,6 +257,53 @@ describe("running an export", () => {
     await store.requestCloseSession();
     expect(store.getState().session).toBeNull();
     expect(store.getState().overlay).toBeNull();
+  });
+});
+
+describe("the consent question over Preferences (docs/22 section 12.3)", () => {
+  /** Preferences with "Send photos to Claude Code?" open over it. */
+  async function asking(options: MockOptions = {}) {
+    const ctx = await opened({ providers: { apple: "available", claude: "available" }, ...options });
+    ctx.store.openOverlay("preferences");
+    await ctx.store.chooseProvider("claude");
+    expect(ctx.store.getState()).toMatchObject({ overlay: "preferences", consentFor: "claude" });
+    return ctx;
+  }
+
+  it("is dropped when About replaces Preferences, so the next ⌘, opens Preferences without it", async () => {
+    const { store } = await asking();
+    store.openOverlay("about");
+    expect(store.getState()).toMatchObject({ overlay: "about", consentFor: null });
+    store.openOverlay("preferences");
+    expect(store.getState()).toMatchObject({ overlay: "preferences", consentFor: null });
+  });
+
+  it("is dropped when the close question takes its place (⌘W while an export runs)", async () => {
+    const { store } = await asking({ speed: 1 });
+    await store.startExport(["DSC04203_neutral.jpg", "DSC04204_neutral.jpg", "DSC04205_neutral.jpg"], "~/x");
+    await store.requestCloseSession();
+    expect(store.getState()).toMatchObject({ overlay: "confirm-close", consentFor: null });
+    store.closeOverlay();
+    store.openOverlay("preferences");
+    expect(store.getState().consentFor).toBeNull();
+  });
+
+  it("is dropped when the .cube import takes its place", async () => {
+    const { api, store } = await asking();
+    api.queueChoice("files", ["~/LUTs/Warm_Film.cube"]);
+    await store.startCubeImport();
+    expect(store.getState()).toMatchObject({ overlay: "import-cube", consentFor: null });
+    store.closeOverlay();
+    store.openOverlay("preferences");
+    expect(store.getState().consentFor).toBeNull();
+  });
+
+  it("stays while Preferences itself is shown again, and Cancel still closes only the question", async () => {
+    const { store } = await asking();
+    store.openOverlay("preferences");
+    expect(store.getState().consentFor).toBe("claude");
+    await store.answerConsent(false);
+    expect(store.getState()).toMatchObject({ overlay: "preferences", consentFor: null });
   });
 });
 

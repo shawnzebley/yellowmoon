@@ -37,13 +37,34 @@ test.describe("the page audit: no element of ours where glasscn has one", () => 
   }
 });
 
+test.describe("YM_GLASS=off (?glass=off)", () => {
+  /** How many elements the page blurs the picture behind. */
+  const blurred = (page: Page) =>
+    page.evaluate(() => [...document.querySelectorAll("*")].filter((el) => getComputedStyle(el).backdropFilter.replace("none", "").trim() !== "").length);
+
+  test("turns the backdrop blur off everywhere and leaves the page as it is", async ({ page }) => {
+    await photos(page);
+    expect(await blurred(page), "the glass blurs what is behind it").toBeGreaterThan(0);
+    await expect(page.locator("html")).not.toHaveAttribute("data-glass", "off");
+    await openApp(page, { ...MOCKUP, glass: "off" });
+    await openPhotos(page);
+    await expect(page.locator("html")).toHaveAttribute("data-glass", "off");
+    expect(await blurred(page)).toBe(0);
+    // Only the blur: the controls are there, the tabs work.
+    await page.getByRole("tab", { name: "Colour" }).click();
+    await expect(page.getByRole("tab", { name: "Colour" })).toHaveAttribute("aria-selected", "true");
+  });
+});
+
 test.describe("tabs", () => {
-  test("← and → move and select, ⌘3 selects Colour, and the panel is labelled by its tab", async ({ page }) => {
+  test("← and → move and select, ⌘4 selects Colour, and the panel is labelled by its tab", async ({ page }) => {
     await photos(page);
     await page.getByRole("tab", { name: "Look" }).focus();
     await page.keyboard.press("ArrowRight");
+    await expect(page.getByRole("tab", { name: "Lens" })).toHaveAttribute("aria-selected", "true");
+    await page.keyboard.press("ArrowRight");
     await expect(page.getByRole("tab", { name: "Light" })).toHaveAttribute("aria-selected", "true");
-    await page.keyboard.press("Meta+3");
+    await page.keyboard.press("Meta+4");
     await expect(page.getByRole("tab", { name: "Colour" })).toHaveAttribute("aria-selected", "true");
     await expect(page.getByRole("tabpanel")).toHaveAttribute("aria-labelledby", "ym-tab-color");
   });
@@ -67,6 +88,69 @@ test.describe("tabs", () => {
     expect(Math.abs(g.labelMid - g.rowMid), JSON.stringify(g)).toBeLessThanOrEqual(1);
     expect(Math.abs(g.lineBottom - g.rimTop), JSON.stringify(g)).toBeLessThanOrEqual(0.5);
   });
+});
+
+test.describe("the tab row at three window sizes", () => {
+  // Seven labels in the 400 px panel's 46 px row (the owner's request of 2026-10-25: Lens is the second tab). Each label is on one line with
+  // its underline under it, nothing is clipped or overlaps its neighbour, whatever the window: the panel is 400 px at every size, so the
+  // three sizes also show that nothing in the row depends on the window.
+  for (const [width, height] of [
+    [1440, 900],
+    [1180, 760],
+    [1800, 1100],
+  ] as const) {
+    test(`every label fits on one line with its underline, at ${width} × ${height}`, async ({ page }) => {
+      await page.setViewportSize({ width, height });
+      await photos(page);
+      const ids = ["look", "lens", "light", "color", "detail", "curve", "raw"];
+      for (const id of ids) {
+        await page.locator(`#ym-tab-${id}`).click();
+        await expect(page.locator(`#ym-tab-${id}`)).toHaveAttribute("aria-selected", "true");
+        // The underline slides to the chosen tab; measure it where it has stopped.
+        await expect
+          .poll(async () =>
+            page.locator(".ym-tools").evaluate((tools, tab) => {
+              const line = tools.querySelector('[data-slot="tabs-indicator"]')!.getBoundingClientRect();
+              const trigger = tools.querySelector(`#ym-tab-${tab}`)!.getBoundingClientRect();
+              return Math.max(Math.abs(line.left - trigger.left), Math.abs(line.right - trigger.right));
+            }, id),
+          )
+          .toBeLessThanOrEqual(1);
+      }
+      const g = await page.locator(".ym-tools").evaluate((tools) => {
+        const row = tools.querySelector(':scope > [data-slot="tabs"]')!.getBoundingClientRect();
+        const triggers = [...tools.querySelectorAll<HTMLElement>('[data-slot="tabs-trigger"]')];
+        const labels = triggers.map((trigger) => {
+          const range = document.createRange();
+          range.selectNodeContents(trigger);
+          const rects = [...range.getClientRects()];
+          const box = trigger.getBoundingClientRect();
+          return {
+            name: trigger.textContent,
+            lines: new Set(rects.map((r) => Math.round(r.top))).size,
+            left: Math.min(...rects.map((r) => r.left)),
+            right: Math.max(...rects.map((r) => r.right)),
+            cell: { left: box.left, right: box.right },
+            overflow: trigger.scrollWidth - trigger.clientWidth,
+          };
+        });
+        return { rowHeight: row.height, rowLeft: row.left, rowRight: row.right, labels };
+      });
+      expect(g.rowHeight, JSON.stringify(g)).toBe(46);
+      expect(g.labels.map((l) => l.name)).toEqual(["Look", "Lens", "Light", "Colour", "Detail", "Curve", "RAW"]);
+      for (const [i, l] of g.labels.entries()) {
+        expect(l.lines, `${l.name} is on one line`).toBe(1);
+        expect(l.overflow, `${l.name} overflows its cell`).toBeLessThanOrEqual(0);
+        // The label sits inside its own cell (so the underline, which is the cell's width, runs under all of it) and inside the row.
+        expect(l.left, `${l.name} starts inside its cell`).toBeGreaterThanOrEqual(l.cell.left - 0.5);
+        expect(l.right, `${l.name} ends inside its cell`).toBeLessThanOrEqual(l.cell.right + 0.5);
+        expect(l.left, `${l.name} is not clipped on the left`).toBeGreaterThanOrEqual(g.rowLeft + 4);
+        expect(l.right, `${l.name} is not clipped on the right`).toBeLessThanOrEqual(g.rowRight - 4);
+        const next = g.labels[i + 1];
+        if (next) expect(next.left - l.right, `the gap between ${l.name} and ${next.name}`).toBeGreaterThanOrEqual(8);
+      }
+    });
+  }
 });
 
 test.describe("sliders and their boxes", () => {
@@ -98,7 +182,8 @@ test.describe("sliders and their boxes", () => {
     await page.mouse.move(at.x + at.width / 2 + 40, at.y + at.height / 2, { steps: 5 });
     await page.mouse.up();
     await expect(box(page, "Exposure")).not.toHaveValue(start);
-    const track = page.locator('[data-slot="slider"]').first();
+    // The track of this slider: the tabs that were opened stay built and hidden (U-02), so the first track of the page may be another's.
+    const track = knob.locator('xpath=ancestor::*[@data-slot="slider"][1]');
     const tb = (await track.boundingBox())!;
     await page.mouse.dblclick(tb.x + tb.width * 0.2, tb.y + tb.height / 2);
     await expect(box(page, "Exposure")).toHaveValue(start);
@@ -129,6 +214,23 @@ test.describe("sliders and their boxes", () => {
     await expect(auto).toHaveAttribute("aria-pressed", "false");
     await auto.click();
     await expect(auto).toHaveAttribute("aria-pressed", "true");
+  });
+
+  test("the Crop panel's AUTO is a glasscn Toggle that switches both ways (Auto crop, docs/20)", async ({ page }) => {
+    await photos(page);
+    await page.getByRole("button", { name: "Crop", exact: true }).click();
+    const card = page.getByRole("region", { name: "Frame" });
+    const auto = card.getByRole("button", { name: "Auto crop" });
+    await expect(auto).toHaveAttribute("data-slot", "toggle");
+    await expect(auto).toHaveText("Auto");
+    await expect(auto).toHaveAttribute("aria-pressed", "false");
+    await auto.click();
+    await expect(auto).toHaveAttribute("aria-pressed", "true");
+    await expect(card.getByText("Cropped to frame the subject.")).toBeVisible();
+    await expect(card.getByText("Levelled by 1.4°.")).toBeVisible();
+    await auto.click();
+    await expect(auto).toHaveAttribute("aria-pressed", "false");
+    await expect(card.getByText("Cropped to frame the subject.")).toHaveCount(0);
   });
 });
 
@@ -178,9 +280,9 @@ test.describe("the other controls", () => {
 });
 
 test.describe("the header", () => {
-  test("Before, Pick white and Crop are toggles: aria-pressed is false, true, false as they are pressed", async ({ page }) => {
+  test("Before, Crop and Nodes are toggles: aria-pressed is false, true, false as they are pressed", async ({ page }) => {
     await photos(page);
-    for (const name of ["Before", "Pick white", "Crop"]) {
+    for (const name of ["Before", "Crop", "Nodes"]) {
       const toggle = page.getByRole("button", { name, exact: true });
       await expect(toggle, `${name} before`).toHaveAttribute("aria-pressed", "false");
       await toggle.click();

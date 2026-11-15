@@ -19,10 +19,10 @@
 # Steps: dng_validate is built if it is missing (tools/dng/build_dng_validate.sh, about 10 minutes the first time, then
 # cached in testdata/dng_sdk); `ym` and `dngfit` are built; the synthetic set is generated if it is missing
 # (tools/fetch/synthetic.sh); then
-#   1. `dngfit eval`: how close Adobe's renderer with the fitted profile is to ACES 2 (neutral ramp, hue and chroma
+#   1. `dngfit eval`: how close Adobe's renderer with the fitted profile is to the cine rendering (neutral ramp, hue and chroma
 #      sweeps, random colours, the chart patches of the synthetic scenes);
 #   2. `dngfit gate`: every DNG passes dng_validate with no warning and no error, and the picture dng_validate renders
-#      from it is within a median CIEDE2000 of 1.5 of our JPEG of the same photo (every file). Without --filter every
+#      from it is within a median CIEDE2000 of 1.5 of our JPEG of the same photo made with sharpening off (every file). Without --filter every
 #      file of the default synthetic set has to be on disk (--require-all), so a partly generated set cannot pass.
 # Exit code 0 when both gates pass, 1 when one fails, 2 on usage or setup errors.
 set -euo pipefail
@@ -82,7 +82,7 @@ export YM_BIN="${YM_BIN:-$target_dir/release/ym}"
 export YELLOWMOON_DATA="${YELLOWMOON_DATA:-$repo_root/data}"
 
 if [ ${#files[@]} -eq 0 ]; then
-  echo "== profile against ACES 2 (Adobe's renderer)"
+  echo "== profile against the cine rendering (Adobe's renderer)"
   "$target_dir/release/dngfit" eval
   echo "== DNG gates on the golden set"
 else

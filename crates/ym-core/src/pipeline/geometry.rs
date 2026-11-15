@@ -13,6 +13,10 @@
 //! 4. The straighten angle rotates the photo about the centre of the canvas, clockwise for positive
 //!    angles, and the canvas keeps its size (corners of the canvas may be empty).
 //! 5. The crop is a rectangle of the canvas, normalised to `[0, 1]²`. The output is that rectangle.
+//! 6. The lens's bend (L4, `docs/21` section 4), when the photo has one ([`Geometry::warp`]), sits
+//!    between 4 and the buffer: the straightened, cropped canvas is the *bent and zoomed* picture, and a
+//!    canvas position reads the photo at `F⁻¹(c / z)` ([`SamplerWarp::canvas_to_photo`]). The inside test
+//!    stays on the canvas position, before the bend. Without a bend nothing below changes.
 //!
 //! Everything is a composition of affine maps and fraction permutations, so one [`Grid`] maps any
 //! output pixel to a position in the buffer, at whatever resolution the buffer and the output
@@ -21,13 +25,31 @@
 //! The dihedral part is exact: with no straighten angle and an output grid that lines up with the
 //! buffer, [`Grid::source`] returns pixel centres and sampling copies pixels.
 
-use ym_gpu::cpu::sampler::SamplerGrid;
+use ym_gpu::cpu::sampler::{SamplerGrid, SamplerWarp};
 
 use crate::auto::display_to_sensor;
 use crate::settings::{Crop, DevelopSettings, NormRect, Orientation};
 
 /// Largest straighten angle that counts as "none" (radians would be overkill: this is degrees).
 const ANGLE_EPS_DEG: f64 = 1e-9;
+
+/// The lens's bend as the sampler reads it, from the lens plan's map for the full-resolution canvas
+/// (`ym_lens::LensPlan::warp`): the coefficients, the zoom and the Newton steps, as plain data.
+/// `None` for the identity (no Anamorphic, and no distortion or no Edges), so a photo without a bend
+/// has the geometry it has without a lens. The axis is the canvas's horizontal.
+#[must_use]
+pub fn sampler_warp(warp: &ym_lens::LensWarp) -> Option<SamplerWarp> {
+    (!warp.is_identity()).then(|| {
+        SamplerWarp::new(
+            warp.bend_x(),
+            warp.bend_y(),
+            warp.distortion_k1(),
+            warp.distortion_k2(),
+            warp.zoom(),
+            ym_lens::consts::NEWTON_STEPS as u8,
+        )
+    })
+}
 
 /// Maps a point of the photo as the camera oriented it to the same spot on the sensor (both as
 /// fractions): [`display_to_sensor`] under the name this module uses.
@@ -160,13 +182,16 @@ pub struct Geometry {
     /// a whole pixel and an output of the crop's own size is a window on the pixels, not a
     /// resample.
     pub pixel_exact: bool,
+    /// The lens's bend (L4): the anamorphic bend, the lens's distortion and the zoom, between the
+    /// canvas position and the buffer. `None` is no bend and the geometry of a photo without one.
+    pub warp: Option<SamplerWarp>,
 }
 
 impl Geometry {
     /// The geometry the settings ask for on a file with EXIF orientation `exif_orientation`.
     #[must_use]
     pub fn new(exif_orientation: u16, settings: &DevelopSettings) -> Self {
-        let (angle_deg, crop) = match &settings.crop {
+        let (angle_deg, crop) = match &settings.input().crop {
             Some(Crop {
                 rect, angle_deg, ..
             }) => (*angle_deg, *rect),
@@ -174,11 +199,20 @@ impl Geometry {
         };
         Self {
             exif_orientation,
-            quarter_turns: quarter_turns_of(settings.orientation),
+            quarter_turns: quarter_turns_of(settings.input().orientation),
             angle_deg,
             crop,
             pixel_exact: false,
+            warp: None,
         }
+    }
+
+    /// The same geometry through the lens's bend (an identity warp is no warp). The warp is the
+    /// canvas's, with the anamorphic axis along the canvas's horizontal.
+    #[must_use]
+    pub fn with_warp(mut self, warp: Option<SamplerWarp>) -> Self {
+        self.warp = warp.filter(|w| !w.is_identity());
+        self
     }
 
     /// No turn, no straightening, no crop: the buffer as it is, in the camera's orientation.
@@ -190,6 +224,7 @@ impl Geometry {
             angle_deg: 0.0,
             crop: NormRect::FULL,
             pixel_exact: false,
+            warp: None,
         }
     }
 
@@ -239,6 +274,11 @@ impl Geometry {
     /// both views hold exactly the same pixels) becomes the crop of the buffer, and the angle keeps
     /// its sense on the canvas (a mirrored orientation turns it the other way round in the
     /// buffer). Without it the result is the whole buffer, never straightened.
+    ///
+    /// The lens's bend goes with it, in the buffer's own orientation: its axis is the canvas's
+    /// horizontal, which is the buffer's vertical when [`Geometry::swaps_sides`] (the map is odd in
+    /// `x` and in `y`, so mirrors and half turns need nothing, and a transposition swaps the roles of
+    /// the two axes). The zoom is the same, so the upright picture is the baked one's pixels.
     #[must_use]
     pub fn upright(&self, buf_w: usize, buf_h: usize, keep_crop: bool) -> Geometry {
         let plain = Geometry {
@@ -247,6 +287,13 @@ impl Geometry {
             angle_deg: 0.0,
             crop: NormRect::FULL,
             pixel_exact: self.pixel_exact,
+            warp: self.warp.map(|w| {
+                if self.swaps_sides() {
+                    w.transposed()
+                } else {
+                    w
+                }
+            }),
         };
         if !keep_crop {
             return plain;
@@ -384,7 +431,44 @@ impl Geometry {
         if !(0.0..=1.0).contains(&u) || !(0.0..=1.0).contains(&v) {
             return None;
         }
+        // The lens's bend: the canvas position reads the photo at `F^-1(c / z)`, which the click
+        // is a point of.
+        let (u, v) = match &self.warp {
+            Some(w) => {
+                let (px, py) = w.canvas_to_photo((cw as f64, ch as f64), cx, cy);
+                (
+                    (px / cw as f64).clamp(0.0, 1.0),
+                    (py / ch as f64).clamp(0.0, 1.0),
+                )
+            }
+            None => (u, v),
+        };
         Some(canvas_to_oriented(self.quarter_turns, [u, v]))
+    }
+
+    /// The inverse of [`Geometry::final_to_oriented`]: a point of the photo as the camera oriented it (fractions of
+    /// the buffer of `buf` pixels, the photo frame of the masks, `docs/23` section 3.6) to the pixel of the final
+    /// image (at the buffer's resolution) where it is drawn: through the user's turn, the lens's bend and its
+    /// zoom, then back through the straightening and the crop. The point may lie outside the final image (the
+    /// photo is larger than the crop, or the turn and the angle move it out of it); `None` only for a point that
+    /// is not a number or a geometry that cannot be inverted.
+    #[must_use]
+    pub fn oriented_to_final(&self, buf: (usize, usize), point: [f64; 2]) -> Option<(f64, f64)> {
+        if !(point[0].is_finite() && point[1].is_finite()) {
+            return None;
+        }
+        let (cw, ch) = self.canvas_size(buf.0, buf.1);
+        let [u, v] = oriented_to_canvas(self.quarter_turns, point);
+        let (px, py) = (u * cw as f64, v * ch as f64);
+        // The lens's bend: a canvas position reads the photo at `F^-1(c / z)`, so the photo point is drawn at
+        // the canvas position `z F(p)`.
+        let (cx, cy) = match &self.warp {
+            Some(w) => w.photo_to_canvas((cw as f64, ch as f64), px, py),
+            None => (px, py),
+        };
+        let (crop, straighten) = self.chains(buf.0, buf.1);
+        let (x, y) = crop.then(&straighten).inverse()?.apply(cx, cy);
+        (x.is_finite() && y.is_finite()).then_some((x, y))
     }
 }
 
@@ -397,6 +481,110 @@ pub fn quarter_turns_of(o: Orientation) -> u8 {
         Orientation::Deg180 => 2,
         Orientation::Deg270 => 3,
     }
+}
+
+/// How far, in canvas pixels at full resolution, a straightened frame keeps from the edge of the
+/// photo in [`fit_inside`]: the reduced views have a canvas of a slightly different shape (their
+/// sides are rounded to whole pixels), and the margin keeps their corners filled too.
+pub const FIT_MARGIN_PX: f64 = 2.0;
+
+/// `rect` (a frame normalised over a canvas of `canvas_w x canvas_h` pixels) made to lie inside the
+/// photo straightened by `angle_deg`, so that the picture has no empty corner (the owner's rule of
+/// 2026-10-22, "No border in photos"; `docs/11` section Crop, `docs/20-auto-crop.md` section 7).
+///
+/// The frame shrinks about its own centre, keeping its shape in pixels, by as little as makes its
+/// four corners sample the photo at least `margin_px` from its edge (the sampling map of
+/// [`Geometry`]: output point `q` samples `c + R(-angle)(q - c)` about the canvas centre `c`); it
+/// also stays inside the canvas. A frame whose centre samples outside that becomes the largest
+/// frame of its shape centred on the canvas. At an angle of 0 the photo fills the canvas: the frame
+/// is only clamped to `[0, 1]²`, so the whole photo stays exactly the whole photo.
+#[must_use]
+pub fn fit_inside(
+    rect: NormRect,
+    angle_deg: f64,
+    canvas_w: f64,
+    canvas_h: f64,
+    margin_px: f64,
+) -> NormRect {
+    let clamped = |r: NormRect| {
+        let x = r.x.clamp(0.0, 1.0);
+        let y = r.y.clamp(0.0, 1.0);
+        NormRect {
+            x,
+            y,
+            width: r.width.clamp(0.0, 1.0 - x),
+            height: r.height.clamp(0.0, 1.0 - y),
+        }
+    };
+    let rect = clamped(rect);
+    if angle_deg.abs() < ANGLE_EPS_DEG
+        || !(canvas_w > 0.0 && canvas_h > 0.0)
+        || rect.width <= 0.0
+        || rect.height <= 0.0
+    {
+        return rect;
+    }
+    let (w, h) = (canvas_w, canvas_h);
+    let m = margin_px.clamp(0.0, 0.25 * w.min(h));
+    // The linear part of the straighten map (`Affine::rotation_about(-angle, ..)`).
+    let (sin, cos) = angle_deg.to_radians().sin_cos();
+    let lin = |dx: f64, dy: f64| (cos * dx + sin * dy, -sin * dx + cos * dy);
+    // The largest scale (at most 1) of the frame centred at (cx, cy) with half sides (a, b), all in
+    // canvas pixels; `None` when its centre samples outside the photo. Every bound is linear in the
+    // scale, so each gives its limit directly.
+    let scale = |cx: f64, cy: f64, a: f64, b: f64| -> Option<f64> {
+        let (px, py) = lin(cx - 0.5 * w, cy - 0.5 * h);
+        let (px, py) = (px + 0.5 * w, py + 0.5 * h);
+        if px < m || px > w - m || py < m || py > h - m {
+            return None;
+        }
+        let mut s: f64 = 1.0;
+        let mut limit = |start: f64, step: f64, lo: f64, hi: f64| {
+            if step > 0.0 {
+                s = s.min((hi - start) / step);
+            } else if step < 0.0 {
+                s = s.min((lo - start) / step);
+            }
+        };
+        for (sx, sy) in [(-1.0, -1.0), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)] {
+            let (dx, dy) = lin(sx * a, sy * b);
+            limit(px, dx, m, w - m);
+            limit(py, dy, m, h - m);
+            // The canvas itself, unturned.
+            limit(cx, sx * a, 0.0, w);
+            limit(cy, sy * b, 0.0, h);
+        }
+        Some(s.max(0.0))
+    };
+    let frame = |cx: f64, cy: f64, a: f64, b: f64, s: f64| NormRect {
+        x: (cx - s * a) / w,
+        y: (cy - s * b) / h,
+        width: 2.0 * s * a / w,
+        height: 2.0 * s * b / h,
+    };
+    let (a, b) = (0.5 * rect.width * w, 0.5 * rect.height * h);
+    let (cx, cy) = (
+        (rect.x + 0.5 * rect.width) * w,
+        (rect.y + 0.5 * rect.height) * h,
+    );
+    if let Some(s) = scale(cx, cy, a, b) {
+        return if s >= 1.0 {
+            rect
+        } else {
+            clamped(frame(cx, cy, a, b, s))
+        };
+    }
+    // The centre is outside: the frame of the same shape that fills the canvas, centred, fitted.
+    let ratio = a / b;
+    let (a, b) = if ratio >= w / h {
+        (0.5 * w, 0.5 * w / ratio)
+    } else {
+        (0.5 * h * ratio, 0.5 * h)
+    };
+    let (cx, cy) = (0.5 * w, 0.5 * h);
+    // The canvas centre samples itself, which `m <= min(w, h) / 4` keeps inside.
+    let s = scale(cx, cy, a, b).unwrap_or(0.0);
+    clamped(frame(cx, cy, a, b, s))
 }
 
 /// Maps output pixels to positions in a pixel buffer (see the module documentation).
@@ -429,6 +617,11 @@ impl Grid {
         if px < -tol || py < -tol || px > self.canvas.0 + tol || py > self.canvas.1 + tol {
             return None;
         }
+        // The lens's bend: the photo position this canvas position reads.
+        let (px, py) = match &self.geometry.warp {
+            Some(w) => w.canvas_to_photo(self.canvas, px, py),
+            None => (px, py),
+        };
         let (u, v) = (px / self.canvas.0, py / self.canvas.1);
         let o = canvas_to_oriented(self.geometry.quarter_turns, [u, v]);
         let s = oriented_to_sensor(self.geometry.exif_orientation, o);
@@ -451,11 +644,16 @@ impl Grid {
             self.geometry.quarter_turns,
             self.geometry.is_unrotated(),
         )
+        .with_warp(self.geometry.warp)
     }
 
     /// The smallest rectangle of the buffer (integer pixels, `x0 <= x < x1`) that holds every
     /// position the output rectangle `[ox, ox + ow) x [oy, oy + oh)` samples, widened by `margin`
     /// pixels and clipped to the buffer. `None` when the whole rectangle lies outside the photo.
+    ///
+    /// Exact from the four corners for an affine chain. With the lens's bend the rectangle's image is
+    /// curved, so the edge of what the rectangle samples is followed through the bend instead, 64
+    /// samples a side, and the box is widened by 2 px more ([`SamplerGrid::source_bounds`]).
     #[must_use]
     pub fn source_bounds(
         &self,
@@ -465,6 +663,9 @@ impl Grid {
         oh: usize,
         margin: usize,
     ) -> Option<(usize, usize, usize, usize)> {
+        if self.geometry.warp.is_some() {
+            return self.sampler_grid().source_bounds(ox, oy, ow, oh, margin);
+        }
         let corners = [
             (ox as f64, oy as f64),
             ((ox + ow) as f64, oy as f64),
@@ -513,7 +714,7 @@ impl Grid {
     /// the output's pixel centres on the buffer's (it may still turn or mirror the image).
     #[must_use]
     pub fn is_pixel_copy(&self) -> bool {
-        if !self.geometry.is_unrotated() {
+        if !self.geometry.is_unrotated() || self.geometry.warp.is_some() {
             return false;
         }
         let (sx, sy) = self.step_lengths();
@@ -536,6 +737,11 @@ fn snap(v: f64) -> f64 {
 mod tests {
     use super::*;
     use crate::settings::DevelopSettings;
+
+    /// The attachment's shipped bend (data version 5, per unit of `q - 1`), as the tests below use it at
+    /// Anamorphic 100.
+    const SHIPPED_BEND_X: [f64; 5] = [-0.0402, -0.0494, 0.0069, 0.0128, 0.0329];
+    const SHIPPED_BEND_Y: [f64; 5] = [-0.1157, -0.0196, 0.0294, 0.0297, -0.0529];
 
     /// Independent forward maps of the 8 EXIF orientations on a w x h buffer, as the pixel
     /// coordinates in the oriented image of buffer pixel (x, y). The oriented image has size
@@ -563,14 +769,15 @@ mod tests {
         let (w, h) = (7usize, 4usize);
         for exif in 1..=8u16 {
             for turns in 0..4u8 {
-                let settings = DevelopSettings {
-                    orientation: match turns {
+                let settings = {
+                    let mut s = DevelopSettings::default();
+                    s.input_mut().orientation = match turns {
                         0 => Orientation::Deg0,
                         1 => Orientation::Deg90,
                         2 => Orientation::Deg180,
                         _ => Orientation::Deg270,
-                    },
-                    ..DevelopSettings::default()
+                    };
+                    s
                 };
                 let g = Geometry::new(exif, &settings);
                 let (cw, ch) = g.canvas_size(w, h);
@@ -764,55 +971,70 @@ mod tests {
                 height: 0.3,
             },
         ];
-        for exif in 1..=8u16 {
-            for turns in 0..4u8 {
-                for angle in [0.0, 7.5, -13.0] {
-                    for crop in crops {
-                        let baked = Geometry {
-                            exif_orientation: exif,
-                            quarter_turns: turns,
-                            angle_deg: angle,
-                            crop,
-                            pixel_exact: true,
-                        };
-                        let up = baked.upright(w, h, true);
-                        assert_eq!((up.exif_orientation, up.quarter_turns), (1, 0));
-                        let (bw, bh) = baked.output_size(w, h);
-                        let (uw, uh) = up.output_size(w, h);
-                        let swapped = (5..=8).contains(&exif) != (turns % 2 == 1);
-                        assert_eq!(
-                            (uw, uh),
-                            if swapped { (bh, bw) } else { (bw, bh) },
-                            "exif {exif} turns {turns} crop {crop:?}: the window keeps its size"
-                        );
-                        let gb = baked.grid((w, h), (bw, bh));
-                        let gu = up.grid((w, h), (uw, uh));
-                        for y in 0..uh {
-                            for x in 0..uw {
-                                // The upright pixel in the oriented image, then the user's turns.
-                                let (mut px, mut py) = forward(exif, x, y, uw, uh);
-                                let (mut ow, mut oh) = if (5..=8).contains(&exif) {
-                                    (uh, uw)
-                                } else {
-                                    (uw, uh)
-                                };
-                                for _ in 0..turns {
-                                    (px, py) = turn(px, py, oh);
-                                    std::mem::swap(&mut ow, &mut oh);
-                                }
-                                assert_eq!((ow, oh), (bw, bh));
-                                let a = gu.source(x, y);
-                                let b = gb.source(px, py);
-                                match (a, b) {
-                                    (None, None) => {}
-                                    (Some(a), Some(b)) => assert!(
-                                        (a.0 - b.0).abs() < 1e-6 && (a.1 - b.1).abs() < 1e-6,
-                                        "exif {exif} turns {turns} angle {angle} crop {crop:?} \
+        // Without a bend, and through the lens's (L4): the bend travels with the geometry, its axis
+        // swapped when the buffer's sides are, and the DNG's upright pixels are the baked ones.
+        for warp in [
+            None,
+            Some(SamplerWarp::new(
+                SHIPPED_BEND_X,
+                SHIPPED_BEND_Y,
+                -0.02,
+                0.01,
+                1.06,
+                3,
+            )),
+        ] {
+            for exif in 1..=8u16 {
+                for turns in 0..4u8 {
+                    for angle in [0.0, 7.5, -13.0] {
+                        for crop in crops {
+                            let baked = Geometry {
+                                exif_orientation: exif,
+                                quarter_turns: turns,
+                                angle_deg: angle,
+                                crop,
+                                pixel_exact: true,
+                                warp,
+                            };
+                            let up = baked.upright(w, h, true);
+                            assert_eq!((up.exif_orientation, up.quarter_turns), (1, 0));
+                            let (bw, bh) = baked.output_size(w, h);
+                            let (uw, uh) = up.output_size(w, h);
+                            let swapped = (5..=8).contains(&exif) != (turns % 2 == 1);
+                            assert_eq!(
+                                (uw, uh),
+                                if swapped { (bh, bw) } else { (bw, bh) },
+                                "exif {exif} turns {turns} crop {crop:?}: the window keeps its size"
+                            );
+                            let gb = baked.grid((w, h), (bw, bh));
+                            let gu = up.grid((w, h), (uw, uh));
+                            for y in 0..uh {
+                                for x in 0..uw {
+                                    // The upright pixel in the oriented image, then the user's turns.
+                                    let (mut px, mut py) = forward(exif, x, y, uw, uh);
+                                    let (mut ow, mut oh) = if (5..=8).contains(&exif) {
+                                        (uh, uw)
+                                    } else {
+                                        (uw, uh)
+                                    };
+                                    for _ in 0..turns {
+                                        (px, py) = turn(px, py, oh);
+                                        std::mem::swap(&mut ow, &mut oh);
+                                    }
+                                    assert_eq!((ow, oh), (bw, bh));
+                                    let a = gu.source(x, y);
+                                    let b = gb.source(px, py);
+                                    match (a, b) {
+                                        (None, None) => {}
+                                        (Some(a), Some(b)) => assert!(
+                                            (a.0 - b.0).abs() < 1e-6 && (a.1 - b.1).abs() < 1e-6,
+                                            "exif {exif} turns {turns} angle {angle} crop {crop:?} \
                                          pixel ({x},{y}): {a:?} vs {b:?}"
-                                    ),
-                                    other => panic!(
-                                        "exif {exif} turns {turns} angle {angle} pixel ({x},{y}): {other:?}"
-                                    ),
+                                        ),
+                                        other => panic!(
+                                            "exif {exif} turns {turns} angle {angle} pixel ({x},{y}): {other:?}"
+                                        ),
+                                    }
                                 }
                             }
                         }
@@ -859,9 +1081,10 @@ mod tests {
 
     #[test]
     fn the_upright_geometry_without_the_crop_is_the_whole_buffer_unturned() {
-        let settings = DevelopSettings {
-            orientation: Orientation::Deg90,
-            crop: Some(Crop {
+        let settings = {
+            let mut s = DevelopSettings::default();
+            s.input_mut().orientation = Orientation::Deg90;
+            s.input_mut().crop = Some(Crop {
                 rect: NormRect {
                     x: 0.1,
                     y: 0.1,
@@ -870,8 +1093,9 @@ mod tests {
                 },
                 angle_deg: 11.0,
                 aspect: crate::settings::CropAspect::Free,
-            }),
-            ..DevelopSettings::default()
+                auto: false,
+            });
+            s
         };
         let g = Geometry::new(6, &settings).at_full_resolution();
         let up = g.upright(60, 40, false);
@@ -897,50 +1121,118 @@ mod tests {
     #[test]
     fn the_sampler_grid_is_this_grid_as_plain_data() {
         let (w, h) = (64usize, 48usize);
+        for warp in [
+            None,
+            Some(SamplerWarp::new(
+                SHIPPED_BEND_X,
+                SHIPPED_BEND_Y,
+                -0.02,
+                0.01,
+                1.06,
+                3,
+            )),
+        ] {
+            for exif in 1..=8u16 {
+                for turns in 0..4u8 {
+                    for angle in [0.0, 3.5, -12.0] {
+                        let settings = {
+                            let mut s = DevelopSettings::default();
+                            s.input_mut().orientation = match turns {
+                                0 => Orientation::Deg0,
+                                1 => Orientation::Deg90,
+                                2 => Orientation::Deg180,
+                                _ => Orientation::Deg270,
+                            };
+                            s.input_mut().crop = Some(Crop {
+                                rect: NormRect {
+                                    x: 0.05,
+                                    y: 0.1,
+                                    width: 0.8,
+                                    height: 0.7,
+                                },
+                                angle_deg: angle,
+                                aspect: crate::settings::CropAspect::Free,
+                                auto: false,
+                            });
+                            s
+                        };
+                        let g = Geometry::new(exif, &settings).with_warp(warp);
+                        for out in [(40usize, 30usize), (90, 70), (23, 17)] {
+                            let grid = g.grid((w, h), out);
+                            let sg = grid.sampler_grid();
+                            assert_eq!(sg.is_pixel_copy(), grid.is_pixel_copy());
+                            assert_eq!(sg.step_lengths(), grid.step_lengths());
+                            assert_eq!(sg.warp, warp);
+                            assert_eq!(
+                                sg.source_bounds(2, 3, 20, 15, 3),
+                                grid.source_bounds(2, 3, 20, 15, 3)
+                            );
+                            for (x, y) in [
+                                (0, 0),
+                                (out.0 - 1, 3),
+                                (7, out.1 - 1),
+                                (out.0 / 2, out.1 / 2),
+                            ] {
+                                assert_eq!(
+                                    sg.source(x, y),
+                                    grid.source(x, y),
+                                    "exif {exif} turns {turns} angle {angle} out {out:?} pixel ({x}, {y})"
+                                );
+                            }
+                            assert_eq!(
+                                sg.source_at(1.25, 2.75),
+                                grid.source_at(1.25, 2.75),
+                                "exif {exif} turns {turns} angle {angle}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn final_to_oriented_inverts_the_grid_through_a_bend() {
+        // A click lands where the sampler reads: the oriented fractions `final_to_oriented` gives,
+        // taken to the sensor, are the buffer position the grid samples, bend included, for every
+        // orientation, turn and straighten angle.
+        let (w, h) = (64usize, 48usize);
+        let warp = Some(SamplerWarp::new(
+            SHIPPED_BEND_X,
+            SHIPPED_BEND_Y,
+            -0.02,
+            0.01,
+            1.06,
+            3,
+        ));
         for exif in 1..=8u16 {
             for turns in 0..4u8 {
                 for angle in [0.0, 3.5, -12.0] {
-                    let settings = DevelopSettings {
-                        orientation: match turns {
-                            0 => Orientation::Deg0,
-                            1 => Orientation::Deg90,
-                            2 => Orientation::Deg180,
-                            _ => Orientation::Deg270,
-                        },
-                        crop: Some(Crop {
-                            rect: NormRect {
-                                x: 0.05,
-                                y: 0.1,
-                                width: 0.8,
-                                height: 0.7,
-                            },
-                            angle_deg: angle,
-                            aspect: crate::settings::CropAspect::Free,
-                        }),
-                        ..DevelopSettings::default()
+                    let g = Geometry {
+                        exif_orientation: exif,
+                        quarter_turns: turns,
+                        angle_deg: angle,
+                        crop: NormRect::FULL,
+                        pixel_exact: false,
+                        warp,
                     };
-                    let g = Geometry::new(exif, &settings);
-                    for out in [(40usize, 30usize), (90, 70), (23, 17)] {
-                        let grid = g.grid((w, h), out);
-                        let sg = grid.sampler_grid();
-                        assert_eq!(sg.is_pixel_copy(), grid.is_pixel_copy());
-                        assert_eq!(sg.step_lengths(), grid.step_lengths());
-                        for (x, y) in [
-                            (0, 0),
-                            (out.0 - 1, 3),
-                            (7, out.1 - 1),
-                            (out.0 / 2, out.1 / 2),
-                        ] {
-                            assert_eq!(
-                                sg.source(x, y),
-                                grid.source(x, y),
-                                "exif {exif} turns {turns} angle {angle} out {out:?} pixel ({x}, {y})"
-                            );
-                        }
-                        assert_eq!(
-                            sg.source_at(1.25, 2.75),
-                            grid.source_at(1.25, 2.75),
-                            "exif {exif} turns {turns} angle {angle}"
+                    let (cw, ch) = g.canvas_size(w, h);
+                    let grid = g.grid((w, h), (cw, ch));
+                    for (fx, fy) in [
+                        (10.25, 12.5),
+                        (cw as f64 * 0.5, ch as f64 * 0.5),
+                        (3.5, 4.5),
+                    ] {
+                        let Some((bx, by)) = grid.source_at(fx, fy) else {
+                            assert!(g.final_to_oriented((w, h), fx, fy).is_none());
+                            continue;
+                        };
+                        let o = g.final_to_oriented((w, h), fx, fy).expect("inside");
+                        let s = oriented_to_sensor(exif, o);
+                        assert!(
+                            (s[0] * w as f64 - bx).abs() < 1e-9
+                                && (s[1] * h as f64 - by).abs() < 1e-9,
+                            "exif {exif} turns {turns} angle {angle}: {s:?} vs ({bx}, {by})"
                         );
                     }
                 }
@@ -962,5 +1254,298 @@ mod tests {
                 assert!((s[0] * w as f64 - bx).abs() < 1e-9 && (s[1] * h as f64 - by).abs() < 1e-9);
             }
         }
+    }
+
+    #[test]
+    fn oriented_to_final_is_the_inverse_of_final_to_oriented() {
+        // The page draws a handle where the core maps the photo's point and puts it back where it is dragged
+        // to: every orientation of the file, every quarter turn, a straightening, a crop and the lens's bend.
+        let (w, h) = (64usize, 48usize);
+        let bend = Some(SamplerWarp::new(
+            SHIPPED_BEND_X,
+            SHIPPED_BEND_Y,
+            -0.02,
+            0.01,
+            1.06,
+            3,
+        ));
+        let crops = [
+            NormRect::FULL,
+            NormRect {
+                x: 0.1,
+                y: 0.15,
+                width: 0.6,
+                height: 0.7,
+            },
+        ];
+        let mut worst: f64 = 0.0;
+        for warp in [None, bend] {
+            for crop in crops {
+                for exif in 1..=8u16 {
+                    for turns in 0..4u8 {
+                        for angle in [0.0, 3.5, -12.0, 30.0] {
+                            let g = Geometry {
+                                exif_orientation: exif,
+                                quarter_turns: turns,
+                                angle_deg: angle,
+                                crop,
+                                pixel_exact: false,
+                                warp,
+                            };
+                            let (ow, oh) = g.output_size(w, h);
+                            for (u, v) in [(0.5, 0.5), (0.13, 0.81), (0.9, 0.2), (0.02, 0.03)] {
+                                let (fx, fy) = (u * ow as f64, v * oh as f64);
+                                let Some(o) = g.final_to_oriented((w, h), fx, fy) else {
+                                    continue;
+                                };
+                                let (bx, by) = g.oriented_to_final((w, h), o).expect("invertible");
+                                // A bend's inverse is Newton's: the clamp of `final_to_oriented` to the
+                                // photo (a point just outside it) does not round-trip, so only the points
+                                // it did not clamp are compared.
+                                let unclamped =
+                                    warp.is_none() || o.iter().all(|c| (0.001..0.999).contains(c));
+                                if unclamped {
+                                    let d = (bx - fx).hypot(by - fy);
+                                    worst = worst.max(d);
+                                    assert!(
+                                        d < 1e-6,
+                                        "exif {exif} turns {turns} angle {angle} crop {crop:?} warp {}: ({fx}, {fy}) came back at ({bx}, {by})",
+                                        warp.is_some()
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        eprintln!("oriented_to_final: the largest round trip is {worst:.2e} final-image pixels");
+    }
+
+    #[test]
+    fn oriented_to_final_puts_the_photo_corners_where_the_turn_and_the_crop_put_them() {
+        // An upright photo, no bend: the photo's own corners are the canvas's, and the crop's origin is
+        // subtracted.
+        let g = Geometry {
+            exif_orientation: 1,
+            quarter_turns: 0,
+            angle_deg: 0.0,
+            crop: NormRect {
+                x: 0.25,
+                y: 0.5,
+                width: 0.5,
+                height: 0.5,
+            },
+            pixel_exact: false,
+            warp: None,
+        };
+        let (x, y) = g
+            .oriented_to_final((100, 80), [0.25, 0.5])
+            .expect("a point");
+        assert!(x.abs() < 1e-9 && y.abs() < 1e-9, "({x}, {y})");
+        let (x, y) = g
+            .oriented_to_final((100, 80), [0.75, 1.0])
+            .expect("a point");
+        assert!(
+            (x - 50.0).abs() < 1e-9 && (y - 40.0).abs() < 1e-9,
+            "({x}, {y})"
+        );
+        // Outside the crop is outside the final image, not refused.
+        let (x, y) = g.oriented_to_final((100, 80), [0.0, 0.0]).expect("a point");
+        assert!(
+            (x + 25.0).abs() < 1e-9 && (y + 40.0).abs() < 1e-9,
+            "({x}, {y})"
+        );
+        // A quarter turn clockwise puts the photo's top-left corner at the canvas's top-right.
+        let turned = Geometry {
+            quarter_turns: 1,
+            crop: NormRect::FULL,
+            ..g
+        };
+        let (x, y) = turned
+            .oriented_to_final((100, 80), [0.0, 0.0])
+            .expect("a point");
+        assert!((x - 80.0).abs() < 1e-9 && y.abs() < 1e-9, "({x}, {y})");
+        // Not a number is no point.
+        assert!(g.oriented_to_final((100, 80), [f64::NAN, 0.5]).is_none());
+        assert!(
+            g.oriented_to_final((100, 80), [0.5, f64::INFINITY])
+                .is_none()
+        );
+    }
+
+    /// A small fixed-seed generator for the fit's property tests.
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn next(&mut self) -> f64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (self.0 >> 11) as f64 / (1u64 << 53) as f64
+        }
+    }
+
+    /// Whether every pixel on the edge of the output of `geometry` on a `buf` buffer samples the
+    /// photo (no empty corner).
+    fn edge_is_filled(geometry: Geometry, buf: (usize, usize)) -> bool {
+        let out = geometry.output_size(buf.0, buf.1);
+        let grid = geometry.grid(buf, out);
+        let (ow, oh) = out;
+        (0..ow).all(|x| grid.source(x, 0).is_some() && grid.source(x, oh - 1).is_some())
+            && (0..oh).all(|y| grid.source(0, y).is_some() && grid.source(ow - 1, y).is_some())
+    }
+
+    #[test]
+    fn a_fitted_frame_has_no_empty_corner_at_any_resolution() {
+        let mut rng = Lcg(7);
+        for &(w, h) in &[
+            (6000usize, 4000usize),
+            (4024, 6048),
+            (3000, 3000),
+            (7008, 2304),
+        ] {
+            for _ in 0..40 {
+                let angle = (rng.next() * 2.0 - 1.0) * 45.0;
+                let width = 0.2 + 0.8 * rng.next();
+                let height = 0.2 + 0.8 * rng.next();
+                let rect = NormRect {
+                    x: rng.next() * (1.0 - width),
+                    y: rng.next() * (1.0 - height),
+                    width,
+                    height,
+                };
+                let fitted = fit_inside(rect, angle, w as f64, h as f64, FIT_MARGIN_PX);
+                let geometry = Geometry {
+                    exif_orientation: 1,
+                    quarter_turns: 0,
+                    angle_deg: angle,
+                    crop: fitted,
+                    pixel_exact: false,
+                    warp: None,
+                };
+                assert!(
+                    edge_is_filled(geometry.at_full_resolution(), (w, h)),
+                    "{w}x{h} {angle} {rect:?} -> {fitted:?}"
+                );
+                // The reduced views: their sides are rounded to whole pixels.
+                for k in [3usize, 8, 16] {
+                    let buf = ((w + k / 2) / k, (h + k / 2) / k);
+                    assert!(
+                        edge_is_filled(geometry, buf),
+                        "{w}x{h} / {k} {angle} {rect:?} -> {fitted:?}"
+                    );
+                }
+                // Its shape in pixels is the frame's.
+                let shape = |r: NormRect| r.width * w as f64 / (r.height * h as f64);
+                assert!((shape(fitted) / shape(rect) - 1.0).abs() < 1e-9);
+            }
+        }
+    }
+
+    #[test]
+    fn the_fit_shrinks_no_more_than_it_must() {
+        let mut rng = Lcg(11);
+        let (w, h) = (6000.0, 4000.0);
+        for _ in 0..200 {
+            let angle = (rng.next() * 2.0 - 1.0) * 30.0;
+            let size = 0.3 + 0.7 * rng.next();
+            let rect = NormRect {
+                x: 0.5 - size / 2.0,
+                y: 0.5 - size / 2.0,
+                width: size,
+                height: size,
+            };
+            let fitted = fit_inside(rect, angle, w, h, FIT_MARGIN_PX);
+            if fitted == rect {
+                continue;
+            }
+            // 0.1 % larger about the same centre no longer fits: fitting it shrinks it again.
+            let grow = 1.001;
+            let bigger = NormRect {
+                x: 0.5 - fitted.width * grow / 2.0,
+                y: 0.5 - fitted.height * grow / 2.0,
+                width: fitted.width * grow,
+                height: fitted.height * grow,
+            };
+            assert!(fit_inside(bigger, angle, w, h, FIT_MARGIN_PX).width < bigger.width);
+        }
+    }
+
+    #[test]
+    fn the_whole_photo_fits_as_the_largest_frame_of_its_shape() {
+        let (w, h) = (6000.0, 4000.0);
+        for angle in [0.5f64, -1.4, 3.0, 10.0, -25.0] {
+            let fitted = fit_inside(NormRect::FULL, angle, w, h, 0.0);
+            // docs/20 section 7: h = min(W / (r |cos| + |sin|), H / (r |sin| + |cos|)), r = W / H.
+            let (s, c) = angle.to_radians().sin_cos();
+            let r = w / h;
+            let want = (w / (r * c.abs() + s.abs())).min(h / (r * s.abs() + c.abs()));
+            assert!(
+                (fitted.height * h - want).abs() < 1e-6,
+                "{angle}: {fitted:?}"
+            );
+            assert!((fitted.x + fitted.width / 2.0 - 0.5).abs() < 1e-12);
+            assert!((fitted.y + fitted.height / 2.0 - 0.5).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn without_an_angle_the_frame_is_only_clamped() {
+        let inside = NormRect {
+            x: 0.1,
+            y: 0.2,
+            width: 0.5,
+            height: 0.6,
+        };
+        assert_eq!(
+            fit_inside(inside, 0.0, 6000.0, 4000.0, FIT_MARGIN_PX),
+            inside
+        );
+        assert_eq!(
+            fit_inside(NormRect::FULL, 0.0, 6000.0, 4000.0, FIT_MARGIN_PX),
+            NormRect::FULL
+        );
+        let over = NormRect {
+            x: -0.1,
+            y: 0.5,
+            width: 0.5,
+            height: 0.7,
+        };
+        let c = fit_inside(over, 0.0, 6000.0, 4000.0, FIT_MARGIN_PX);
+        assert_eq!((c.x, c.y, c.width, c.height), (0.0, 0.5, 0.5, 0.5));
+        // A frame already inside the straightened photo is returned as it is.
+        let small = NormRect {
+            x: 0.4,
+            y: 0.4,
+            width: 0.2,
+            height: 0.2,
+        };
+        assert_eq!(fit_inside(small, 5.0, 6000.0, 4000.0, FIT_MARGIN_PX), small);
+    }
+
+    #[test]
+    fn a_frame_whose_centre_is_outside_becomes_the_centred_largest() {
+        // At 40 degrees the canvas's corner region is empty; a small frame there is replaced by
+        // the largest frame of its shape about the centre.
+        let corner = NormRect {
+            x: 0.0,
+            y: 0.0,
+            width: 0.1,
+            height: 0.1,
+        };
+        let fitted = fit_inside(corner, 40.0, 6000.0, 4000.0, FIT_MARGIN_PX);
+        assert!((fitted.x + fitted.width / 2.0 - 0.5).abs() < 1e-12);
+        assert!((fitted.y + fitted.height / 2.0 - 0.5).abs() < 1e-12);
+        let geometry = Geometry {
+            exif_orientation: 1,
+            quarter_turns: 0,
+            angle_deg: 40.0,
+            crop: fitted,
+            pixel_exact: false,
+            warp: None,
+        };
+        assert!(edge_is_filled(geometry.at_full_resolution(), (6000, 4000)));
     }
 }

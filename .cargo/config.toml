@@ -1,0 +1,5 @@
+
+# The iPhone web app (`web/`): the threaded WebAssembly build of `ym`. A 33 MP raw needs more than the
+# linker's default 1 GiB, so the shared memory may grow to the 4 GiB a wasm32 address space allows.
+[target.wasm32-wasip1-threads]
+rustflags = ["-C", "link-arg=--max-memory=4294967296"]

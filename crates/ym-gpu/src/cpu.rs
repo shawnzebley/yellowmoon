@@ -48,17 +48,25 @@
 
 use std::ops::Range;
 
+pub mod bm_dct;
 pub mod chain;
+pub mod coarse_chroma;
 pub mod demosaic;
 pub mod denoise;
+pub mod denoise_space;
 pub mod detail;
+pub mod false_color;
 pub mod filters;
+pub mod flat_regions;
+pub mod frame_denoise;
 pub mod gains;
 pub mod highlights;
 pub mod lens;
 pub mod magnify;
 pub mod metrics;
+pub mod nl_bayes;
 pub mod noise;
+pub mod noise_level;
 pub mod normalize;
 pub mod output_sharpen;
 pub mod resample;
@@ -67,7 +75,10 @@ pub mod sharpen;
 pub mod spline;
 pub mod synth;
 pub mod tiling;
+pub mod tint;
+pub mod tuning;
 pub mod vignette;
+pub mod ycbcr;
 
 pub use noise::NoiseDn;
 pub use tiling::{Halo, Rect};

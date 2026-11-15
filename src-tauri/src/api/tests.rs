@@ -1,6 +1,57 @@
 //! The command handlers against `ym-core`, with synthetic ARW files and no webview
 //! (`docs/01` §IPC). The harness is in `crate::testing`.
 
+/// A node patch that holds the given fields (a JSON object of field names and values), each on the node it
+/// belongs to: the Input, the Output or Main's grade.
+fn field_patch(fields: serde_json::Value) -> serde_json::Value {
+    let (mut input, mut output, mut grade) = (json!({}), json!({}), json!({}));
+    for (k, v) in fields.as_object().expect("a JSON object of fields") {
+        match k.as_str() {
+            "look" | "look_intensity" | "output_sharpening" => output[k] = v.clone(),
+            "contrast" | "brightness" | "highlights" | "shadows" | "white" | "black"
+            | "color_balance" | "saturation" | "color_warp" | "curve" => grade[k] = v.clone(),
+            _ => input[k] = v.clone(),
+        }
+    }
+    let mut nodes = serde_json::Map::new();
+    for (id, node) in [("input", input), ("output", output)] {
+        if node.as_object().is_some_and(|o| !o.is_empty()) {
+            nodes.insert(id.to_owned(), node);
+        }
+    }
+    if grade.as_object().is_some_and(|o| !o.is_empty()) {
+        nodes.insert("1".to_owned(), json!({ "grade": grade }));
+    }
+    json!({ "nodes": nodes })
+}
+
+/// The Input's part of a patch on the bridge.
+fn input_of(patch: &SettingsPatch) -> &NodePatch {
+    patch.nodes.get("input").expect("an Input patch")
+}
+
+/// Main's grade part of a patch on the bridge.
+fn grade_of(patch: &SettingsPatch) -> &GradePatch {
+    patch
+        .nodes
+        .get("1")
+        .and_then(|n| n.grade.as_ref())
+        .expect("Main's grade patch")
+}
+
+/// The Input's part of a patch of the core.
+fn core_input(patch: &ym_core::settings::SettingsPatch) -> &ym_core::settings::NodePatch {
+    patch.input_patch().expect("an Input patch")
+}
+
+/// Main's grade part of a patch of the core.
+fn core_grade(patch: &ym_core::settings::SettingsPatch) -> &ym_core::settings::GradePatch {
+    patch
+        .main_patch()
+        .and_then(|n| n.grade.as_ref())
+        .expect("Main's grade patch")
+}
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -202,6 +253,69 @@ fn thumbnails_cross_the_bridge_as_addresses_and_can_be_asked_for_again() {
     assert_eq!(h.frames.respond(path_of_url(&after[0].url)).0, 404);
 }
 
+/// `docs/26` H-11: a photo whose thumbnail the shell let go of to keep its byte budget gets a new one
+/// when the page says it shows the photo.
+#[test]
+fn a_thumbnail_the_budget_let_go_of_comes_back_when_the_photo_is_in_view() {
+    // One byte of budget: only the photo just given a thumbnail and the photo on screen survive.
+    let h = Harness::with_thumbnail_budget(1);
+    h.open(5);
+    let state = h.develop();
+    let ids: Vec<_> = state.photos.iter().map(|p| p.id).collect();
+    wait_until("five thumbnails", || {
+        h.events
+            .events()
+            .iter()
+            .filter(|e| matches!(e, AppEvent::ThumbnailReady(_)))
+            .count()
+            >= 5
+    });
+    assert!(h.api.thumbnails().wait_idle(WAIT));
+    let ready_count = |id: PhotoId| {
+        h.events
+            .events()
+            .iter()
+            .filter(|e| matches!(e, AppEvent::ThumbnailReady(t) if t.id == id))
+            .count()
+    };
+    // The store counts what it holds, and what it holds is what it counts.
+    assert_eq!(
+        h.frames.thumbnail_bytes_counted(),
+        h.frames.thumbnail_bytes()
+    );
+    let held = h.api.thumbnails_now();
+    assert!(
+        held.len() < ids.len(),
+        "the budget let some thumbnails go: {} held of {}",
+        held.len(),
+        ids.len()
+    );
+    let lost: Vec<u32> = h.frames.evicted_thumbnails();
+    assert_eq!(lost.len() + held.len(), ids.len());
+    let target = PhotoId(lost[0]);
+    assert!(!held.iter().any(|t| t.id == target));
+
+    // The page shows the photo: nothing to hand out for it yet, and the core makes it again.
+    let before = ready_count(target);
+    let answer = h.api.thumbnails_in_view(&[target]);
+    assert!(answer.is_empty(), "{answer:?}");
+    wait_until("the thumbnail to come back", || {
+        ready_count(target) > before
+    });
+    assert!(h.api.thumbnails().wait_idle(WAIT));
+    let back = h.api.thumbnails_now();
+    let url = &back.iter().find(|t| t.id == target).expect("back").url;
+    assert!(png_size(&served(&h, url)).0 > 0);
+    assert!(!h.frames.evicted_thumbnails().contains(&target.0));
+    // And now the page is told its address.
+    assert_eq!(h.api.thumbnails_in_view(&[target]).len(), 1);
+    // The store stayed within what it can: nothing but the protected photos is over the budget.
+    assert_eq!(
+        h.frames.thumbnail_bytes_counted(),
+        h.frames.thumbnail_bytes()
+    );
+}
+
 #[test]
 fn a_drop_without_arw_files_says_so_and_a_missing_file_is_named() {
     let h = Harness::new();
@@ -225,6 +339,31 @@ fn a_drop_without_arw_files_says_so_and_a_missing_file_is_named() {
     assert!(err.message.contains("isn't there"), "{err}");
     // An empty session is still a session.
     assert!(h.api.session_state().expect("state").photos.is_empty());
+}
+
+/// A folder that cannot be read is named, not called empty (`docs/26` H-02). Skipped as root, which
+/// can read a folder with mode 000.
+#[cfg(unix)]
+#[test]
+fn an_unreadable_folder_is_named_and_is_not_no_arw() {
+    use std::os::unix::fs::PermissionsExt;
+    let h = Harness::new();
+    let locked = h.photos.path().join("Locked");
+    std::fs::create_dir_all(&locked).expect("folder");
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+    let readable = std::fs::read_dir(&locked).is_ok();
+    let result = h.api.open_paths(&[locked.to_string_lossy().into_owned()]);
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    if readable {
+        eprintln!("skipped: this user can read a folder with mode 000 (root)");
+        return;
+    }
+    let err = result.expect_err("unreadable");
+    assert_eq!(err.scope, ErrorScope::Open);
+    assert_eq!(
+        err.message,
+        "Yellowmoon can't read the folder Locked. Check that it is still there and that you may open it, then try again."
+    );
 }
 
 #[test]
@@ -274,7 +413,7 @@ fn closing_the_session_cancels_its_queued_renders_and_forgets_what_they_cached()
             let (id, look) = (*id, look.clone());
             [
                 std::thread::spawn(move || a.look_thumbnail(id, &look).map(|png| png.len())),
-                std::thread::spawn(move || b.histogram(id).map(|_| 0)),
+                std::thread::spawn(move || b.histogram(id, None).map(|_| 0)),
             ]
         })
         .collect();
@@ -428,9 +567,9 @@ fn undo_brings_the_photos_their_settings_and_their_thumbnails_back() {
     wait_until("four thumbnails", || h.frames.thumbnail_urls().len() == 4);
     let urls: std::collections::HashMap<u32, String> =
         h.frames.thumbnail_urls().into_iter().collect();
-    let patch: SettingsPatch = serde_json::from_value(
+    let patch: SettingsPatch = serde_json::from_value(field_patch(
         json!({ "contrast": 25, "exposure": { "kind": "manual", "ev": 0.5 } }),
-    )
+    ))
     .expect("patch");
     h.api.update_settings(ids[1], &patch).expect("edit");
     h.api.set_picked(ids[1], true).expect("pick");
@@ -490,7 +629,8 @@ fn removing_the_last_photos_empties_the_session_and_undo_fills_it_again() {
         reopened.opened,
         Some(OpenSummary {
             added: 2,
-            already_open: 0
+            already_open: 0,
+            cancelled: false,
         })
     );
     h.api.close_session();
@@ -557,8 +697,8 @@ fn the_output_sharpening_crosses_the_bridge_as_a_plain_number() {
     let id = h.first();
     // The default is 100, in the stored settings and in the resolved values.
     let before = h.api.get_settings(id).expect("settings");
-    assert_eq!(before.settings.output_sharpening, Num(100.0));
-    assert_eq!(before.values.output_sharpening, Num(100.0));
+    assert_eq!(before.settings.output().output_sharpening, Num(100.0));
+    assert_eq!(before.values.output.output_sharpening, Num(100.0));
     // Moving the slider sends a number; out of range is clamped by the core; 0 is a value.
     for (sent, shown) in [
         (35.0, 35.0),
@@ -568,22 +708,36 @@ fn the_output_sharpening_crosses_the_bridge_as_a_plain_number() {
         (100.0, 100.0),
     ] {
         let patch: SettingsPatch =
-            serde_json::from_value(json!({ "output_sharpening": sent })).expect("patch");
+            serde_json::from_value(field_patch(json!({ "output_sharpening": sent })))
+                .expect("patch");
         let after = h.api.update_settings(id, &patch).expect("update");
-        assert_eq!(after.settings.output_sharpening, Num(shown), "sent {sent}");
-        assert_eq!(after.values.output_sharpening, Num(shown), "sent {sent}");
+        assert_eq!(
+            after.settings.output().output_sharpening,
+            Num(shown),
+            "sent {sent}"
+        );
+        assert_eq!(
+            after.values.output.output_sharpening,
+            Num(shown),
+            "sent {sent}"
+        );
     }
     // A string is not a number: the bridge refuses it before the core sees it.
     assert!(
-        serde_json::from_value::<SettingsPatch>(json!({ "output_sharpening": "a lot" })).is_err()
+        serde_json::from_value::<SettingsPatch>(field_patch(
+            json!({ "output_sharpening": "a lot" })
+        ))
+        .is_err()
     );
     // The patch of one field leaves the others alone.
-    let patch: SettingsPatch =
-        serde_json::from_value(json!({ "output_sharpening": 60, "contrast": 5 })).expect("patch");
+    let patch: SettingsPatch = serde_json::from_value(field_patch(
+        json!({ "output_sharpening": 60, "contrast": 5 }),
+    ))
+    .expect("patch");
     let after = h.api.update_settings(id, &patch).expect("update");
-    assert_eq!(after.settings.output_sharpening, Num(60.0));
+    assert_eq!(after.settings.output().output_sharpening, Num(60.0));
     assert_eq!(
-        after.settings.contrast,
+        after.settings.main_grade().contrast,
         PercentSetting::Manual { value: Num(5.0) }
     );
 }
@@ -595,10 +749,15 @@ fn settings_round_trip_with_the_json_the_frontend_sends() {
     h.develop();
     let id = h.first();
     let before = h.api.get_settings(id).expect("settings");
-    assert!(before.auto.exposure && before.auto.white_balance && before.auto.sharpen);
-    assert!(matches!(before.settings.exposure, ExposureSetting::Auto));
+    assert!(
+        before.auto.input.exposure && before.auto.input.white_balance && before.auto.input.sharpen
+    );
+    assert!(matches!(
+        before.settings.input().exposure,
+        ExposureSetting::Auto
+    ));
 
-    let patch: SettingsPatch = serde_json::from_value(json!({
+    let patch: SettingsPatch = serde_json::from_value(field_patch(json!({
         "exposure": { "kind": "manual", "ev": 0.5 },
         "contrast": 20,
         "color_balance": { "shadows": [0.2, -0.1] },
@@ -610,56 +769,66 @@ fn settings_round_trip_with_the_json_the_frontend_sends() {
         },
         "orientation": 90,
         "white_pick": [0.5, 0.5]
-    }))
+    })))
     .expect("a patch as the frontend writes it");
     let after = h.api.update_settings(id, &patch).expect("update");
-    assert!((after.values.exposure_ev.0 - 0.5).abs() < 1e-9);
-    assert!(!after.auto.exposure);
+    assert!((after.values.input.exposure_ev.0 - 0.5).abs() < 1e-9);
+    assert!(!after.auto.input.exposure);
     assert_eq!(
-        after.settings.contrast,
+        after.settings.main_grade().contrast,
         PercentSetting::Manual { value: Num(20.0) }
     );
     assert_eq!(
-        after.settings.color_balance.shadows,
+        after.settings.main_grade().color_balance.shadows,
         crate::wire::BalanceSetting::Manual {
             point: [Num(0.2), Num(-0.1)]
         }
     );
-    assert_eq!(after.settings.color_balance.midtones, [Num(0.0), Num(0.0)]);
-    assert_eq!(after.settings.curve.luma.len(), 3);
-    assert_eq!(after.settings.orientation, crate::wire::Orientation(90));
-    assert!(after.settings.crop.is_some());
-    assert!(after.settings.white_pick.is_some());
+    assert_eq!(
+        after.settings.main_grade().color_balance.midtones,
+        [Num(0.0), Num(0.0)]
+    );
+    assert_eq!(after.settings.main_grade().curve.luma.len(), 3);
+    assert_eq!(
+        after.settings.input().orientation,
+        crate::wire::Orientation(90)
+    );
+    assert!(after.settings.input().crop.is_some());
+    assert!(after.settings.input().white_pick.is_some());
     // The same answer comes back from get_settings.
     assert_eq!(h.api.get_settings(id).expect("settings"), after);
 
     // `null` clears the crop and the pick; Auto resets the exposure; nothing else changes.
-    let clear: SettingsPatch = serde_json::from_value(json!({
+    let clear: SettingsPatch = serde_json::from_value(field_patch(json!({
         "exposure": { "kind": "auto" },
         "crop": null,
         "white_pick": null
-    }))
+    })))
     .expect("clearing patch");
     let cleared = h.api.update_settings(id, &clear).expect("clear");
-    assert!(cleared.auto.exposure);
-    assert!(cleared.settings.crop.is_none() && cleared.settings.white_pick.is_none());
+    assert!(cleared.auto.input.exposure);
+    assert!(
+        cleared.settings.input().crop.is_none() && cleared.settings.input().white_pick.is_none()
+    );
     assert_eq!(
-        cleared.settings.contrast,
+        cleared.settings.main_grade().contrast,
         PercentSetting::Manual { value: Num(20.0) }
     );
 
     // A patch without the key leaves the crop alone.
-    let set: SettingsPatch = serde_json::from_value(json!({
+    let set: SettingsPatch = serde_json::from_value(field_patch(json!({
         "crop": { "rect": { "x": 0, "y": 0, "width": 1, "height": 0.5 }, "angle_deg": 0, "aspect": "free" }
-    }))
+    })))
     .expect("crop patch");
     h.api.update_settings(id, &set).expect("crop");
-    let leave: SettingsPatch = serde_json::from_value(json!({ "saturation": 10 })).expect("patch");
+    let leave: SettingsPatch =
+        serde_json::from_value(field_patch(json!({ "saturation": 10 }))).expect("patch");
     assert!(
         h.api
             .update_settings(id, &leave)
             .expect("update")
             .settings
+            .input()
             .crop
             .is_some()
     );
@@ -672,14 +841,20 @@ fn settings_errors_are_plain_sentences_and_change_nothing() {
     h.develop();
     let id = h.first();
     // A curve with one point is not a curve.
-    let bad: SettingsPatch =
-        serde_json::from_value(json!({ "contrast": 5, "curve": { "luma": [[0.5, 0.5]] } }))
-            .expect("parses");
+    let bad: SettingsPatch = serde_json::from_value(field_patch(
+        json!({ "contrast": 5, "curve": { "luma": [[0.5, 0.5]] } }),
+    ))
+    .expect("parses");
     let err = h.api.update_settings(id, &bad).expect_err("refused");
     assert_eq!(err.scope, ErrorScope::Render);
     assert!(!err.message.is_empty());
     assert_eq!(
-        h.api.get_settings(id).expect("settings").settings.contrast,
+        h.api
+            .get_settings(id)
+            .expect("settings")
+            .settings
+            .main_grade()
+            .contrast,
         PercentSetting::Auto
     );
     // A misspelt field is an error, not a patch that silently does nothing (`docs/01`
@@ -700,7 +875,7 @@ fn settings_errors_are_plain_sentences_and_change_nothing() {
         serde_json::from_value::<PreferencesPatch>(json!({ "remove_location": true })).is_err()
     );
     // The same patch spelt right is fine.
-    assert!(serde_json::from_value::<SettingsPatch>(json!({ "contrast": 1 })).is_ok());
+    assert!(serde_json::from_value::<SettingsPatch>(field_patch(json!({ "contrast": 1 }))).is_ok());
 }
 
 #[test]
@@ -718,6 +893,7 @@ fn apply_look_reaches_this_picked_and_all_photos() {
             .get_settings(id)
             .expect("settings")
             .values
+            .output
             .look_intensity
             .0
     };
@@ -750,6 +926,35 @@ fn apply_look_reaches_this_picked_and_all_photos() {
 }
 
 #[test]
+fn opening_files_reports_how_far_the_reading_has_got() {
+    let h = Harness::new();
+    h.open(3);
+    let seen: Vec<(u32, u32)> = h
+        .events
+        .events()
+        .iter()
+        .filter_map(|e| match e {
+            AppEvent::OpenProgress(p) => Some((p.done, p.total)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(seen.first(), Some(&(0, 3)));
+    assert_eq!(seen.last(), Some(&(3, 3)));
+    // No open is running: Cancel stops nothing, and the next open is not cancelled.
+    h.api.cancel_open();
+    let folder = h.photos.path().to_string_lossy().into_owned();
+    let again = h.api.open_paths(&[folder]).expect("open again");
+    assert_eq!(
+        again.opened,
+        Some(OpenSummary {
+            added: 0,
+            already_open: 3,
+            cancelled: false,
+        })
+    );
+}
+
+#[test]
 fn opening_more_files_adds_to_the_session_and_says_what_was_new() {
     let h = Harness::new();
     let first = h.open(2);
@@ -757,7 +962,8 @@ fn opening_more_files_adds_to_the_session_and_says_what_was_new() {
         first.opened,
         Some(OpenSummary {
             added: 2,
-            already_open: 0
+            already_open: 0,
+            cancelled: false,
         })
     );
     let ids: Vec<_> = first.photos.iter().map(|p| p.id).collect();
@@ -772,7 +978,8 @@ fn opening_more_files_adds_to_the_session_and_says_what_was_new() {
         again.opened,
         Some(OpenSummary {
             added: 0,
-            already_open: 2
+            already_open: 2,
+            cancelled: false,
         })
     );
     assert_eq!(again.photos.len(), 2);
@@ -785,7 +992,8 @@ fn opening_more_files_adds_to_the_session_and_says_what_was_new() {
         more.opened,
         Some(OpenSummary {
             added: 1,
-            already_open: 2
+            already_open: 2,
+            cancelled: false,
         })
     );
     assert_eq!(
@@ -804,21 +1012,22 @@ fn copy_and_paste_settings_move_a_photos_settings_onto_others() {
     h.open(3);
     let state = h.develop();
     let ids: Vec<_> = state.photos.iter().map(|p| p.id).collect();
-    let edit: SettingsPatch = serde_json::from_value(json!({
+    let edit: SettingsPatch = serde_json::from_value(field_patch(json!({
         "exposure": { "kind": "manual", "ev": 0.6 },
         "contrast": 25,
         "look": "builtin:neutral",
         "look_intensity": 45,
         "crop": { "rect": { "x": 0.1, "y": 0.1, "width": 0.5, "height": 0.5 }, "angle_deg": 2, "aspect": "free" },
         "orientation": 90
-    }))
+    })))
     .expect("patch");
     h.api.update_settings(ids[0], &edit).expect("edit");
 
     let copied = h.api.copy_settings(ids[0]).expect("copy");
-    assert!(copied.crop.is_none() && copied.orientation.is_none() && copied.white_pick.is_none());
+    let input = input_of(&copied);
+    assert!(input.crop.is_none() && input.orientation.is_none() && input.white_pick.is_none());
     assert_eq!(
-        copied.contrast,
+        grade_of(&copied).contrast,
         Some(PercentPatch::Setting(PercentSetting::Manual {
             value: Num(25.0)
         }))
@@ -836,10 +1045,10 @@ fn copy_and_paste_settings_move_a_photos_settings_onto_others() {
     );
     for id in [ids[1], ids[2]] {
         let r = h.api.get_settings(id).expect("settings");
-        assert_eq!(r.values.contrast.0, 25.0);
-        assert_eq!(r.values.exposure_ev.0, 0.6);
-        assert_eq!(r.values.look_intensity.0, 45.0);
-        assert!(r.settings.crop.is_none(), "the crop is not pasted");
+        assert_eq!(r.values.main.grade.contrast.0, 25.0);
+        assert_eq!(r.values.input.exposure_ev.0, 0.6);
+        assert_eq!(r.values.output.look_intensity.0, 45.0);
+        assert!(r.settings.input().crop.is_none(), "the crop is not pasted");
     }
     // Every photo that changed is announced, once.
     let events = h.events.events();
@@ -858,9 +1067,10 @@ fn copy_and_paste_settings_move_a_photos_settings_onto_others() {
     assert_eq!(h.events.events().len(), after);
 
     // A look that is not in the library is refused as `apply_look` refuses it, and nothing changes.
-    let gone: SettingsPatch =
-        serde_json::from_value(json!({ "look": "arri:3000:nothing", "contrast": -5 }))
-            .expect("patch");
+    let gone: SettingsPatch = serde_json::from_value(field_patch(
+        json!({ "look": "arri:3000:nothing", "contrast": -5 }),
+    ))
+    .expect("patch");
     let err = h
         .api
         .paste_settings(&[ids[1]], &gone)
@@ -871,11 +1081,255 @@ fn copy_and_paste_settings_move_a_photos_settings_onto_others() {
             .get_settings(ids[1])
             .expect("settings")
             .values
+            .main
+            .grade
             .contrast
             .0,
         25.0
     );
     assert!(h.api.copy_settings(PhotoId(9999)).is_err());
+}
+
+/// A patch that makes the graph Input, 1, 2, 3, Output with an exposure trim in nodes 2 and 3 (+0.5 and +0.8 stops).
+fn three_node_patch() -> SettingsPatch {
+    let link = |from: serde_json::Value, to: serde_json::Value| json!({ "from": { "node": from, "port": "picture" }, "to": { "node": to, "port": "picture" } });
+    serde_json::from_value(json!({
+        "nodes": {
+            "2": { "kind": "corrector", "pos": [1.0, 0.0], "trim": { "exposure_ev": 0.5 } },
+            "3": { "kind": "corrector", "pos": [2.0, 0.0], "trim": { "exposure_ev": 0.8 } },
+        },
+        "links": [
+            link(json!("input"), json!(1)),
+            link(json!(1), json!(2)),
+            link(json!(2), json!(3)),
+            link(json!(3), json!("output")),
+        ],
+    }))
+    .expect("patch")
+}
+
+#[test]
+fn the_panel_signals_read_the_picture_after_a_mixer_and_into_a_splitter() {
+    use ym_core::settings::NodeId as Core;
+    let h = Harness::new();
+    h.open(3);
+    h.develop();
+    let id = h.first();
+    h.rect(300.0, 300.0);
+    assert!(h.api.viewport().wait_idle(WAIT));
+    // Input -> 1 -> 2 (an exposure trim) -> Layer 3 -> Output, and a Splitter 4 after node 2 that nothing reads.
+    let link = |from: serde_json::Value, from_port: &str, to: serde_json::Value, to_port: &str| json!({ "from": { "node": from, "port": from_port }, "to": { "node": to, "port": to_port } });
+    let patch: SettingsPatch = serde_json::from_value(json!({
+        "nodes": {
+            "2": { "kind": "corrector", "pos": [1.0, 0.0], "trim": { "exposure_ev": 0.5 } },
+            "3": { "kind": "layer", "pos": [2.0, 0.0] },
+            "4": { "kind": "splitter", "pos": [2.0, 1.0] },
+        },
+        "links": [
+            link(json!("input"), "picture", json!(1), "picture"),
+            link(json!(1), "picture", json!(2), "picture"),
+            link(json!(2), "picture", json!(3), "picture.1"),
+            link(json!(3), "picture", json!("output"), "picture"),
+            link(json!(2), "picture", json!(4), "picture"),
+        ],
+    }))
+    .expect("patch");
+    h.api.update_settings(id, &patch).expect("update");
+    let at = |n: u32| wire_node(Core::Corrector(n));
+    let two = h.api.histogram(id, at(2)).expect("histogram");
+    // A Layer of one input is that input's picture; a Splitter reads the picture on the link into it.
+    assert_eq!(h.api.histogram(id, at(3)).expect("histogram"), two);
+    assert_eq!(h.api.histogram(id, at(4)).expect("histogram"), two);
+    assert_ne!(two, h.api.histogram(id, None).expect("histogram"));
+    assert_eq!(
+        h.api.chroma_scatter(id, at(3)).expect("scatter"),
+        h.api.chroma_scatter(id, at(2)).expect("scatter")
+    );
+    assert_eq!(
+        h.api
+            .sample_chroma(150.0, 150.0, at(3), None)
+            .expect("chroma"),
+        h.api
+            .sample_chroma(150.0, 150.0, at(2), None)
+            .expect("chroma")
+    );
+}
+
+/// The `node_thumbnails_ready` events so far.
+fn node_thumbnail_events(h: &Harness) -> Vec<NodeThumbnailsReady> {
+    h.events
+        .events()
+        .into_iter()
+        .filter_map(|e| match e {
+            AppEvent::NodeThumbnailsReady(t) => Some(t),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The nodes an event names, in order.
+fn nodes_of(event: &NodeThumbnailsReady) -> Vec<u32> {
+    event.thumbnails.iter().map(|t| t.node).collect()
+}
+
+fn url_of(event: &NodeThumbnailsReady, node: u32) -> String {
+    event
+        .thumbnails
+        .iter()
+        .find(|t| t.node == node)
+        .unwrap_or_else(|| panic!("node {node} is not in the event"))
+        .url
+        .clone()
+}
+
+#[test]
+fn node_thumbnails_are_asked_for_at_once_and_arrive_as_addresses_of_the_nodes_that_changed() {
+    let h = Harness::new();
+    h.open(1);
+    h.develop();
+    let id = h.first();
+    h.api
+        .update_settings(id, &three_node_patch())
+        .expect("a graph of three nodes");
+    let idle = || {
+        assert!(
+            h.api.node_thumbnailer().wait_idle(WAIT),
+            "the node thumbnails were not made"
+        );
+    };
+
+    // The command has no answer to wait for; the pictures come as an event, every node of the photo.
+    h.api.node_thumbnails(id);
+    idle();
+    let first = node_thumbnail_events(&h);
+    assert_eq!(first.len(), 1);
+    assert_eq!(first[0].photo_id, id);
+    assert_eq!(nodes_of(&first[0]), vec![1, 2, 3]);
+    // Addresses, never bytes; PNGs of about 160 px on the scheme, a different one for each node.
+    for t in &first[0].thumbnails {
+        assert!(
+            t.url.contains(&format!("/node-{}-{}-", id.0, t.node)),
+            "{}",
+            t.url
+        );
+        assert!(t.url.len() < 100, "{}", t.url);
+        let (w, hh) = png_size(&served(&h, &t.url));
+        assert!(w.max(hh) <= 160 && w.max(hh) > 0, "{w} x {hh}");
+    }
+    let urls: std::collections::BTreeSet<_> =
+        first[0].thumbnails.iter().map(|t| t.url.clone()).collect();
+    assert_eq!(urls.len(), 3);
+    assert_ne!(
+        served(&h, &url_of(&first[0], 1)),
+        served(&h, &url_of(&first[0], 3)),
+        "node 3 is not node 1's picture"
+    );
+
+    // Asking again with nothing changed announces nothing: the webview has the addresses.
+    h.api.node_thumbnails(id);
+    h.api.node_thumbnails(id);
+    idle();
+    assert_eq!(node_thumbnail_events(&h).len(), 1);
+
+    // A change to node 3: only node 3 is in the event, at a new address. The nodes before it keep
+    // theirs, and the picture the webview may still be loading stays served.
+    let change: SettingsPatch =
+        serde_json::from_value(json!({ "nodes": { "3": { "trim": { "exposure_ev": 1.5 } } } }))
+            .expect("patch");
+    h.api.update_settings(id, &change).expect("update");
+    h.api.node_thumbnails(id);
+    idle();
+    let events = node_thumbnail_events(&h);
+    assert_eq!(events.len(), 2);
+    assert_eq!(nodes_of(&events[1]), vec![3]);
+    assert_ne!(url_of(&events[1], 3), url_of(&events[0], 3));
+    assert_ne!(
+        served(&h, &url_of(&events[1], 3)),
+        served(&h, &url_of(&events[0], 3))
+    );
+    for node in [1, 2, 3] {
+        assert_eq!(
+            h.frames.respond(path_of_url(&url_of(&events[0], node))).0,
+            200
+        );
+    }
+
+    // A change at the Input reaches every node.
+    let exposure: SettingsPatch = serde_json::from_value(
+        json!({ "nodes": { "input": { "exposure": { "kind": "manual", "ev": 0.6 } } } }),
+    )
+    .expect("patch");
+    h.api.update_settings(id, &exposure).expect("update");
+    h.api.node_thumbnails(id);
+    idle();
+    let events = node_thumbnail_events(&h);
+    assert_eq!(events.len(), 3);
+    assert_eq!(nodes_of(&events[2]), vec![1, 2, 3]);
+
+    // A node that is taken out has no picture any more, and the others are announced only if they changed.
+    let remove: SettingsPatch = serde_json::from_value(json!({
+        "remove": [2],
+        "links": [
+            { "from": { "node": "input", "port": "picture" }, "to": { "node": 1, "port": "picture" } },
+            { "from": { "node": 1, "port": "picture" }, "to": { "node": 3, "port": "picture" } },
+            { "from": { "node": 3, "port": "picture" }, "to": { "node": "output", "port": "picture" } },
+        ],
+    }))
+    .expect("patch");
+    h.api.update_settings(id, &remove).expect("update");
+    h.api.node_thumbnails(id);
+    idle();
+    let events = node_thumbnail_events(&h);
+    assert_eq!(events.len(), 4);
+    assert_eq!(nodes_of(&events[3]), vec![3], "node 3 now reads Main");
+
+    // A photo that is not in the session has none, and says nothing.
+    h.api.node_thumbnails(PhotoId(9999));
+    idle();
+    assert_eq!(node_thumbnail_events(&h).len(), 4);
+
+    // The photo leaves the filmstrip: its addresses stop answering, and asking for it again (after Undo)
+    // announces every node anew.
+    let last = events[3].thumbnails[0].url.clone();
+    h.api.remove_photos(&[id]).expect("remove");
+    assert_eq!(h.frames.respond(path_of_url(&last)).0, 404);
+    assert_eq!(h.frames.respond(path_of_url(&url_of(&events[2], 1))).0, 404);
+    h.api.restore_photos().expect("restore");
+    h.api.node_thumbnails(id);
+    idle();
+    let events = node_thumbnail_events(&h);
+    assert_eq!(events.len(), 5);
+    assert_eq!(nodes_of(&events[4]), vec![1, 3]);
+    assert_eq!(h.frames.respond(path_of_url(&url_of(&events[4], 1))).0, 200);
+
+    // Closing the session drops them.
+    let kept = url_of(&events[4], 3);
+    h.api.close_session();
+    assert_eq!(h.frames.respond(path_of_url(&kept)).0, 404);
+}
+
+#[test]
+fn node_thumbnails_of_a_photo_that_is_not_developed_yet_make_nothing_and_the_event_is_small() {
+    let h = Harness::new();
+    h.open(1);
+    let id = h.first();
+    // Asked before the photo is ready: skipped, no error, no event.
+    h.api.node_thumbnails(id);
+    h.develop();
+    assert!(h.api.node_thumbnailer().wait_idle(WAIT));
+    h.api.node_thumbnails(id);
+    assert!(h.api.node_thumbnailer().wait_idle(WAIT));
+    let events = node_thumbnail_events(&h);
+    assert_eq!(
+        events.len(),
+        1,
+        "the first request, if it came late, or the second"
+    );
+    // The default graph has Main alone: one card, one picture.
+    assert_eq!(nodes_of(&events[0]), vec![1]);
+    let json = serde_json::to_string(&events[0]).expect("json");
+    assert!(json.len() < 200, "{json}");
+    assert!(json.contains("\"photo_id\""), "{json}");
 }
 
 #[test]
@@ -884,14 +1338,18 @@ fn rerun_histogram_and_look_thumbnails() {
     h.open(1);
     h.develop();
     let id = h.first();
-    let patch: SettingsPatch =
-        serde_json::from_value(json!({ "exposure": { "kind": "manual", "ev": 1.5 } }))
-            .expect("patch");
+    let patch: SettingsPatch = serde_json::from_value(field_patch(
+        json!({ "exposure": { "kind": "manual", "ev": 1.5 } }),
+    ))
+    .expect("patch");
     h.api.update_settings(id, &patch).expect("update");
     let rerun = h.api.rerun_auto(id).expect("rerun");
-    assert!(rerun.auto.exposure, "Re-run sets exposure back to Auto");
+    assert!(
+        rerun.auto.input.exposure,
+        "Re-run sets exposure back to Auto"
+    );
 
-    let histogram = h.api.histogram(id).expect("histogram");
+    let histogram = h.api.histogram(id, None).expect("histogram");
     for channel in [&histogram.red, &histogram.green, &histogram.blue] {
         assert_eq!(channel.len(), 64);
     }
@@ -1000,13 +1458,270 @@ fn the_fallback_viewport_sends_frames_for_the_cell_and_follows_the_input() {
     h.frame_after(n);
     assert!(h.api.viewport().wait_idle(WAIT));
     let n = h.api.viewport().frames_presented();
-    h.api.viewport_set_mode(&ViewportMode::Fit).expect("fit");
+    h.api
+        .viewport_set_mode(&ViewportMode::Fit, None)
+        .expect("fit");
     h.frame_after(n);
     assert!(h.api.viewport().wait_idle(WAIT));
     assert!(matches!(
         h.api.viewport().snapshot_synced().1.mode,
         ym_core::pipeline::ViewportMode::Fit
     ));
+}
+
+#[test]
+fn the_mask_view_is_set_with_the_mode_kept_and_dropped_with_none() {
+    use crate::wire::{MaskStyle, MaskView};
+    use ym_core::pipeline::{MaskStyle as CoreStyle, MaskView as CoreView};
+    let h = Harness::new();
+    h.open(1);
+    h.develop();
+    h.rect(100.0, 100.0);
+    h.frame_of_size(100, 100);
+    assert!(h.api.viewport().wait_idle(WAIT));
+    assert_eq!(h.api.viewport().snapshot_synced().1.mask_view, None);
+
+    // A zoom and a pan the page did not touch stay as they were when only the mask view changes.
+    h.api
+        .viewport_input(&ViewportInput::ToggleZoom {
+            x: Num(50.0),
+            y: Num(50.0),
+        })
+        .expect("toggle");
+    assert!(h.api.viewport().wait_idle(WAIT));
+    let zoomed = h.api.viewport().snapshot_synced().1;
+
+    let n = h.api.viewport().frames_presented();
+    h.api
+        .viewport_set_mode(
+            &ViewportMode::Percent { value: Num(100.0) },
+            Some(&MaskView {
+                node: 1,
+                style: MaskStyle::Overlay,
+                row: None,
+                depth: false,
+            }),
+        )
+        .expect("mask view");
+    h.frame_after(n);
+    assert!(h.api.viewport().wait_idle(WAIT));
+    let on = h.api.viewport().snapshot_synced().1;
+    assert_eq!(
+        on.mask_view,
+        Some(CoreView {
+            node: 1,
+            style: CoreStyle::Overlay,
+            row: None,
+            depth: false
+        })
+    );
+    assert_eq!(on.mode, zoomed.mode);
+    assert_eq!(on.centre, zoomed.centre);
+
+    // Another style, another node, and one row of it.
+    let n = h.api.viewport().frames_presented();
+    h.api
+        .viewport_set_mode(
+            &ViewportMode::Percent { value: Num(100.0) },
+            Some(&MaskView {
+                node: 2,
+                style: MaskStyle::MaskOnly,
+                row: Some(3),
+                // Show depth travels with the view (`docs/23` section 9).
+                depth: true,
+            }),
+        )
+        .expect("mask view");
+    h.frame_after(n);
+    assert!(h.api.viewport().wait_idle(WAIT));
+    assert_eq!(
+        h.api.viewport().snapshot_synced().1.mask_view,
+        Some(CoreView {
+            node: 2,
+            style: CoreStyle::MaskOnly,
+            row: Some(3),
+            depth: true
+        })
+    );
+
+    // None is no mask view.
+    let n = h.api.viewport().frames_presented();
+    h.api
+        .viewport_set_mode(&ViewportMode::Percent { value: Num(100.0) }, None)
+        .expect("no mask view");
+    h.frame_after(n);
+    assert!(h.api.viewport().wait_idle(WAIT));
+    assert_eq!(h.api.viewport().snapshot_synced().1.mask_view, None);
+}
+
+#[test]
+fn a_mask_view_belongs_to_its_photo() {
+    use crate::wire::{MaskStyle, MaskView};
+    let h = Harness::new();
+    h.open(2);
+    let done = h.develop();
+    let ids: Vec<PhotoId> = done.photos.iter().map(|p| p.id).collect();
+    h.rect(100.0, 100.0);
+    h.frame_of_size(100, 100);
+    assert!(h.api.viewport().wait_idle(WAIT));
+    h.api
+        .viewport_set_mode(
+            &ViewportMode::Fit,
+            Some(&MaskView {
+                node: 1,
+                style: MaskStyle::MaskOnly,
+                row: None,
+                depth: false,
+            }),
+        )
+        .expect("mask view");
+    assert!(h.api.viewport().wait_idle(WAIT));
+    assert!(h.api.viewport().snapshot_synced().1.mask_view.is_some());
+    h.api.set_current(ids[1]).expect("next photo");
+    assert!(h.api.viewport().wait_idle(WAIT));
+    assert_eq!(
+        h.api.viewport().snapshot_synced().1.mask_view,
+        None,
+        "the next photo has no mask view until the page asks for one"
+    );
+}
+
+#[test]
+fn the_kinds_of_mask_this_machine_makes_are_the_cores_and_cross_by_the_same_word() {
+    use crate::wire::MaskKind;
+    let h = Harness::new();
+    let kinds = h.api.mask_kinds().expect("kinds");
+    // Object is first where the SAM weights are (`data/models/sam2`, `tools/fetch/sam2.sh`; CI's rust job fetches none), then the kinds that
+    // need nothing: Background, the shapes, Brush and the ranges. Subject and People (N-19) follow the Vision probe: a harness has no
+    // provider, which is a computer that cannot make them, so they are not offered.
+    let object = ym_core::pipeline::ObjectModel::probe(
+        &ym_core::data_dir::find_data_dir().expect("the data folder"),
+    )
+    .is_some();
+    // Depth (D-04) follows its own weights (`data/models/depth`, `tools/fetch/depth.sh`), right after Background.
+    let depth = ym_core::pipeline::DepthModel::probe(
+        &ym_core::data_dir::find_data_dir().expect("the data folder"),
+    )
+    .is_some();
+    let mut want = Vec::new();
+    if object {
+        want.push(MaskKind::Object);
+    }
+    want.push(MaskKind::Background);
+    if depth {
+        want.push(MaskKind::Depth);
+    }
+    want.extend([
+        MaskKind::Linear,
+        MaskKind::Radial,
+        MaskKind::Brush,
+        MaskKind::ColorRange,
+        MaskKind::BrightnessRange,
+    ]);
+    assert_eq!(kinds, want);
+    let words: Vec<&str> = want
+        .iter()
+        .map(|k| match k {
+            MaskKind::Object => "object",
+            MaskKind::Background => "background",
+            MaskKind::Depth => "depth",
+            MaskKind::Linear => "linear",
+            MaskKind::Radial => "radial",
+            MaskKind::Brush => "brush",
+            MaskKind::ColorRange => "color_range",
+            MaskKind::BrightnessRange => "brightness_range",
+            _ => unreachable!("not offered"),
+        })
+        .collect();
+    assert_eq!(serde_json::to_value(&kinds).expect("json"), json!(words));
+    assert!(!kinds.contains(&MaskKind::Subject) && !kinds.contains(&MaskKind::People));
+    // Every kind of the core is a kind of the wire, by the same word.
+    for core in ym_core::settings::MaskKind::ALL {
+        let wire: MaskKind = convert(&core).expect("a kind of the wire");
+        assert_same("mask kind", &core, &wire);
+    }
+}
+
+#[test]
+fn points_are_mapped_between_the_photo_and_the_cell_by_the_core() {
+    use crate::wire::MapFrom;
+    let h = Harness::new();
+    // No photo is shown: nothing has a place.
+    assert_eq!(
+        h.api
+            .viewport_map_points(&[[Num(0.5), Num(0.5)]], MapFrom::Photo)
+            .expect("no photo"),
+        vec![None]
+    );
+    h.open(1);
+    h.develop();
+    h.rect(300.0, 300.0);
+    h.frame_of_size(300, 300);
+    assert!(h.api.viewport().wait_idle(WAIT));
+    let (photo, state) = h.api.viewport().snapshot_synced();
+    assert!(photo.is_some());
+    // The photo's middle is the cell's middle, whatever the photo's size; the corners are the picture's.
+    let middle = h
+        .api
+        .viewport_map_points(&[[Num(0.5), Num(0.5)]], MapFrom::Photo)
+        .expect("mapped");
+    let [x, y] = middle[0].expect("a place");
+    assert!(
+        (x.0 - 150.0).abs() < 1e-6 && (y.0 - 150.0).abs() < 1e-6,
+        "{x:?} {y:?}"
+    );
+    // The same through the other direction, and through the state the viewport holds.
+    let back = h
+        .api
+        .viewport_map_points(
+            &[[x, y], [Num(150.0), Num(1.0)], [Num(f64::NAN), Num(4.0)]],
+            MapFrom::Cell,
+        )
+        .expect("mapped");
+    let [u, v] = back[0].expect("a place in the photo");
+    assert!((u.0 - 0.5).abs() < 1e-9 && (v.0 - 0.5).abs() < 1e-9);
+    // The cell is square and the photo 3:2: a point near the top is on the paper, a point that is not a number
+    // has no place, and the answers are in the order of the questions.
+    assert_eq!(back[1], None, "the paper");
+    assert_eq!(back[2], None, "not a number");
+    assert_eq!(back.len(), 3);
+    // It is the renderer's own answer, on the state the viewport holds.
+    let src =
+        PhotoSource::from_session(&h.api.core().session, photo.expect("a photo")).expect("source");
+    let direct = h
+        .api
+        .core()
+        .renderer
+        .map_points(
+            &src,
+            &state,
+            ym_core::pipeline::MapFrom::Photo,
+            &[[0.25, 0.75]],
+            &CancelToken::new(),
+        )
+        .expect("mapped");
+    let wire = h
+        .api
+        .viewport_map_points(&[[Num(0.25), Num(0.75)]], MapFrom::Photo)
+        .expect("mapped");
+    let [dx, dy] = direct[0].expect("a place");
+    let [wx, wy] = wire[0].expect("a place");
+    assert_eq!((dx, dy), (wx.0, wy.0));
+    // The wire's words are the core's.
+    assert_same(
+        "map_from",
+        &ym_core::pipeline::MapFrom::Photo,
+        &MapFrom::Photo,
+    );
+    assert_same(
+        "map_from",
+        &ym_core::pipeline::MapFrom::Cell,
+        &MapFrom::Cell,
+    );
+    assert_eq!(
+        serde_json::to_value(MapFrom::Photo).expect("json"),
+        json!("photo")
+    );
 }
 
 #[test]
@@ -1105,15 +1820,19 @@ fn choosing_photos_while_everything_else_changes_never_stalls_the_viewport() {
                             .expect("zoom"),
                         2 => api.set_before(i % 2 == 0),
                         3 => {
-                            let patch: SettingsPatch =
-                                serde_json::from_value(json!({ "contrast": (i % 40) as i32 - 20 }))
-                                    .expect("patch");
+                            let patch: SettingsPatch = serde_json::from_value(field_patch(
+                                json!({ "contrast": (i % 40) as i32 - 20 }),
+                            ))
+                            .expect("patch");
                             api.update_settings(photo, &patch).expect("update");
                         }
                         4 => api
-                            .viewport_set_mode(&ViewportMode::Percent {
-                                value: Num(if i % 2 == 0 { 100.0 } else { 50.0 }),
-                            })
+                            .viewport_set_mode(
+                                &ViewportMode::Percent {
+                                    value: Num(if i % 2 == 0 { 100.0 } else { 50.0 }),
+                                },
+                                None,
+                            )
                             .expect("mode"),
                         5 => api
                             .viewport_set_rect(&ViewportRect {
@@ -1127,7 +1846,7 @@ fn choosing_photos_while_everything_else_changes_never_stalls_the_viewport() {
                         _ => {
                             // The readout and the pick race with all of it; either answer is fine.
                             let _ = api.sample_pixel(40.0, 30.0);
-                            let _ = api.histogram(photo);
+                            let _ = api.histogram(photo, None);
                         }
                     }
                 }
@@ -1228,7 +1947,7 @@ fn the_render_stats_of_a_frame_carry_its_zoom_and_the_fit_zoom() {
 
     let n = h.api.viewport().frames_presented();
     h.api
-        .viewport_set_mode(&ViewportMode::Percent { value: Num(100.0) })
+        .viewport_set_mode(&ViewportMode::Percent { value: Num(100.0) }, None)
         .expect("100 %");
     h.frame_after(n);
     assert!(h.api.viewport().wait_idle(WAIT));
@@ -1241,6 +1960,56 @@ fn the_render_stats_of_a_frame_carry_its_zoom_and_the_fit_zoom() {
         (at_100.fit_percent.expect("the Fit zoom").0 - fit).abs() < 1e-9,
         "{at_100:?}"
     );
+}
+
+#[test]
+fn a_round_on_a_renderer_without_a_device_says_it_is_busy_on_the_cpu_and_then_that_it_is_done() {
+    // The harness's app has no graphics device: every photo's raw stages run on the CPU.
+    let h = Harness::new();
+    let busy_events = || crate::testing::busy_events(&h.events);
+    let on = ViewportBusy {
+        busy: true,
+        cpu: true,
+        finding: false,
+    };
+    let off = ViewportBusy {
+        busy: false,
+        cpu: true,
+        finding: false,
+    };
+    h.open(1);
+    h.develop();
+    assert!(
+        busy_events().is_empty(),
+        "nothing is drawn before the cell is placed"
+    );
+    h.rect(100.0, 100.0);
+    h.frame_of_size(100, 100);
+    assert!(h.api.viewport().wait_idle(WAIT));
+    let first = busy_events();
+    assert_eq!(first.first(), Some(&on), "{first:?}");
+    assert_eq!(first.last(), Some(&off), "{first:?}");
+    assert!(
+        first.windows(2).all(|w| w[0] != w[1]),
+        "only changes are sent: {first:?}"
+    );
+    // A zoom to 100 %: a coarse frame, the full-resolution tiles, the sharp frame. Busy as it starts,
+    // and not busy once it is over.
+    let n = h.api.viewport().frames_presented();
+    h.api
+        .viewport_set_mode(&ViewportMode::Percent { value: Num(100.0) }, None)
+        .expect("100 %");
+    h.frame_after(n);
+    assert!(h.api.viewport().wait_idle(WAIT));
+    let zoomed = busy_events();
+    assert!(zoomed.len() > first.len(), "{zoomed:?}");
+    assert_eq!(zoomed[first.len()], on);
+    assert_eq!(zoomed.last(), Some(&off));
+    assert!(zoomed.iter().all(|b| b.cpu), "{zoomed:?}");
+    // Closing the session leaves it not busy.
+    h.api.close_session();
+    assert!(h.api.viewport().wait_idle(WAIT));
+    assert_eq!(busy_events().last(), Some(&off));
 }
 
 #[test]
@@ -1261,6 +2030,181 @@ fn the_pixel_readout_finds_the_photo_and_not_the_paper() {
     assert!(h.api.sample_pixel(f64::NAN, 3.0).is_err());
 }
 
+/// A node's id as the wire has it.
+fn wire_node(id: ym_core::settings::NodeId) -> Option<crate::wire::NodeId> {
+    Some(crate::wire::NodeId(id))
+}
+
+#[test]
+fn the_panel_signals_take_a_node_across_the_bridge() {
+    use ym_core::settings::NodeId as Core;
+    let h = Harness::new();
+    h.open(3);
+    h.develop();
+    let id = h.first();
+    h.rect(300.0, 300.0);
+    assert!(h.api.viewport().wait_idle(WAIT));
+    let main = h.api.histogram(id, None).expect("histogram");
+    let dots = h.api.chroma_scatter(id, None).expect("scatter");
+    // Left out, or Main, is what it was before nodes.
+    assert_eq!(h.api.histogram(id, None).expect("histogram"), main);
+    assert_eq!(
+        h.api
+            .histogram(id, wire_node(Core::MAIN))
+            .expect("histogram"),
+        main
+    );
+    assert_eq!(h.api.chroma_scatter(id, None).expect("scatter"), dots);
+    // A node the photo does not have, and the Output, are refused in words.
+    let missing = h
+        .api
+        .histogram(id, wire_node(Core::Corrector(2)))
+        .expect_err("no node 2");
+    assert_eq!(missing.message, "This photo has no node 2.");
+    let output = h
+        .api
+        .chroma_scatter(id, wire_node(Core::Output))
+        .expect_err("the output");
+    assert_eq!(output.message, "The output has no picture to read here.");
+    assert!(
+        h.api
+            .sample_chroma(150.0, 150.0, wire_node(Core::Corrector(2)), None)
+            .is_err()
+    );
+    // Nodes 2 and 3 (an exposure trim in each): their curves' inputs are not Main's, and Main's
+    // own reading does not change with what follows it.
+    h.api
+        .update_settings(id, &three_node_patch())
+        .expect("update");
+    assert_eq!(h.api.histogram(id, None).expect("histogram"), main);
+    let two = h
+        .api
+        .histogram(id, wire_node(Core::Corrector(2)))
+        .expect("histogram");
+    let three = h
+        .api
+        .histogram(id, wire_node(Core::Corrector(3)))
+        .expect("histogram");
+    assert_ne!(two, main);
+    assert_ne!(three, two);
+    assert!(h.api.histogram(id, wire_node(Core::Input)).is_ok());
+    assert_eq!(
+        h.api
+            .chroma_scatter(id, wire_node(Core::Corrector(3)))
+            .expect("scatter")
+            .points
+            .len()
+            % 2,
+        0
+    );
+    // Pick colour at a node answers a point of the photo, and the paper has none.
+    let inside = h
+        .api
+        .sample_chroma(150.0, 150.0, wire_node(Core::Corrector(3)), None)
+        .expect("chroma")
+        .expect("a point of the photo");
+    assert!(inside.a.0.is_finite() && inside.b.0.is_finite());
+    assert_eq!(
+        h.api
+            .sample_chroma(150.0, 5.0, wire_node(Core::Corrector(3)), None)
+            .expect("paper"),
+        None
+    );
+}
+
+#[test]
+fn pick_colour_takes_a_tap_across_the_bridge() {
+    use crate::wire::ChromaTap;
+    use ym_core::settings::NodeId as Core;
+    let h = Harness::new();
+    h.open(1);
+    h.develop();
+    let id = h.first();
+    h.rect(300.0, 300.0);
+    assert!(h.api.viewport().wait_idle(WAIT));
+    // The words of the wire are the core's, and left out is the warp's input.
+    assert_same(
+        "chroma_tap",
+        &ym_core::pipeline::ChromaTap::WarpInput,
+        &ChromaTap::WarpInput,
+    );
+    assert_same(
+        "chroma_tap",
+        &ym_core::pipeline::ChromaTap::NodeInput,
+        &ChromaTap::NodeInput,
+    );
+    assert_eq!(
+        serde_json::to_value(ChromaTap::NodeInput).expect("json"),
+        json!("node_input")
+    );
+    let corrector = wire_node(Core::Corrector(2));
+    let at = |tap: Option<ChromaTap>| {
+        h.api
+            .sample_chroma(150.0, 150.0, corrector, tap)
+            .expect("chroma")
+    };
+    // Node 2, a temperature trim and a saturation after Main: its input is Main's output, whatever
+    // its own trim and grade do, and its warp's input is after them.
+    let patch: SettingsPatch = serde_json::from_value(json!({
+        "nodes": {
+            "2": {
+                "kind": "corrector", "pos": [1.0, 0.0],
+                "trim": { "temperature": 60.0, "tint": -40.0 },
+                "grade": { "saturation": { "kind": "manual", "value": 40.0 } },
+            },
+        },
+        "links": [
+            { "from": { "node": "input", "port": "picture" }, "to": { "node": 1, "port": "picture" } },
+            { "from": { "node": 1, "port": "picture" }, "to": { "node": 2, "port": "picture" } },
+            { "from": { "node": 2, "port": "picture" }, "to": { "node": "output", "port": "picture" } },
+        ],
+    }))
+    .expect("patch");
+    h.api.update_settings(id, &patch).expect("update");
+    let (warp, input) = (
+        at(Some(ChromaTap::WarpInput)),
+        at(Some(ChromaTap::NodeInput)),
+    );
+    assert_eq!(at(None), warp, "left out is the warp's input");
+    assert_ne!(warp, input, "the node's trim and grade are between the two");
+    // Taking the trim and the grade away moves the warp's input onto the node's input, which does
+    // not move.
+    let reset: SettingsPatch = serde_json::from_value(json!({
+        "nodes": { "2": {
+            "trim": { "temperature": 0.0, "tint": 0.0 },
+            "grade": { "saturation": { "kind": "manual", "value": 0.0 } },
+        } },
+    }))
+    .expect("patch");
+    h.api.update_settings(id, &reset).expect("update");
+    assert_eq!(at(Some(ChromaTap::NodeInput)), input);
+    assert_eq!(at(Some(ChromaTap::WarpInput)), input);
+    // Main's input is the Input's output, and the paper has no colour at either tap.
+    assert!(
+        h.api
+            .sample_chroma(150.0, 150.0, None, Some(ChromaTap::NodeInput))
+            .expect("chroma")
+            .is_some()
+    );
+    assert_eq!(
+        h.api
+            .sample_chroma(150.0, 5.0, corrector, Some(ChromaTap::NodeInput))
+            .expect("paper"),
+        None
+    );
+    // A node the photo does not have is refused in words at this tap too.
+    let missing = h
+        .api
+        .sample_chroma(
+            150.0,
+            150.0,
+            wire_node(Core::Corrector(9)),
+            Some(ChromaTap::NodeInput),
+        )
+        .expect_err("no node 9");
+    assert_eq!(missing.message, "This photo has no node 9.");
+}
+
 #[test]
 fn pick_colour_and_the_chroma_scatter_cross_the_bridge() {
     let h = Harness::new();
@@ -1269,23 +2213,23 @@ fn pick_colour_and_the_chroma_scatter_cross_the_bridge() {
     let last = opened.photos.last().expect("photos").id;
     let early = h
         .api
-        .chroma_scatter(last)
+        .chroma_scatter(last, None)
         .expect("no error while developing");
     assert!(early.points.len().is_multiple_of(2));
     h.develop();
     let id = h.first();
-    let scatter = h.api.chroma_scatter(id).expect("scatter");
+    let scatter = h.api.chroma_scatter(id, None).expect("scatter");
     assert!(!scatter.points.is_empty() && scatter.points.len() <= 2 * 2048);
     assert_eq!(scatter.points.len() % 2, 0);
-    assert_eq!(h.api.chroma_scatter(id).expect("scatter"), scatter);
-    assert!(h.api.chroma_scatter(PhotoId(9999)).is_err());
+    assert_eq!(h.api.chroma_scatter(id, None).expect("scatter"), scatter);
+    assert!(h.api.chroma_scatter(PhotoId(9999), None).is_err());
     // Pick colour: the photo's chroma under the pointer, `null` on the paper and for a point that
     // is not a number.
     h.rect(300.0, 300.0);
     assert!(h.api.viewport().wait_idle(WAIT));
     let inside = h
         .api
-        .sample_chroma(150.0, 150.0)
+        .sample_chroma(150.0, 150.0, None, None)
         .expect("chroma")
         .expect("a point of the photo");
     assert!(inside.a.0.is_finite() && inside.b.0.is_finite());
@@ -1293,34 +2237,47 @@ fn pick_colour_and_the_chroma_scatter_cross_the_bridge() {
         serde_json::to_value(inside).expect("json"),
         json!({ "a": inside.a.0, "b": inside.b.0 })
     );
-    assert_eq!(h.api.sample_chroma(150.0, 5.0).expect("paper"), None);
     assert_eq!(
-        h.api.sample_chroma(f64::NAN, 3.0).expect("not a number"),
+        h.api.sample_chroma(150.0, 5.0, None, None).expect("paper"),
+        None
+    );
+    assert_eq!(
+        h.api
+            .sample_chroma(f64::NAN, 3.0, None, None)
+            .expect("not a number"),
         None
     );
     // A pin on that colour moves the picture there but not what Pick colour reads (the warp's
     // input), and the answer is the core's.
     let pin = json!({ "source": [inside.a.0, inside.b.0], "target": [inside.a.0 + 0.05, inside.b.0],
-        "locked": false, "range": 0.04, "shadows": 1, "highlights": 1, "pivot_ev": 0, "exposure_ev": 0 });
+        "locked": false, "range": 0.04, "shadows": 1, "highlights": 1, "pivot_ev": 0, "exposure_ev": 0,
+        "saturation": 0.5 });
     let patch: SettingsPatch =
-        serde_json::from_value(json!({ "color_warp": { "pins": [pin] } })).expect("patch");
+        serde_json::from_value(field_patch(json!({ "color_warp": { "pins": [pin] } })))
+            .expect("patch");
     let resolved = h.api.update_settings(id, &patch).expect("update");
-    assert_eq!(resolved.settings.color_warp.pins.len(), 1);
-    assert_eq!(resolved.values.color_warp, resolved.settings.color_warp);
+    assert_eq!(resolved.settings.main_grade().color_warp.pins.len(), 1);
     assert_eq!(
-        h.api.sample_chroma(150.0, 150.0).expect("chroma"),
+        resolved.values.main.grade.color_warp,
+        resolved.settings.main_grade().color_warp
+    );
+    assert_eq!(
+        h.api
+            .sample_chroma(150.0, 150.0, None, None)
+            .expect("chroma"),
         Some(inside)
     );
     // The settings travel with Copy settings and come back in `get_settings`.
     let copied = h.api.copy_settings(id).expect("copy");
     assert_eq!(
-        copied.color_warp,
-        Some(resolved.settings.color_warp.clone())
+        grade_of(&copied).color_warp,
+        Some(resolved.settings.main_grade().color_warp.clone())
     );
     let cleared: SettingsPatch =
-        serde_json::from_value(json!({ "color_warp": { "pins": [] } })).expect("patch");
+        serde_json::from_value(field_patch(json!({ "color_warp": { "pins": [] } })))
+            .expect("patch");
     let resolved = h.api.update_settings(id, &cleared).expect("update");
-    assert!(resolved.settings.color_warp.pins.is_empty());
+    assert!(resolved.settings.main_grade().color_warp.pins.is_empty());
 }
 
 #[test]
@@ -1343,6 +2300,7 @@ fn a_pick_white_click_becomes_the_photos_white_pick() {
             .get_settings(id)
             .expect("settings")
             .settings
+            .input()
             .white_pick
             .is_none()
     );
@@ -1354,7 +2312,11 @@ fn a_pick_white_click_becomes_the_photos_white_pick() {
         })
         .expect("a click on the photo");
     let settings = h.api.get_settings(id).expect("settings");
-    let [x, y] = settings.settings.white_pick.expect("the pick is set");
+    let [x, y] = settings
+        .settings
+        .input()
+        .white_pick
+        .expect("the pick is set");
     assert!(
         (x.0 - 0.5).abs() < 0.05 && (y.0 - 0.5).abs() < 0.05,
         "{x:?} {y:?}"
@@ -1463,6 +2425,120 @@ fn a_new_photo_goes_back_to_fit() {
     ));
 }
 
+// --- Memory pressure (`docs/26` H-14) --------------------------------------------------------
+
+/// The `MemoryNotice` events seen so far, in order.
+fn memory_notices(h: &Harness) -> Vec<Option<String>> {
+    h.events
+        .events()
+        .iter()
+        .filter_map(|e| match e {
+            AppEvent::MemoryNotice(n) => Some(n.message.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn the_memory_notice_reaches_the_webview_once_per_stay_and_goes_at_normal() {
+    use ym_core::memory::{MEMORY_NOTICE_SENTENCE, PressureLevel};
+    let h = Harness::new();
+    let core = h.api.core();
+    core.apply_pressure(PressureLevel::Warning);
+    assert!(memory_notices(&h).is_empty(), "warning shows nothing");
+    core.apply_pressure(PressureLevel::Critical);
+    core.apply_pressure(PressureLevel::Critical);
+    assert_eq!(
+        memory_notices(&h),
+        vec![Some(MEMORY_NOTICE_SENTENCE.to_owned())],
+        "once"
+    );
+    core.apply_pressure(PressureLevel::Normal);
+    core.apply_pressure(PressureLevel::Critical);
+    assert_eq!(
+        memory_notices(&h),
+        vec![
+            Some(MEMORY_NOTICE_SENTENCE.to_owned()),
+            None,
+            Some(MEMORY_NOTICE_SENTENCE.to_owned())
+        ]
+    );
+    // The event on the wire: the sentence, or null.
+    let on_wire = serde_json::to_value(crate::wire::MemoryNotice { message: None }).expect("json");
+    assert_eq!(on_wire, json!({ "message": null }));
+}
+
+#[test]
+fn the_app_starts_the_pressure_poll_with_its_source_and_quitting_ends_it() {
+    use std::sync::Mutex;
+    use ym_core::memory::{MEMORY_NOTICE_SENTENCE, PressureLevel, PressureSource};
+    let levels = Mutex::new(std::collections::VecDeque::from([
+        PressureLevel::Critical,
+        PressureLevel::Normal,
+    ]));
+    let probe = Arc::new(());
+    let held = Arc::clone(&probe);
+    let source = PressureSource::new(move || {
+        let _held = &held;
+        levels
+            .lock()
+            .expect("levels")
+            .pop_front()
+            .unwrap_or(PressureLevel::Normal)
+    });
+    let h = Harness::with_pressure(source);
+    // The poll reads at once and then every two seconds: the first two readings come in the first tick or two; what the page
+    // is told is the notice and its going, in that order, whatever the pace.
+    wait_until("the notice to come and go", || {
+        memory_notices(&h).len() == 2
+    });
+    assert_eq!(
+        memory_notices(&h),
+        vec![Some(MEMORY_NOTICE_SENTENCE.to_owned()), None]
+    );
+    // Quitting ends the thread: it lets go of the source.
+    h.api.shutdown();
+    assert_eq!(Arc::strong_count(&probe), 1);
+}
+
+#[test]
+fn the_thumbnail_refresher_waits_while_memory_is_critical_and_goes_on_when_it_falls() {
+    use ym_core::memory::PressureLevel;
+    let h = Harness::new();
+    h.open(2);
+    let state = h.develop();
+    wait_until("the first thumbnails", || {
+        h.events
+            .events()
+            .iter()
+            .filter(|e| matches!(e, AppEvent::ThumbnailReady(_)))
+            .count()
+            >= 2
+    });
+    assert!(h.api.thumbnails().wait_idle(WAIT));
+    let announced = || {
+        h.events
+            .events()
+            .iter()
+            .filter(|e| matches!(e, AppEvent::ThumbnailReady(_)))
+            .count()
+    };
+    let before = announced();
+    h.api.core().apply_pressure(PressureLevel::Critical);
+    h.api
+        .thumbnails()
+        .refresh([ym_core::session::PhotoId(state.photos[0].id.0)]);
+    // The refresher has found the gate paused and is waiting in it: it cannot have rendered anything.
+    wait_until("the refresher to wait", || {
+        h.api.thumbnails().gate_waits() >= 1
+    });
+    assert_eq!(announced(), before);
+    // The level falls: the refresh goes on.
+    h.api.core().apply_pressure(PressureLevel::Normal);
+    wait_until("the refreshed thumbnail", || announced() > before);
+    assert!(h.api.thumbnails().wait_idle(WAIT));
+}
+
 // --- Thumbnails -------------------------------------------------------------------------------
 
 #[test]
@@ -1500,9 +2576,9 @@ fn the_filmstrip_thumbnail_follows_a_look_change() {
 
     // A crop shows in the thumbnail, so it refreshes it; an exposure change does not.
     let a1 = count_for(a);
-    let crop: SettingsPatch = serde_json::from_value(json!({
+    let crop: SettingsPatch = serde_json::from_value(field_patch(json!({
         "crop": { "rect": { "x": 0, "y": 0, "width": 0.5, "height": 0.5 }, "angle_deg": 0, "aspect": "free" }
-    }))
+    })))
     .expect("crop");
     h.api.update_settings(a, &crop).expect("crop");
     wait_until("a thumbnail of the crop", || count_for(a) > a1);
@@ -1511,9 +2587,10 @@ fn the_filmstrip_thumbnail_follows_a_look_change() {
     // An exposure change is not asked for again: wait longer than the thumbnails collect requests
     // before looking.
     let a2 = count_for(a);
-    let exposure: SettingsPatch =
-        serde_json::from_value(json!({ "exposure": { "kind": "manual", "ev": 1.0 } }))
-            .expect("exposure");
+    let exposure: SettingsPatch = serde_json::from_value(field_patch(
+        json!({ "exposure": { "kind": "manual", "ev": 1.0 } }),
+    ))
+    .expect("exposure");
     h.api.update_settings(a, &exposure).expect("exposure");
     std::thread::sleep(Duration::from_millis(700));
     assert!(h.api.thumbnails().wait_idle(WAIT));
@@ -1797,13 +2874,14 @@ fn the_look_file_libraries_are_the_packages_they_are_the_looks_of() {
     assert_eq!(PackageId::from_data_id("look-library-logc5"), None);
     for id in [
         PackageId::LookLibraryLogc4,
-        PackageId::DisplayLutsLogc4,
         PackageId::LookLibraryLogc3,
         PackageId::LookLibraryLogc3ToRec709,
-        PackageId::DisplayLutsLogc3,
     ] {
         assert_eq!(PackageId::from_data_id(id.data_id()), Some(id));
     }
+    // ARRI's display LUT packages are not offered: they are no package of the wizard.
+    assert_eq!(PackageId::from_data_id("display-luts-logc4"), None);
+    assert_eq!(PackageId::from_data_id("display-luts-logc3"), None);
 }
 
 #[test]
@@ -1932,7 +3010,6 @@ fn preferences_round_trip_and_nothing_else_is_written() {
     let h = Harness::new();
     let prefs = h.api.preferences_get().expect("prefs");
     assert_eq!(prefs.default_look.0, "builtin:signature");
-    assert_eq!(prefs.display_rendering, DisplayRendering::Aces2);
     assert!(prefs.check_for_updates_automatically && !prefs.remove_location_from_exports);
     // Reading creates nothing.
     assert_eq!(
@@ -1966,6 +3043,26 @@ fn preferences_round_trip_and_nothing_else_is_written() {
     );
 }
 
+/// "Single-key shortcuts" (`docs/28` A-P11) crosses the bridge: on by default, saved when it is
+/// turned off, and still off when the app starts again over the same folder.
+#[test]
+fn single_key_shortcuts_are_on_by_default_and_survive_a_restart() {
+    let h = Harness::new();
+    assert!(h.api.preferences_get().expect("prefs").single_key_shortcuts);
+    let patch: PreferencesPatch =
+        serde_json::from_value(json!({ "single_key_shortcuts": false })).expect("patch");
+    assert!(
+        !h.api
+            .preferences_set(&patch)
+            .expect("set")
+            .single_key_shortcuts
+    );
+    let saved = std::fs::read_to_string(h.app_root.path().join("preferences.json")).expect("file");
+    assert!(saved.contains("\"single_key_shortcuts\": false"), "{saved}");
+    let again = ym_core::preferences::PreferencesStore::open(h.app_root.path());
+    assert!(!again.get().single_key_shortcuts);
+}
+
 /// An advisor that is always available and gives the same answer, or the same failure, for every
 /// picture (`docs/19` section 12).
 struct Scripted(Result<ym_core::apple_auto::AdvisorAnswer, ym_core::apple_auto::AdvisorError>);
@@ -1983,6 +3080,20 @@ impl ym_core::apple_auto::AutoAdvisor for Scripted {
         _: &str,
     ) -> Result<ym_core::apple_auto::AdvisorAnswer, ym_core::apple_auto::AdvisorError> {
         self.0.clone()
+    }
+}
+
+/// What `Scripted` says about itself on the wire: Apple Intelligence's shape, model `Scripted`.
+fn scripted_info(sha: &str) -> AppleAutoInfo {
+    AppleAutoInfo {
+        provider: AutoProvider::Apple,
+        model: "Scripted".into(),
+        os: "test".into(),
+        tool_version: None,
+        api: None,
+        prompt: 3,
+        instructions: crate::wire::AppleAutoInstructions::Default,
+        instructions_sha256: sha.to_owned(),
     }
 }
 
@@ -2010,23 +3121,27 @@ fn apple_auto_reaches_the_webview_through_the_settings_the_status_and_settings_c
         },
         scene: "A grey gradient".into(),
         plan: "Teal shadows, more contrast".into(),
+        served_model: None,
     };
     let h = Harness::with_advisor(Arc::new(Scripted(Ok(answer))));
-    let status = h.api.apple_auto_status().expect("status");
-    assert!(status.available && status.active && status.preference);
-    assert_eq!(status.reason, None);
-    let sha = ym_core::apple_auto::InstructionsId::default().instructions_sha256;
+    let status = h.api.auto_status().expect("status");
+    assert!(status.visible && status.active);
     assert_eq!(
-        status.info,
-        Some(AppleAutoInfo {
-            model: "Scripted".into(),
-            os: "test".into(),
-            instructions: crate::wire::AppleAutoInstructions::Default,
-            instructions_sha256: sha.clone(),
-        })
+        (status.preference, status.chosen, status.effective),
+        (
+            AutoProvider::Apple,
+            AutoProvider::Apple,
+            AutoProvider::Apple
+        )
     );
-    assert_eq!(status.mode, AppleAutoMode::FromPreference);
-    assert_eq!((status.prompt, status.table), (3, 2));
+    let apple = &status.providers[1];
+    assert_eq!(apple.provider, AutoProvider::Apple);
+    assert_eq!(apple.state, ProviderState::Available);
+    assert_eq!(apple.reason, None);
+    assert!(apple.listed && apple.selectable && apple.consent && !apple.experimental);
+    let sha = ym_core::apple_auto::InstructionsId::default().instructions_sha256;
+    assert_eq!(apple.info, Some(scripted_info(&sha)));
+    assert_eq!(status.table, 2);
     assert_eq!(status.own_instructions, "");
     assert_eq!(
         status.default_instructions,
@@ -2069,75 +3184,97 @@ fn apple_auto_reaches_the_webview_through_the_settings_the_status_and_settings_c
     assert_eq!(answer.scene, "A grey gradient");
     assert_eq!(answer.plan, "Teal shadows, more contrast");
     assert_eq!(rs.estimates.apple_steps, Some(answer.steps));
-    assert_eq!(rs.estimates.highlights, Num(-20.0));
-    assert_eq!(rs.values.highlights, Num(-20.0));
-    assert_eq!(rs.settings.highlights, PercentSetting::Auto);
-    assert!(rs.auto.highlights && rs.auto.balance_shadows);
+    assert_eq!(rs.estimates.main.highlights, Num(-20.0));
+    assert_eq!(rs.values.main.grade.highlights, Num(-20.0));
+    assert_eq!(rs.settings.main_grade().highlights, PercentSetting::Auto);
+    assert!(rs.auto.main.highlights && rs.auto.main.balance_shadows);
     assert_eq!(
-        rs.values.color_balance.shadows,
+        rs.values.main.grade.color_balance.shadows,
         [Num(-0.866 * 0.55), Num(-0.5 * 0.55)]
     );
     assert_eq!(info.model, "Scripted");
     assert_eq!(rs.estimates.source, AutoSource::Apple);
+    assert_eq!(rs.estimates.provider, AutoProvider::Apple);
     assert_eq!(
-        (rs.estimates.contrast, rs.estimates.saturation),
+        (rs.estimates.main.contrast, rs.estimates.main.saturation),
         (Num(30.0), Num(-15.0))
     );
-    assert_eq!(rs.settings.contrast, PercentSetting::Auto);
-    assert!(rs.auto.contrast && rs.auto.saturation);
+    assert_eq!(rs.settings.main_grade().contrast, PercentSetting::Auto);
+    assert!(rs.auto.main.contrast && rs.auto.main.saturation);
     assert_eq!(
-        (rs.values.contrast, rs.values.saturation),
+        (
+            rs.values.main.grade.contrast,
+            rs.values.main.grade.saturation
+        ),
         (Num(30.0), Num(-15.0))
     );
 
     // A manual value wins over the answer; Re-run puts contrast and saturation back to Auto.
-    let manual: SettingsPatch = serde_json::from_value(json!({
+    let manual: SettingsPatch = serde_json::from_value(field_patch(json!({
         "contrast": { "kind": "manual", "value": -10 },
         "saturation": { "kind": "manual", "value": 5 }
-    }))
+    })))
     .expect("patch");
     let edited = h.api.update_settings(id, &manual).expect("update");
-    assert!(!edited.auto.contrast && !edited.auto.saturation);
+    assert!(!edited.auto.main.contrast && !edited.auto.main.saturation);
     assert_eq!(
-        (edited.values.contrast, edited.values.saturation),
+        (
+            edited.values.main.grade.contrast,
+            edited.values.main.grade.saturation
+        ),
         (Num(-10.0), Num(5.0))
     );
-    assert_eq!(edited.estimates.contrast, Num(30.0), "the Auto value stays");
+    assert_eq!(
+        edited.estimates.main.contrast,
+        Num(30.0),
+        "the Auto value stays"
+    );
     let rerun = h.api.rerun_auto(id).expect("rerun");
-    assert!(rerun.auto.contrast && rerun.auto.saturation);
-    assert_eq!(rerun.settings.saturation, PercentSetting::Auto);
+    assert!(rerun.auto.main.contrast && rerun.auto.main.saturation);
+    assert_eq!(rerun.settings.main_grade().saturation, PercentSetting::Auto);
     wait_until("the answer after Re-run", || {
         matches!(apple_state(&h, id), AppleAuto::Answered { .. })
     });
 
-    // The preference off: every photo back to the rule at once, and the webview is told.
+    // Default Auto chosen: every photo back to the rule at once, and the webview is told.
     let asks = h.api.core().session.apple_auto_asks();
     let before = h.events.events().len();
     let prefs = h
         .api
-        .preferences_set(&prefs_patch(json!({ "apple_auto": false })))
+        .preferences_set(&prefs_patch(json!({ "auto_provider": "yellowmoon" })))
         .expect("off");
-    assert!(!prefs.apple_auto);
+    assert_eq!(prefs.auto_provider, AutoProvider::Yellowmoon);
     let off = h.api.get_settings(id).expect("settings");
     assert_eq!(off.estimates.apple, AppleAuto::Off);
     assert_eq!(off.estimates.source, AutoSource::Rule);
     assert_eq!(
-        (off.values.contrast, off.values.saturation),
+        (
+            off.values.main.grade.contrast,
+            off.values.main.grade.saturation
+        ),
         (Num(0.0), Num(0.0))
     );
     wait_until("settings_changed for the preference", || {
         h.events.events()[before..].contains(&AppEvent::SettingsChanged(id))
     });
-    let status = h.api.apple_auto_status().expect("status");
-    assert!(status.available && !status.active && !status.preference);
+    let status = h.api.auto_status().expect("status");
+    assert!(status.visible && !status.active);
+    assert_eq!(
+        (status.preference, status.effective),
+        (AutoProvider::Yellowmoon, AutoProvider::Yellowmoon)
+    );
+    assert_eq!(status.providers[1].state, ProviderState::Available);
 
-    // On again: the answer was kept, so nothing is asked again.
+    // Apple Intelligence again: the answer was kept, so nothing is asked again.
     h.api
-        .preferences_set(&prefs_patch(json!({ "apple_auto": true })))
+        .preferences_set(&prefs_patch(json!({ "auto_provider": "apple" })))
         .expect("on");
     assert!(matches!(apple_state(&h, id), AppleAuto::Answered { .. }));
     assert_eq!(h.api.core().session.apple_auto_asks(), asks);
-    assert!(h.api.preferences_get().expect("prefs").apple_auto);
+    assert_eq!(
+        h.api.preferences_get().expect("prefs").auto_provider,
+        AutoProvider::Apple
+    );
 
     // New instructions: saved, every photo asked again; too long: refused with a plain message.
     let asks = h.api.core().session.apple_auto_asks();
@@ -2159,7 +3296,7 @@ fn apple_auto_reaches_the_webview_through_the_settings_the_status_and_settings_c
         h.api.core().session.apple_auto_asks() > asks
             && matches!(apple_state(&h, id), AppleAuto::Answered { .. })
     });
-    let status = h.api.apple_auto_status().expect("status");
+    let status = h.api.auto_status().expect("status");
     assert_eq!(
         status.instructions,
         crate::wire::AppleAutoInstructions::Edited
@@ -2199,36 +3336,36 @@ fn a_failed_question_crosses_the_bridge_and_auto_stays_the_rule() {
         AppleAuto::Failed {
             kind: AppleAutoFailure::Refused,
             message: "Not this one.".into(),
-            info: AppleAutoInfo {
-                model: "Scripted".into(),
-                os: "test".into(),
-                instructions: crate::wire::AppleAutoInstructions::Default,
-                instructions_sha256: ym_core::apple_auto::InstructionsId::default()
-                    .instructions_sha256,
-            }
+            info: scripted_info(
+                &ym_core::apple_auto::InstructionsId::default().instructions_sha256
+            ),
         }
     );
     assert_eq!(rs.estimates.source, AutoSource::Rule);
     assert_eq!(
-        (rs.estimates.contrast, rs.estimates.saturation),
+        (rs.estimates.main.contrast, rs.estimates.main.saturation),
         (Num(0.0), Num(0.0))
     );
 }
 
 #[test]
-fn without_an_advisor_apple_auto_is_off_and_its_row_stays_hidden() {
+fn without_an_advisor_every_provider_is_off_and_the_row_stays_hidden() {
     let h = Harness::new();
-    let status = h.api.apple_auto_status().expect("status");
-    assert!(!status.available && !status.active);
-    assert_eq!(status.reason, None);
-    assert_eq!(status.info, None);
+    let status = h.api.auto_status().expect("status");
+    assert!(!status.visible && !status.active);
+    assert_eq!(status.effective, AutoProvider::Yellowmoon);
+    for provider in &status.providers[1..] {
+        assert_eq!(provider.state, ProviderState::NotInstalled);
+        assert_eq!(provider.info, None);
+        assert!(!provider.listed && !provider.selectable);
+    }
     h.open(1);
     h.develop();
     let rs = h.api.get_settings(h.first()).expect("settings");
     assert_eq!(rs.estimates.apple, AppleAuto::Off);
     assert_eq!(rs.estimates.source, AutoSource::Rule);
-    assert_eq!(rs.settings.contrast, PercentSetting::Auto);
-    assert!(rs.auto.contrast && rs.auto.saturation);
+    assert_eq!(rs.settings.main_grade().contrast, PercentSetting::Auto);
+    assert!(rs.auto.main.contrast && rs.auto.main.saturation);
 }
 
 #[test]
@@ -2241,16 +3378,731 @@ fn the_system_advisor_off_apple_silicon_says_why_it_is_not_available() {
         return;
     }
     let h = Harness::with_advisor(ym_apple::system_advisor());
-    let status = h.api.apple_auto_status().expect("status");
-    assert!(!status.available && !status.active);
+    let status = h.api.auto_status().expect("status");
+    assert!(!status.visible && !status.active);
+    let apple = &status.providers[1];
+    assert_eq!(apple.state, ProviderState::Unavailable);
+    assert!(!apple.listed && !apple.selectable);
     assert!(
         matches!(
-            status.reason,
+            apple.reason,
             Some(AppleAutoReason::NotAMac | AppleAutoReason::IntelMac)
         ),
         "{:?}",
-        status.reason
+        apple.reason
     );
+}
+
+/// The providers of a computer: Apple Intelligence switched off, Claude Code signed in and
+/// Antigravity not, as scripted fakes (`docs/22` section 12.9).
+fn a_computer_with_claude_signed_in() -> (
+    ym_core::auto_provider::ProviderAdvisors,
+    Arc<ym_core::auto_provider::FakeProvider>,
+    Arc<ym_core::auto_provider::FakeProvider>,
+) {
+    use ym_core::apple_auto::{Availability, UnavailableReason};
+    use ym_core::auto_provider::{AutoProvider as Core, FakeProvider, ProviderAdvisors};
+    let apple = FakeProvider::new(
+        Core::Apple,
+        Availability::Unavailable(UnavailableReason::AppleIntelligenceOff),
+    );
+    let claude = Arc::new(FakeProvider::available(Core::Claude).with_served_model("claude-fake-1"));
+    let agy = Arc::new(FakeProvider::new(
+        Core::Agy,
+        Availability::Unavailable(UnavailableReason::SignedOut),
+    ));
+    let advisors = ProviderAdvisors::default()
+        .with(Core::Apple, Arc::new(apple))
+        .with(Core::Claude, claude.clone())
+        .with(Core::Agy, agy.clone());
+    (advisors, claude, agy)
+}
+
+/// A program's advisor that is always available and counts how often the core asked it to probe:
+/// `refreshes` for a check the app started by itself, `asked` for the one a person's Preferences
+/// opening asks for (`AutoAdvisor::refresh_asked`; for `agy` the check that contacts its service).
+struct Probing {
+    refreshes: std::sync::atomic::AtomicUsize,
+    asked: std::sync::atomic::AtomicUsize,
+}
+
+impl Probing {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            refreshes: 0.into(),
+            asked: 0.into(),
+        })
+    }
+
+    fn probes(&self) -> (usize, usize) {
+        use std::sync::atomic::Ordering::SeqCst;
+        (self.refreshes.load(SeqCst), self.asked.load(SeqCst))
+    }
+}
+
+impl ym_core::apple_auto::AutoAdvisor for Probing {
+    fn availability(&self) -> ym_core::apple_auto::Availability {
+        ym_core::apple_auto::Availability::Available(
+            ym_core::auto_provider::FakeProvider::info_for(
+                ym_core::auto_provider::AutoProvider::Claude,
+            ),
+        )
+    }
+
+    fn ask(
+        &self,
+        _: &ym_core::apple_auto::AdvisorPicture,
+        _: &str,
+    ) -> Result<ym_core::apple_auto::AdvisorAnswer, ym_core::apple_auto::AdvisorError> {
+        Err(ym_core::apple_auto::AdvisorError::new(
+            ym_core::apple_auto::FailureKind::CliFailed,
+            "not asked in this test",
+        ))
+    }
+
+    fn refresh(&self) {
+        self.refreshes
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn refresh_asked(&self) {
+        self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[test]
+fn the_cached_status_asks_no_program_to_check_anything_and_only_the_full_one_does() {
+    // `docs/22` section 3.3 and D7: only Preferences opening makes the programs probe (`agy`'s
+    // sign-in check contacts its service). Typing instructions saves a preference about every five
+    // seconds, and the webview reads the cached status after each save and on every
+    // `auto_status_changed`: none of that may start a probe of a program nobody chose.
+    use ym_core::auto_provider::{AutoProvider as Core, ProviderAdvisors};
+    let (claude, agy) = (Probing::new(), Probing::new());
+    let advisors = ProviderAdvisors::default()
+        .with(Core::Claude, claude.clone())
+        .with(Core::Agy, agy.clone());
+    let h = Harness::with_advisors(advisors);
+    let (claude_before, agy_before) = (claude.probes(), agy.probes());
+
+    let cached = h.api.auto_status_cached().expect("cached status");
+    assert_eq!(cached.providers.len(), 4);
+    assert!(cached.visible, "a program is there: {cached:?}");
+    for text in ["Make it warmer.", "Make it warmer and brighter.", ""] {
+        h.api
+            .preferences_set(&prefs_patch(json!({ "apple_auto_instructions": text })))
+            .expect("instructions");
+        h.api.auto_status_cached().expect("cached status");
+    }
+    h.api
+        .preferences_set(&prefs_patch(json!({ "auto_provider": "yellowmoon" })))
+        .expect("choice");
+    let after = h.api.auto_status_cached().expect("cached status");
+    assert_eq!(after.preference, AutoProvider::Yellowmoon);
+    assert_eq!(
+        (claude.probes(), agy.probes()),
+        (claude_before, agy_before),
+        "no program was asked to check anything"
+    );
+
+    // The full status is what Preferences opening asks for: every program checks, once each.
+    let full = h.api.auto_status().expect("status");
+    assert_eq!(full.preference, AutoProvider::Yellowmoon);
+    assert_eq!(claude.probes().1, claude_before.1 + 1);
+    assert_eq!(agy.probes().1, agy_before.1 + 1);
+    // Reading it from the cache afterwards says the same and asks nothing more.
+    assert_eq!(h.api.auto_status_cached().expect("cached status"), full);
+    assert_eq!(claude.probes().1, claude_before.1 + 1);
+    assert_eq!(agy.probes().1, agy_before.1 + 1);
+}
+
+/// Whether a process of this id still exists (a zombie that was not reaped yet counts).
+#[cfg(unix)]
+fn process_exists(pid: i32) -> bool {
+    std::process::Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+/// What one run of a test double was, from its record (`YM_FAKE_RECORD/run-NNNN/argv.txt`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DoubleRun {
+    /// `--version`.
+    Version,
+    /// `claude auth status`, or `agy -p /usage` (the sign-in check).
+    SignInCheck,
+    /// A request for a photo's grading.
+    Request,
+}
+
+/// The runs a double has made so far, oldest first.
+fn double_runs(record: &Path) -> Vec<DoubleRun> {
+    let mut names: Vec<_> = std::fs::read_dir(record)
+        .map(|entries| {
+            entries
+                .filter_map(|e| e.ok()?.file_name().into_string().ok())
+                .filter(|name| name.starts_with("run-"))
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
+    names
+        .iter()
+        .map(|name| {
+            let argv =
+                std::fs::read_to_string(record.join(name).join("argv.txt")).unwrap_or_default();
+            let argv: Vec<&str> = argv.lines().collect();
+            if argv == ["--version"] {
+                DoubleRun::Version
+            } else if argv == ["auth", "status"] || argv.starts_with(&["-p", "/usage"]) {
+                DoubleRun::SignInCheck
+            } else {
+                DoubleRun::Request
+            }
+        })
+        .collect()
+}
+
+/// `ym-auto-*` folders in `temp`: what a request leaves behind until it has ended.
+fn request_folders(temp: &Path) -> usize {
+    std::fs::read_dir(temp)
+        .map(|entries| {
+            entries
+                .filter_map(|e| e.ok()?.file_name().into_string().ok())
+                .filter(|name| name.starts_with("ym-auto-"))
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+#[test]
+fn the_app_builds_its_advisors_without_starting_a_probe() {
+    // Owner, 2026-10-29: "only instantiate CLIs when we need grading and immediately close them after
+    // finish" (`docs/22` sections 0 and 3.3). Launching the app builds the programs' advisors with
+    // `StartProbe::Never`: `StartProbe::Now` would run `claude --version`, `claude auth status` and
+    // `agy --version` at every launch, whatever the person chose.
+    assert_eq!(LAUNCH_PROBE, ym_agents::StartProbe::Never);
+    // What the app hands the core: nothing has checked anything, so nothing is known.
+    let advisors = system_advisors();
+    for provider in [
+        ym_core::auto_provider::AutoProvider::Claude,
+        ym_core::auto_provider::AutoProvider::Agy,
+    ] {
+        let advisor = advisors.get(provider).expect("the program's advisor");
+        assert_eq!(
+            advisor.availability(),
+            ym_core::apple_auto::Availability::Unavailable(
+                ym_core::apple_auto::UnavailableReason::Checking
+            ),
+            "{provider:?} reads checking until something asks it to check"
+        );
+        assert_eq!(
+            advisor.details().path,
+            None,
+            "{provider:?} was not even looked for"
+        );
+    }
+}
+
+#[test]
+fn a_program_is_started_when_photos_need_grading_and_when_preferences_opens_and_not_at_launch() {
+    // The owner's choice of 2026-10-29, "Preferences + before grading": launching the app starts no
+    // program; opening photos checks the chosen one (version, sign-in), then asks it once per photo;
+    // opening Preferences checks every program; a program is closed when it has answered
+    // (`docs/22` section 3.3). The doubles record every run.
+    use ym_agents::advisor::Source;
+    use ym_agents::tool::{Tool, Tuning};
+    use ym_core::auto_provider::{AutoProvider as Core, ProviderAdvisors};
+    let (Some(claude_double), Some(agy_double)) = (
+        ym_agents::testing::require_fake_cli(Tool::Claude),
+        ym_agents::testing::require_fake_cli(Tool::Agy),
+    ) else {
+        return;
+    };
+    let scratch = tempfile::tempdir().expect("scratch");
+    let temp = scratch.path().join("tmp");
+    std::fs::create_dir(&temp).expect("temporary folder");
+    let (claude_record, agy_record) = (scratch.path().join("claude"), scratch.path().join("agy"));
+    // No minimum interval between two checks, so that a check the core should not have asked for would
+    // be a run of the double, not swallowed by the advisor.
+    let tuning_for = |tool: Tool, record: &Path| {
+        let mut tuning =
+            Tuning::for_tool(tool).with_env("YM_FAKE_RECORD", &record.to_string_lossy());
+        tuning.temp_dir = Some(temp.clone());
+        tuning.min_interval = Duration::ZERO;
+        tuning
+    };
+    let claude = ym_agents::ClaudeAdvisor::custom(
+        Source::Program(claude_double),
+        tuning_for(Tool::Claude, &claude_record),
+    );
+    let agy = ym_agents::AgyAdvisor::custom(
+        Source::Program(agy_double),
+        tuning_for(Tool::Agy, &agy_record),
+    );
+    // The saved choice is Claude Code, agreed to: the person who quits and starts the app again.
+    let h = Harness::with_preferences_file(
+        ProviderAdvisors::default()
+            .with(Core::Claude, claude)
+            .with(Core::Agy, agy),
+        r#"{ "auto_provider": "claude", "auto_consent": { "claude": true, "agy": false } }"#,
+    );
+    let runs = |record: &Path| double_runs(record);
+    let nothing: Vec<DoubleRun> = Vec::new();
+
+    // Launch: the core is open with the saved choice. Nothing was started, and reading the status the
+    // webview reads after the preferences change starts nothing either.
+    assert_eq!(runs(&claude_record), nothing);
+    assert_eq!(runs(&agy_record), nothing);
+    h.api.auto_status_cached().expect("cached status");
+    h.api
+        .preferences_set(&prefs_patch(
+            json!({ "apple_auto_instructions": "Moodier." }),
+        ))
+        .expect("instructions");
+    h.api.auto_status_cached().expect("cached status");
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(runs(&claude_record), nothing, "nothing runs at launch");
+    assert_eq!(runs(&agy_record), nothing);
+
+    // Photos are opened: the chosen program is checked (its version, its sign-in), then asked about
+    // the photo. The program the person did not choose is left alone.
+    h.open(1);
+    h.develop();
+    let id = h.first();
+    wait_until("Claude Code to answer", || {
+        matches!(apple_state(&h, id), AppleAuto::Answered { .. })
+    });
+    assert_eq!(
+        runs(&claude_record),
+        [
+            DoubleRun::Version,
+            DoubleRun::SignInCheck,
+            DoubleRun::Request
+        ],
+        "the check first, then one request"
+    );
+    assert_eq!(
+        runs(&agy_record),
+        nothing,
+        "only the chosen program is started"
+    );
+    // Closed when it has answered: its temporary folder is gone, and (the double exited by itself) so
+    // is the program: its record holds no run that is still going.
+    wait_until("the request's folder to go", || request_folders(&temp) == 0);
+
+    // More photos while it reads available: the cached reading serves, so no new check, only the
+    // request for the new photo.
+    crate::testing::write_arw(h.photos.path(), "DSC00002.ARW", 2);
+    h.api
+        .open_paths(&[h.photos.path().to_string_lossy().into_owned()])
+        .expect("open the folder again");
+    wait_until("the second photo's answer", || {
+        double_runs(&claude_record)
+            .iter()
+            .filter(|r| **r == DoubleRun::Request)
+            .count()
+            == 2
+    });
+    assert_eq!(
+        runs(&claude_record),
+        [
+            DoubleRun::Version,
+            DoubleRun::SignInCheck,
+            DoubleRun::Request,
+            DoubleRun::Request
+        ],
+        "no second check while it reads available"
+    );
+    wait_until("the request's folder to go", || request_folders(&temp) == 0);
+
+    // Opening Preferences is the person's own check of every program: Antigravity is started now, for
+    // its version and its sign-in check, and no photo is asked about.
+    h.api.auto_status().expect("status");
+    wait_until("Antigravity to be checked", || {
+        runs(&agy_record) == [DoubleRun::Version, DoubleRun::SignInCheck]
+    });
+    assert!(
+        !runs(&agy_record).contains(&DoubleRun::Request),
+        "a check sends no picture"
+    );
+    wait_until("the checks to end", || request_folders(&temp) == 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn quitting_stops_a_request_that_is_running_and_leaves_no_program_and_no_folder() {
+    // `docs/22` sections 9.4 and 12.10: a child is not stopped by its parent's death on Unix, so the
+    // quit path (`AppApi::shutdown`) ends the programs Auto started and returns only after they are
+    // reaped and their temporary folders removed: the process ends as soon as it returns.
+    use ym_agents::advisor::Source;
+    use ym_agents::tool::{Tool, Tuning};
+    use ym_core::auto_provider::{AutoProvider as Core, ProviderAdvisors};
+    let Some(double) = ym_agents::testing::require_fake_cli(Tool::Claude) else {
+        return;
+    };
+    let scratch = tempfile::tempdir().expect("scratch");
+    let temp = scratch.path().join("tmp");
+    std::fs::create_dir(&temp).expect("temporary folder");
+    let pidfile = scratch.path().join("pids");
+    // The double's `slow` scenario: it starts a grandchild, writes both pids and sleeps for ten minutes.
+    let mut tuning = Tuning::for_tool(Tool::Claude)
+        .with_env("YM_FAKE_SCENARIO", "slow")
+        .with_env("YM_FAKE_PIDFILE", &pidfile.to_string_lossy());
+    tuning.temp_dir = Some(temp.clone());
+    let claude = ym_agents::ClaudeAdvisor::custom(Source::Program(double), tuning);
+    let h = Harness::with_advisors(ProviderAdvisors::default().with(Core::Claude, claude));
+    h.api
+        .preferences_set(&prefs_patch(json!({
+            "auto_provider": "claude", "auto_consent": { "claude": true, "agy": false }
+        })))
+        .expect("agreed");
+    h.open(1);
+    let pids = || -> Vec<i32> {
+        std::fs::read_to_string(&pidfile)
+            .unwrap_or_default()
+            .split_whitespace()
+            .filter_map(|p| p.parse().ok())
+            .collect()
+    };
+    wait_until("the request to start", || pids().len() >= 2);
+    let pids = pids();
+    assert!(
+        pids.iter().all(|p| process_exists(*p)),
+        "the double and its grandchild run: {pids:?}"
+    );
+    let folders = || -> Vec<String> {
+        std::fs::read_dir(&temp)
+            .expect("temporary folder")
+            .filter_map(|e| e.ok()?.file_name().into_string().ok())
+            .filter(|name| name.starts_with("ym-auto-"))
+            .collect()
+    };
+    assert!(
+        !folders().is_empty(),
+        "the request works in a folder of its own"
+    );
+
+    h.api.shutdown();
+
+    // Nothing is left when it returns: the double is reaped (not even a zombie) and its folder is gone.
+    assert!(
+        !process_exists(pids[0]),
+        "the program is still there after shutdown: {pids:?}"
+    );
+    assert_eq!(
+        folders(),
+        Vec::<String>::new(),
+        "the request's folder is left"
+    );
+    // Its grandchild is killed with the group; init reaps it, which may take a moment.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while process_exists(pids[1]) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the grandchild is still running: {pids:?}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn auto_status_lists_every_provider_the_way_the_dropdown_shows_them() {
+    let (advisors, _claude, _agy) = a_computer_with_claude_signed_in();
+    let h = Harness::with_advisors(advisors);
+    let status = h.api.auto_status().expect("status");
+    // The row shows: a program is there. The saved choice is Apple Intelligence, which is off, so
+    // Default Auto grades and the choice stays.
+    assert!(status.visible && !status.active);
+    assert_eq!(
+        (status.preference, status.chosen, status.effective),
+        (
+            AutoProvider::Apple,
+            AutoProvider::Apple,
+            AutoProvider::Yellowmoon
+        )
+    );
+    assert_eq!(
+        status.consent,
+        AutoConsent {
+            claude: false,
+            agy: false
+        }
+    );
+    let shown: Vec<_> = status
+        .providers
+        .iter()
+        .map(|p| (p.provider, p.state, p.listed, p.selectable, p.experimental))
+        .collect();
+    assert_eq!(
+        shown,
+        [
+            (
+                AutoProvider::Yellowmoon,
+                ProviderState::Available,
+                true,
+                true,
+                false
+            ),
+            (
+                AutoProvider::Apple,
+                ProviderState::Unavailable,
+                false,
+                false,
+                false
+            ),
+            (
+                AutoProvider::Claude,
+                ProviderState::Available,
+                true,
+                true,
+                false
+            ),
+            (
+                AutoProvider::Agy,
+                ProviderState::SignedOut,
+                true,
+                false,
+                true
+            ),
+        ]
+    );
+    assert_eq!(
+        status.providers[1].reason,
+        Some(AppleAutoReason::AppleIntelligenceOff)
+    );
+    assert_eq!(status.providers[3].reason, Some(AppleAutoReason::SignedOut));
+    // The program's own details: who answers, which version, where its pictures go, which prompt.
+    let sha = ym_core::apple_auto::InstructionsId::default().instructions_sha256;
+    assert_eq!(
+        status.providers[2].info,
+        Some(AppleAutoInfo {
+            provider: AutoProvider::Claude,
+            model: "Test Claude Code".into(),
+            os: String::new(),
+            tool_version: Some("0.0.0-test".into()),
+            api: None,
+            prompt: 1,
+            instructions: crate::wire::AppleAutoInstructions::Default,
+            instructions_sha256: sha,
+        })
+    );
+    // Nothing of the program's place on disk is on the wire.
+    let json = serde_json::to_value(&status).expect("json");
+    assert!(json["providers"][2].get("path").is_none());
+    assert!(json.get("choice").is_none());
+    assert_eq!(h.api.app_info().os, std::env::consts::OS);
+}
+
+#[test]
+fn a_program_is_chosen_with_its_consent_in_one_patch_and_never_without_it() {
+    let (advisors, _claude, _agy) = a_computer_with_claude_signed_in();
+    let h = Harness::with_advisors(advisors);
+    let err = h
+        .api
+        .preferences_set(&prefs_patch(json!({ "auto_provider": "claude" })))
+        .expect_err("no consent yet");
+    // (The preferences go through the look service, so the scope is the one every refused patch has.)
+    assert_eq!(
+        err.message,
+        "Say yes to sending photos to Claude Code first."
+    );
+    let err = h
+        .api
+        .preferences_set(&prefs_patch(json!({
+            "auto_provider": "agy", "auto_consent": { "claude": true, "agy": false }
+        })))
+        .expect_err("not for this program");
+    assert_eq!(
+        err.message,
+        "Say yes to sending photos to Antigravity first."
+    );
+    let prefs = h.api.preferences_get().expect("prefs");
+    assert_eq!(prefs.auto_provider, AutoProvider::Apple, "nothing changed");
+    assert_eq!(
+        prefs.auto_consent,
+        AutoConsent {
+            claude: false,
+            agy: false
+        }
+    );
+
+    // One patch, the choice and the consent: saved, and Claude Code grades.
+    let prefs = h
+        .api
+        .preferences_set(&prefs_patch(json!({
+            "auto_provider": "claude", "auto_consent": { "claude": true, "agy": false }
+        })))
+        .expect("agreed");
+    assert_eq!(prefs.auto_provider, AutoProvider::Claude);
+    assert_eq!(
+        prefs.auto_consent,
+        AutoConsent {
+            claude: true,
+            agy: false
+        }
+    );
+    let status = h.api.auto_status().expect("status");
+    assert!(status.active);
+    assert_eq!(
+        (status.preference, status.effective),
+        (AutoProvider::Claude, AutoProvider::Claude)
+    );
+    assert_eq!(
+        status.consent,
+        AutoConsent {
+            claude: true,
+            agy: false
+        }
+    );
+    assert!(status.providers[2].consent && !status.providers[3].consent);
+    // Default Auto and Apple Intelligence are always taken, available or not.
+    for choice in ["yellowmoon", "apple"] {
+        h.api
+            .preferences_set(&prefs_patch(json!({ "auto_provider": choice })))
+            .expect(choice);
+    }
+    // The old switch is gone from the wire: a patch with it is refused before it reaches the core.
+    assert!(
+        serde_json::from_value::<PreferencesPatch>(json!({ "apple_auto": false })).is_err(),
+        "apple_auto is not a preference any more"
+    );
+}
+
+#[test]
+fn a_provider_that_changes_tells_the_webview_to_ask_again() {
+    use ym_core::apple_auto::{Availability, UnavailableReason};
+    use ym_core::auto_provider::FakeProvider;
+    let (advisors, claude, _agy) = a_computer_with_claude_signed_in();
+    claude.set_availability(Availability::Unavailable(UnavailableReason::SignedOut));
+    let h = Harness::with_advisors(advisors);
+    assert_eq!(
+        h.api.auto_status().expect("status").providers[2].state,
+        ProviderState::SignedOut
+    );
+    let before = h.events.events().len();
+    claude.set_availability(Availability::Available(FakeProvider::info_for(
+        ym_core::auto_provider::AutoProvider::Claude,
+    )));
+    wait_until("auto_status_changed", || {
+        h.events.events()[before..].contains(&AppEvent::AutoStatusChanged)
+    });
+    let status = h.api.auto_status().expect("status");
+    assert_eq!(status.providers[2].state, ProviderState::Available);
+    assert!(status.providers[2].selectable);
+    // The same reading again says nothing.
+    let before = h.events.events().len();
+    claude.set_availability(Availability::Available(FakeProvider::info_for(
+        ym_core::auto_provider::AutoProvider::Claude,
+    )));
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(!h.events.events()[before..].contains(&AppEvent::AutoStatusChanged));
+}
+
+#[test]
+fn a_program_that_grades_says_so_on_the_wire_in_the_answer_and_in_the_failure() {
+    let (advisors, claude, _agy) = a_computer_with_claude_signed_in();
+    let h = Harness::with_advisors(advisors);
+    h.api
+        .preferences_set(&prefs_patch(json!({
+            "auto_provider": "claude", "auto_consent": { "claude": true, "agy": false }
+        })))
+        .expect("agreed");
+    h.open(1);
+    h.develop();
+    let id = h.first();
+    wait_until("the answer", || {
+        matches!(apple_state(&h, id), AppleAuto::Answered { .. })
+    });
+    let rs = h.api.get_settings(id).expect("settings");
+    let AppleAuto::Answered { info, .. } = &rs.estimates.apple else {
+        panic!("answered: {:?}", rs.estimates.apple);
+    };
+    assert_eq!(info.provider, AutoProvider::Claude);
+    // The model the program says answered, not the alias asked for.
+    assert_eq!(info.model, "claude-fake-1");
+    assert_eq!(info.tool_version.as_deref(), Some("0.0.0-test"));
+    assert_eq!(info.prompt, 1);
+    assert_eq!(rs.estimates.source, AutoSource::Claude);
+    assert_eq!(rs.estimates.provider, AutoProvider::Claude);
+    // Re-run asks again and the program fails: the photo says why and Auto is the rule.
+    claude.fail_with(Some((
+        ym_core::apple_auto::FailureKind::CliFailed,
+        "It stopped.".into(),
+    )));
+    h.api.rerun_auto(id).expect("rerun");
+    wait_until("the failure", || {
+        matches!(apple_state(&h, id), AppleAuto::Failed { .. })
+    });
+    let AppleAuto::Failed {
+        kind,
+        message,
+        info,
+    } = apple_state(&h, id)
+    else {
+        panic!("failed");
+    };
+    assert_eq!(kind, AppleAutoFailure::CliFailed);
+    assert_eq!(message, "It stopped.");
+    assert_eq!(info.provider, AutoProvider::Claude);
+    assert_eq!(
+        h.api.get_settings(id).expect("settings").estimates.source,
+        AutoSource::Rule
+    );
+}
+
+#[test]
+fn a_program_that_is_chosen_but_not_agreed_to_leaves_the_photos_to_the_rule_and_says_why() {
+    // A preferences file edited by hand: Claude Code saved with no consent acts as Default Auto (`docs/22` section 10.2).
+    let (advisors, _claude, _agy) = a_computer_with_claude_signed_in();
+    let h = Harness::with_preferences_file(advisors, r#"{ "auto_provider": "claude" }"#);
+    let status = h.api.auto_status().expect("status");
+    assert_eq!(
+        (status.preference, status.effective),
+        (AutoProvider::Claude, AutoProvider::Yellowmoon)
+    );
+    assert!(!status.active);
+    h.open(1);
+    h.develop();
+    let id = h.first();
+    wait_until("the reason", || {
+        matches!(
+            apple_state(&h, id),
+            AppleAuto::Unavailable {
+                reason: AppleAutoReason::NotConsented
+            }
+        )
+    });
+}
+
+#[test]
+fn the_info_of_a_program_reads_the_cores_tool_object_and_the_wires_own_fields() {
+    let core_shape = json!({
+        "provider": "claude", "model": "claude-sonnet-5-5", "os": "",
+        "tool": { "version": "2.1.310", "api": "firstParty", "auth": "oauth_token" },
+        "prompt": 1, "instructions": "default", "instructions_sha256": "932b96907b63"
+    });
+    let info: AppleAutoInfo = serde_json::from_value(core_shape).expect("the core's shape");
+    assert_eq!(info.provider, AutoProvider::Claude);
+    assert_eq!(info.tool_version.as_deref(), Some("2.1.310"));
+    assert_eq!(info.api.as_deref(), Some("firstParty"));
+    // What the webview gets is flat, and reads back as itself.
+    let wire = serde_json::to_value(&info).expect("json");
+    assert_eq!(wire["tool_version"], json!("2.1.310"));
+    assert_eq!(wire["api"], json!("firstParty"));
+    assert!(wire.get("tool").is_none());
+    assert_eq!(
+        serde_json::from_value::<AppleAutoInfo>(wire).expect("again"),
+        info
+    );
+    // Apple Intelligence has no tool.
+    let apple: AppleAutoInfo = serde_json::from_value(json!({
+        "provider": "apple", "model": "AFM 3 Core", "os": "27.0.1 (27A404)",
+        "prompt": 3, "instructions": "edited", "instructions_sha256": "abc"
+    }))
+    .expect("Apple's shape");
+    assert_eq!((apple.tool_version, apple.api), (None, None));
 }
 
 #[test]
@@ -2565,7 +4417,7 @@ fn real_files_open_draw_and_answer_the_readouts() {
         let centre = h.api.sample_pixel(360.0, 240.0).expect("a pixel");
         assert!(u16::from(centre.r) + u16::from(centre.g) + u16::from(centre.b) > 0);
         h.api
-            .histogram(photo.id)
+            .histogram(photo.id, None)
             .unwrap_or_else(|e| panic!("{}: {e}", photo.file_name));
         h.api
             .look_thumbnail(photo.id, &LookId("builtin:neutral".to_owned()))
@@ -2576,7 +4428,7 @@ fn real_files_open_draw_and_answer_the_readouts() {
         let seen = last_seq(&h);
         let t = std::time::Instant::now();
         h.api
-            .viewport_set_mode(&ViewportMode::Percent { value: Num(100.0) })
+            .viewport_set_mode(&ViewportMode::Percent { value: Num(100.0) }, None)
             .expect("100 %");
         let sharp = h
             .events
@@ -2591,7 +4443,9 @@ fn real_files_open_draw_and_answer_the_readouts() {
             t.elapsed(),
             sharp.seq - seen
         );
-        h.api.viewport_set_mode(&ViewportMode::Fit).expect("fit");
+        h.api
+            .viewport_set_mode(&ViewportMode::Fit, None)
+            .expect("fit");
         assert!(h.api.viewport().wait_idle(WAIT));
     }
 }
@@ -2639,28 +4493,75 @@ fn a_latency_bound_that_is_not_a_number_of_milliseconds_stops_the_test() {
     }
 }
 
-/// M3-03: "opening 500 files keeps the UI responsive". The shell's share of that: the commands the
-/// webview sends while 500 photos develop answer quickly (the pool is busy with decoding, the
-/// commands are not), and the events stay a bounded stream. Prints the numbers (`--nocapture`).
-///
-/// The slowest command must take less than 100 ms. `YM_PERF_SHELL_MAX_MS=<milliseconds>` moves
-/// that bound for a runner that is shared (the weekly job sets 250); without it the bound is the
-/// 100 ms of the task. Run it with `npm run perf:latency:shell` (or `npm run perf:latency` for
-/// this half and the web view's half).
+/// Peak resident memory of this process so far, in MiB (`getrusage`; 0 where it is not read).
+#[cfg(unix)]
+fn peak_rss_mib() -> u64 {
+    // SAFETY: `getrusage` fills the struct it is given; a zeroed one is a valid value to pass.
+    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    // SAFETY: the pointer is to a live `rusage`.
+    let status = unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) };
+    assert_eq!(status, 0, "getrusage failed");
+    let max = u64::try_from(usage.ru_maxrss).unwrap_or(0);
+    // Bytes on macOS, kilobytes on Linux.
+    if cfg!(target_os = "macos") {
+        max / (1024 * 1024)
+    } else {
+        max / 1024
+    }
+}
+
+#[cfg(not(unix))]
+fn peak_rss_mib() -> u64 {
+    0
+}
+
+/// The number of photos of the 2000-file test: `YM_PERF_PHOTOS` when it is one positive whole
+/// number (the web view's job sets a list such as `100,500,2000`, which is not for this test), else 2000.
+fn two_thousand_count(setting: Option<&str>) -> usize {
+    setting
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(2000)
+}
+
 #[test]
-#[ignore = "writes 500 synthetic photos and develops them (about half a minute)"]
-fn five_hundred_files_leave_the_commands_responsive() {
-    let h = Harness::new();
-    for i in 1..=500_u64 {
-        crate::testing::write_arw(h.photos.path(), &format!("DSC{i:05}.ARW"), i % 7 + 1);
+fn the_count_of_the_big_folder_test_comes_from_ym_perf_photos() {
+    assert_eq!(two_thousand_count(None), 2000);
+    assert_eq!(two_thousand_count(Some("")), 2000);
+    assert_eq!(two_thousand_count(Some("100,500,2000")), 2000);
+    assert_eq!(two_thousand_count(Some(" 750 ")), 750);
+    assert_eq!(two_thousand_count(Some("0")), 2000);
+}
+
+/// The thumbnail budget of the 2000-file test: a quarter of what 2000 thumbnails of the synthetic
+/// photos take, so that the budget is passed and photos lose theirs. (The application's own
+/// budget is [`crate::viewport::THUMBNAIL_BUDGET_BYTES`].)
+const TWO_THOUSAND_THUMBNAIL_BUDGET: usize = 8 << 20;
+
+/// Opens `count` synthetic photos and watches the commands a person sends while they develop. Prints
+/// the open time, the time until every photo is Ready, the slowest command, the events, the
+/// shell's thumbnail bytes and the peak resident memory so far, and asserts the slowest command is
+/// under the bound (`YM_PERF_SHELL_MAX_MS`, 100 ms without it).
+///
+/// `burst`: all photos share one capture time (the 500-file test always did); otherwise each has its own.
+fn photos_leave_the_commands_responsive(count: usize, burst: bool, thumbnail_budget: usize) {
+    let h = Harness::with_thumbnail_budget(thumbnail_budget);
+    for i in 1..=count as u64 {
+        crate::testing::write_arw_at(
+            h.photos.path(),
+            &format!("DSC{i:05}.ARW"),
+            i % 7 + 1,
+            // Every photo has its own capture time, or all share one (one burst).
+            if burst { 0 } else { i },
+        );
     }
     let t = std::time::Instant::now();
     let opened = h
         .api
         .open_paths(&[h.photos.path().to_string_lossy().into_owned()])
-        .expect("open 500 files");
+        .unwrap_or_else(|e| panic!("open {count} files: {e:?}"));
     let open_time = t.elapsed();
-    assert_eq!(opened.photos.len(), 500);
+    assert_eq!(opened.photos.len(), count);
     eprintln!("open_paths: {open_time:?}");
 
     let ids: Vec<PhotoId> = opened.photos.iter().map(|p| p.id).collect();
@@ -2708,7 +4609,55 @@ fn five_hundred_files_leave_the_commands_responsive() {
         .iter()
         .filter(|e| matches!(e, AppEvent::ThumbnailReady(_)))
         .count();
+    let reading: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            AppEvent::OpenProgress(p) => Some((p.done, p.total)),
+            _ => None,
+        })
+        .collect();
     eprintln!("{progress} photo_progress events, {thumbs} thumbnails");
+    eprintln!(
+        "{} open_progress events (the last: {:?})",
+        reading.len(),
+        reading.iter().max()
+    );
+    eprintln!(
+        "thumbnails held by the shell: {} bytes of a budget of {thumbnail_budget} ({} photos let go); peak RSS so far: {} MiB",
+        h.frames.thumbnail_bytes(),
+        h.frames.evicted_thumbnails().len(),
+        peak_rss_mib()
+    );
+    // `docs/26` H-11: the shell's thumbnail store stays under its budget, whatever the count, and
+    // what it counts is what it holds.
+    assert!(
+        h.frames.thumbnail_bytes() <= thumbnail_budget,
+        "the thumbnail store holds {} bytes, over its budget of {thumbnail_budget}",
+        h.frames.thumbnail_bytes()
+    );
+    assert_eq!(
+        h.frames.thumbnail_bytes_counted(),
+        h.frames.thumbnail_bytes()
+    );
+    // A photo whose thumbnail was let go gets a new one when its row scrolls into view: a window
+    // of 30 of them is asked for, as the filmstrip does, and comes back, within the budget.
+    let lost = h.frames.evicted_thumbnails();
+    let window: Vec<PhotoId> = lost.iter().take(30).map(|id| PhotoId(*id)).collect();
+    if !window.is_empty() {
+        assert!(h.api.thumbnails_in_view(&window).is_empty());
+        let t = std::time::Instant::now();
+        wait_until("the thumbnails in view to come back", || {
+            let held = h.api.thumbnails_now();
+            window.iter().all(|w| held.iter().any(|t| t.id == *w))
+        });
+        eprintln!(
+            "{} thumbnails in view came back after {:?}",
+            window.len(),
+            t.elapsed()
+        );
+        assert!(h.api.thumbnails().wait_idle(Duration::from_secs(60)));
+        assert!(h.frames.thumbnail_bytes() <= thumbnail_budget);
+    }
     let bound = latency_bound(std::env::var(LATENCY_BOUND_VAR).ok().as_deref());
     eprintln!("bound on the slowest command: {bound:?}");
     assert!(
@@ -2716,6 +4665,38 @@ fn five_hundred_files_leave_the_commands_responsive() {
         "a command took {slowest:?} while photos were developing (the bound is {bound:?}; \
          {LATENCY_BOUND_VAR} moves it)"
     );
+    assert_eq!(
+        reading.iter().max().copied(),
+        Some((count as u32, count as u32)),
+        "open_progress reached the end"
+    );
+}
+
+/// M3-03: "opening 500 files keeps the UI responsive". The shell's share of that: the commands the
+/// webview sends while 500 photos develop answer quickly (the pool is busy with decoding, the
+/// commands are not), and the events stay a bounded stream. Prints the numbers (`--nocapture`).
+///
+/// The slowest command must take less than 100 ms. `YM_PERF_SHELL_MAX_MS=<milliseconds>` moves
+/// that bound for a runner that is shared (the weekly job sets 250); without it the bound is the
+/// 100 ms of the task. Run it with `npm run perf:latency:shell` (or `npm run perf:latency` for
+/// this half and the web view's half).
+#[test]
+#[ignore = "writes 500 synthetic photos and develops them (about half a minute)"]
+fn five_hundred_files_leave_the_commands_responsive() {
+    photos_leave_the_commands_responsive(500, true, crate::viewport::THUMBNAIL_BUDGET_BYTES);
+}
+
+/// `docs/26` H-10: the same at 2000 files (`YM_PERF_PHOTOS` changes the count), once with 2000
+/// different capture times and once as one burst. Prints the open time, the time until every photo
+/// is Ready, the slowest command, the shell's thumbnail bytes and the peak resident memory.
+#[test]
+#[ignore = "writes 2000 synthetic photos twice and develops them (about a minute)"]
+fn two_thousand_files_leave_the_commands_responsive() {
+    let count = two_thousand_count(std::env::var("YM_PERF_PHOTOS").ok().as_deref());
+    eprintln!("--- {count} files, different capture times");
+    photos_leave_the_commands_responsive(count, false, TWO_THOUSAND_THUMBNAIL_BUDGET);
+    eprintln!("--- {count} files, one capture time (one burst)");
+    photos_leave_the_commands_responsive(count, true, TWO_THOUSAND_THUMBNAIL_BUDGET);
 }
 
 /// The `ExportBusy` events seen so far, in order.
@@ -2983,6 +4964,7 @@ fn app_info_and_the_looks_folder() {
     let info = h.api.app_info();
     assert_eq!(info.version, ym_core::version::app_version());
     assert_eq!(info.pipeline_version, ym_core::version::PIPELINE_VERSION);
+    assert_eq!(info.os, std::env::consts::OS);
     let folder = h.api.looks_folder().expect("looks folder");
     assert!(folder.is_dir() && folder.starts_with(h.app_root.path()));
 }
@@ -3016,6 +4998,36 @@ fn assert_same<C: serde::Serialize, W: serde::Serialize>(what: &str, core: &C, w
         same_json(&c, &w),
         "{what} lost something on the bridge:\ncore {c}\nwire {w}"
     );
+}
+
+/// Like `assert_same` for an export estimate, which is computed by two separate calls. Two fields
+/// read the live disk at call time and can differ between the calls: `free_bytes` and `low_space`
+/// (derived from it). Those are left out of the comparison; `free_bytes` is checked on its own to
+/// be present on both sides and within 1 GiB, which still catches a unit change.
+fn assert_same_estimate<C: serde::Serialize, W: serde::Serialize>(core: &C, wire: &W) {
+    const LIVE: [&str; 2] = ["free_bytes", "low_space"];
+    let mut c = serde_json::to_value(core).expect("core json");
+    let mut w = serde_json::to_value(wire).expect("wire json");
+    let mut free = Vec::new();
+    for (side, value) in [("core", &mut c), ("wire", &mut w)] {
+        let object = value.as_object_mut().expect("estimate is an object");
+        for key in LIVE {
+            let removed = object.remove(key);
+            if key == "free_bytes" {
+                let bytes = removed
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or_else(|| panic!("{side} estimate has no free_bytes"));
+                free.push(bytes);
+            }
+        }
+    }
+    assert!(
+        (free[0] - free[1]).abs() < 1024.0 * 1024.0 * 1024.0,
+        "export_estimate free_bytes differ by more than 1 GiB: core {} wire {}",
+        free[0],
+        free[1]
+    );
+    assert_same("export_estimate", &c, &w);
 }
 
 #[test]
@@ -3074,7 +5086,7 @@ fn core_types_convert_without_loss() {
     let state = h.develop();
     let id = state.photos[0].id;
     // Something in every optional field.
-    let patch: SettingsPatch = serde_json::from_value(json!({
+    let patch: SettingsPatch = serde_json::from_value(field_patch(json!({
         "exposure": { "kind": "manual", "ev": -0.7 },
         "white_balance": { "kind": "manual", "kelvin": 4300, "tint": 5 },
         "sharpen": { "kind": "manual", "amount": 120, "radius_px": 1.1 },
@@ -3086,13 +5098,15 @@ fn core_types_convert_without_loss() {
         "orientation": 270,
         "decode": { "neural_demosaic": false },
         "rolloff": { "highlights": 0.2 },
+        "lens": { "kind": "petzval", "flares": 35, "edges": 50, "anamorphic": 20 },
         "color_warp": { "pins": [
             { "source": [0.12, 0.03], "target": [0.08, 0.1], "locked": false, "range": 0.06,
-              "shadows": 0.5, "highlights": 1, "pivot_ev": -1.5, "exposure_ev": 0.25 },
+              "shadows": 0.5, "highlights": 1, "pivot_ev": -1.5, "exposure_ev": 0.25,
+              "saturation": -0.4 },
             { "source": [-0.05, -0.1], "target": [-0.05, -0.1], "locked": true, "range": 0.04,
-              "shadows": 1, "highlights": 1, "pivot_ev": 0, "exposure_ev": 0 }
+              "shadows": 1, "highlights": 1, "pivot_ev": 0, "exposure_ev": 0, "saturation": 0 }
         ] }
-    }))
+    })))
     .expect("patch");
     h.api.update_settings(id, &patch).expect("update");
 
@@ -3119,11 +5133,6 @@ fn core_types_convert_without_loss() {
         &h.api.looks_list().expect("looks"),
     );
     assert_same(
-        "looks_display_luts",
-        &core.looks_display_luts(),
-        &h.api.looks_display_luts().expect("luts"),
-    );
-    assert_same(
         "preferences",
         &core.preferences_get(),
         &h.api.preferences_get().expect("prefs"),
@@ -3133,8 +5142,7 @@ fn core_types_convert_without_loss() {
     let job = jpeg_job(out.path());
     let core_job: ym_core::export_queue::ExportJob = convert(&job).expect("job");
     assert_same("export_job", &core_job, &job);
-    assert_same(
-        "export_estimate",
+    assert_same_estimate(
         &core.export_estimate(&core_job),
         &h.api.export_estimate(&job).expect("estimate"),
     );
@@ -3148,7 +5156,7 @@ fn core_types_convert_without_loss() {
     assert_same(
         "histogram",
         &histogram,
-        &h.api.histogram(id).expect("histogram"),
+        &h.api.histogram(id, None).expect("histogram"),
     );
     let scatter = core
         .renderer
@@ -3157,7 +5165,7 @@ fn core_types_convert_without_loss() {
     assert_same(
         "chroma_scatter",
         &scatter,
-        &h.api.chroma_scatter(id).expect("scatter"),
+        &h.api.chroma_scatter(id, None).expect("scatter"),
     );
     let sample = ym_core::pipeline::ChromaSample {
         a: 0.125,
@@ -3170,37 +5178,125 @@ fn core_types_convert_without_loss() {
     let core_patch: ym_core::settings::SettingsPatch = convert(&patch).expect("core patch");
     assert_same(
         "settings_patch.color_warp",
-        &core_patch.color_warp,
-        &patch.color_warp,
+        &core_grade(&core_patch).color_warp,
+        &grade_of(&patch).color_warp,
     );
-    assert_eq!(core_patch.color_warp.map(|w| w.pins.len()), Some(2));
+    assert_eq!(
+        core_grade(&core_patch)
+            .color_warp
+            .as_ref()
+            .map(|w| w.pins.len()),
+        Some(2)
+    );
+    // The lens crosses whole, in the patch and in the settings it made; `lens_list` crosses as the core has it.
+    assert_same(
+        "settings_patch.lens",
+        &core_input(&core_patch).lens,
+        &input_of(&patch).lens,
+    );
+    assert_eq!(
+        core_input(&core_patch).lens,
+        Some(ym_core::settings::LensPatch {
+            kind: Some(ym_core::settings::LensKind::Petzval),
+            flares: Some(35.0),
+            edges: Some(50.0),
+            anamorphic: Some(20.0),
+        })
+    );
+    let resolved = h.api.get_settings(id).expect("settings");
+    assert_same(
+        "settings.lens",
+        &core
+            .session
+            .settings(ym_core::session::PhotoId(id.0))
+            .expect("settings")
+            .settings
+            .input()
+            .lens,
+        &resolved.settings.input().lens,
+    );
+    assert_eq!(resolved.values.input.lens, resolved.settings.input().lens);
+    assert_eq!(
+        resolved.settings.input().lens.kind,
+        crate::wire::LensKind::Petzval
+    );
+    assert_same(
+        "lens_list",
+        &core.lens_list(),
+        &h.api.lens_list().expect("lens list"),
+    );
+}
+
+#[test]
+fn the_lenses_cross_the_bridge_by_the_same_word_and_a_lens_patch_redraws_the_thumbnail() {
+    use crate::wire::LensKind as Wire;
+    use ym_lens::LensKind as Core;
+    let pairs = [
+        (Wire::Default, Core::Default, "default"),
+        (Wire::Classic, Core::Classic, "classic"),
+        (Wire::Vintage, Core::Vintage, "vintage"),
+        (Wire::Petzval, Core::Petzval, "petzval"),
+        (Wire::Triplet, Core::Triplet, "triplet"),
+        (Wire::Sonnar, Core::Sonnar, "sonnar"),
+        (Wire::Detuned, Core::Detuned, "detuned"),
+    ];
+    assert_eq!(pairs.len(), Core::ALL.len());
+    for (wire, core, word) in pairs {
+        assert_eq!(Core::from(wire), core);
+        assert_eq!(Wire::from(core), wire);
+        assert_eq!(serde_json::to_value(wire).expect("json"), json!(word));
+        assert_eq!(core.as_str(), word);
+    }
+    // One lens of the menu, as the library gives it, crosses with every field.
+    let info = ym_lens::LensInfo {
+        kind: Core::Sonnar,
+        name: "Sonnar".to_owned(),
+        line: "Smooth and glowing, with gentle edges.".to_owned(),
+        start_flares: 37.5,
+        start_edges: 50.0,
+        version: 3,
+        design_source: "A patent".to_owned(),
+    };
+    let wire: crate::wire::LensInfo = convert(&info).expect("lens info");
+    assert_same("lens_info", &info, &wire);
+    assert_eq!(wire.kind, Wire::Sonnar);
+    // A patch that names the lens changes what a thumbnail shows.
+    let patch: SettingsPatch =
+        serde_json::from_value(field_patch(json!({ "lens": { "flares": 10 } }))).expect("patch");
+    assert!(touches_thumbnail(&patch));
+    assert!(!touches_thumbnail(&SettingsPatch::default()));
 }
 
 #[test]
 fn a_patch_survives_the_bridge_and_a_missing_key_stays_missing() {
     // `crop: null` is a present key and no `crop` is none: the manual `Serialize` keeps them apart.
     let clear: SettingsPatch =
-        serde_json::from_value(json!({ "crop": null, "white_pick": null })).expect("patch");
-    assert_eq!(clear.crop, Some(None));
-    assert_eq!(clear.white_pick, Some(None));
+        serde_json::from_value(field_patch(json!({ "crop": null, "white_pick": null })))
+            .expect("patch");
+    assert_eq!(input_of(&clear).crop, Some(None));
+    assert_eq!(input_of(&clear).white_pick, Some(None));
     let json = serde_json::to_value(&clear).expect("json");
-    assert_eq!(json, json!({ "crop": null, "white_pick": null }));
+    assert_eq!(
+        json,
+        json!({ "nodes": { "input": { "crop": null, "white_pick": null } } })
+    );
     let core: ym_core::settings::SettingsPatch = convert(&clear).expect("core patch");
-    assert_eq!(core.crop, Some(None));
-    assert_eq!(core.white_pick, Some(None));
-    assert_eq!(core.look, None);
+    assert_eq!(core_input(&core).crop, Some(None));
+    assert_eq!(core_input(&core).white_pick, Some(None));
+    assert_eq!(core.look(), None);
 
-    let none: SettingsPatch = serde_json::from_value(json!({})).expect("empty");
+    let none: SettingsPatch = serde_json::from_value(field_patch(json!({}))).expect("empty");
     assert_eq!(serde_json::to_value(&none).expect("json"), json!({}));
     let core: ym_core::settings::SettingsPatch = convert(&none).expect("core");
     assert_eq!(core, ym_core::settings::SettingsPatch::default());
 
     // Parts of a manual white balance may be left out; the core fills them in.
-    let part: SettingsPatch =
-        serde_json::from_value(json!({ "white_balance": { "kind": "manual", "kelvin": 5000 } }))
-            .expect("patch");
+    let part: SettingsPatch = serde_json::from_value(field_patch(
+        json!({ "white_balance": { "kind": "manual", "kelvin": 5000 } }),
+    ))
+    .expect("patch");
     let core: ym_core::settings::SettingsPatch = convert(&part).expect("core");
-    assert!(core.white_balance.is_some());
+    assert!(core_input(&core).white_balance.is_some());
 }
 
 /// An advisor whose exposure answers go +1, +3, +3 in the order it is asked about the photos (the rest keep).
@@ -3226,6 +5322,7 @@ impl ym_core::apple_auto::AutoAdvisor for Sequence {
             },
             scene: format!("Photo {n}"),
             plan: String::new(),
+            served_model: None,
         })
     }
 }
@@ -3297,5 +5394,684 @@ fn removing_a_frame_with_apple_auto_makes_the_burst_steps_again_tells_the_webvie
     assert!(ids.iter().all(|id| step(*id) == Some(3)));
     for id in &stays {
         assert_eq!(told(*id, before), 1, "{id:?}");
+    }
+}
+
+// ---- Object masks (docs/23 sections 4.4 and 9, task N-18) ------------------------------------------------------------------------------------
+
+/// The Object model of the repository's data folder, when it has the weights (`tools/fetch/sam2.sh`); CI's rust job fetches none and these tests then
+/// check what does not need the model.
+fn object_weights() -> bool {
+    ym_core::pipeline::ObjectModel::probe(
+        &ym_core::data_dir::find_data_dir().expect("the data folder"),
+    )
+    .is_some_and(|m| m.sam().is_ok())
+}
+
+/// A patch that gives Main one mask row, in the full form of the wire (`MaskItem`: every field of the kind is required there).
+fn row_patch(kind: &str) -> SettingsPatch {
+    let row = match kind {
+        "object" => {
+            json!({ "kind": "object", "mode": "add", "invert": false, "enabled": true, "opacity": 1, "points": [], "box": null, "feather": 0, "grow": 0, "refine": 0.5 })
+        }
+        "subject" | "people" => {
+            json!({ "kind": kind, "mode": "add", "invert": false, "enabled": true, "opacity": 1, "feather": 0, "grow": 0, "refine": 0.5 })
+        }
+        _ => {
+            json!({ "kind": "radial", "mode": "add", "invert": false, "enabled": true, "opacity": 1, "center": [0.5, 0.5], "radii": [0.25, 0.18], "angle_deg": 0, "feather": 0.3 })
+        }
+    };
+    serde_json::from_value(json!({ "nodes": { "1": { "masks": { "items": [row] } } } }))
+        .expect("a patch")
+}
+
+#[test]
+fn mask_find_refuses_what_is_not_an_object_row_with_the_scope_mask_and_a_plain_sentence() {
+    use crate::wire::{ErrorScope, MaskFindPrompt};
+    let h = Harness::new();
+    h.open(1);
+    let id = h.develop().photos[0].id;
+    h.api
+        .update_settings(id, &row_patch("radial"))
+        .expect("a Radial row");
+    let click = MaskFindPrompt::Point {
+        x: Num(0.5),
+        y: Num(0.5),
+        positive: true,
+    };
+    let err = h
+        .api
+        .mask_find(id, 1, 0, click)
+        .expect_err("a Radial is not an Object row");
+    assert_eq!(err.scope, ErrorScope::Mask);
+    // Where the weights are the model says what is wrong with the request; where they are not, that there is no model.
+    assert_eq!(
+        err.message,
+        if object_weights() {
+            "That mask is not an Object mask. Select an Object mask and try again."
+        } else {
+            "This copy of Yellowmoon has no Object model. Reinstall the app."
+        }
+    );
+    // A row that is not there is the same refusal.
+    let err = h.api.mask_find(id, 1, 7, click).expect_err("no such row");
+    assert_eq!(err.scope, ErrorScope::Mask);
+}
+
+/// The whole path through the shell: an Object row on the photo being looked at starts the encoder (`object_state` says so, and says when it has
+/// stopped), a click is answered with the row's new points in the shapes of the wire, and nothing changes in the settings.
+#[test]
+fn mask_find_answers_in_the_shapes_of_the_wire_and_object_state_comes_as_events() {
+    use crate::events::AppEvent;
+    use crate::wire::{MaskFindPrompt, MaskFindResult};
+    if !object_weights() {
+        assert!(
+            std::env::var_os("YM_REQUIRE_SAM2").is_none(),
+            "YM_REQUIRE_SAM2 is set and data/models/sam2 is missing"
+        );
+        eprintln!("\n* OBJECT SHELL TEST SKIPPED: no SAM weights (tools/fetch/sam2.sh)\n");
+        return;
+    }
+    let h = Harness::new();
+    h.open(1);
+    let id = h.develop().photos[0].id;
+    h.api.set_current(id).expect("current");
+    h.api
+        .update_settings(id, &row_patch("object"))
+        .expect("an Object row");
+    // The core asked for the features: the page is told that the encoder is working, and that it has stopped.
+    let seen = |preparing: bool| {
+        h.events
+            .events()
+            .iter()
+            .any(|e| matches!(e, AppEvent::ObjectState(s) if s.photo_id == id && s.preparing == preparing))
+    };
+    wait_until("the encoder to start", || seen(true));
+    let before = h.api.get_settings(id).expect("settings");
+    let found = h
+        .api
+        .mask_find(
+            id,
+            1,
+            0,
+            MaskFindPrompt::Point {
+                x: Num(0.5),
+                y: Num(0.5),
+                positive: true,
+            },
+        )
+        .expect("an answer");
+    let MaskFindResult::Found {
+        points,
+        box_,
+        took_ms,
+    } = found
+    else {
+        panic!("the model finds an object in the middle of the gradient: {found:?}");
+    };
+    assert_eq!(points, vec![(Num(0.5), Num(0.5), true)]);
+    assert!(box_.is_none() && took_ms.0 > 0.0);
+    wait_until("the encoder to stop", || seen(false));
+    assert_eq!(
+        h.api.get_settings(id).expect("settings"),
+        before,
+        "a find changes no settings"
+    );
+    // The wire's words.
+    assert_eq!(
+        serde_json::to_value(&MaskFindResult::Found {
+            points,
+            box_: None,
+            took_ms
+        })
+        .expect("json"),
+        json!({ "kind": "found", "points": [[0.5, 0.5, true]], "box": null, "took_ms": took_ms.0 })
+    );
+    assert_eq!(
+        serde_json::to_value(&MaskFindResult::Nothing).expect("json"),
+        json!({ "kind": "nothing" })
+    );
+    assert_eq!(
+        serde_json::from_value::<MaskFindPrompt>(
+            json!({ "kind": "box", "x0": 0.1, "y0": 0.2, "x1": 0.6, "y1": 0.7 })
+        )
+        .expect("a box"),
+        MaskFindPrompt::Box {
+            x0: Num(0.1),
+            y0: Num(0.2),
+            x1: Num(0.6),
+            y1: Num(0.7)
+        }
+    );
+}
+
+// ---- Subject and People (N-19) ----------------------------------------------------------------------
+
+/// A computer that supports Subject and People (the fake Vision) offers them after the kinds that need a model, in the order of the
+/// Add mask menu, and by the same words on the wire; one that supports only People offers only People.
+#[test]
+fn subject_and_people_are_offered_where_the_probe_says_yes_and_by_their_words() {
+    use crate::wire::MaskKind;
+    use ym_core::settings::MaskUnavailable;
+    use ym_core::vision::{FakeVision, VisionStatus, VisionSupport};
+    let kinds_of = |h: &Harness| -> Vec<MaskKind> {
+        h.api
+            .mask_kinds()
+            .expect("kinds")
+            .into_iter()
+            .filter(|k| !matches!(k, MaskKind::Object | MaskKind::Depth))
+            .collect()
+    };
+    let h = Harness::with_vision(Arc::new(FakeVision::new()));
+    let kinds = kinds_of(&h);
+    assert_eq!(
+        kinds,
+        [
+            MaskKind::Subject,
+            MaskKind::People,
+            MaskKind::Background,
+            MaskKind::Linear,
+            MaskKind::Radial,
+            MaskKind::Brush,
+            MaskKind::ColorRange,
+            MaskKind::BrightnessRange
+        ]
+    );
+    assert_eq!(
+        serde_json::to_value(&kinds[..2]).expect("json"),
+        json!(["subject", "people"])
+    );
+    let h = Harness::with_vision(Arc::new(FakeVision::new().with_support(VisionSupport {
+        subject: VisionStatus::Unsupported(MaskUnavailable::NotSupported),
+        people: VisionStatus::Supported,
+    })));
+    assert_eq!(kinds_of(&h)[0], MaskKind::People);
+    assert!(!kinds_of(&h).contains(&MaskKind::Subject));
+    let h = Harness::with_vision(Arc::new(ym_core::vision::NoVision));
+    assert!(
+        !kinds_of(&h).contains(&MaskKind::Subject) && !kinds_of(&h).contains(&MaskKind::People)
+    );
+}
+
+/// The whole path through the shell: a Subject row on the photo being looked at starts the core's worker; the viewport is busy and
+/// finding while it works (`viewport_busy.finding`, which survives the end of the round that asked), and when it ends `vision_state`
+/// says which kinds found nothing and the photo is drawn again.
+#[test]
+fn a_subject_row_is_found_in_the_background_viewport_busy_says_finding_and_vision_state_comes_as_an_event()
+ {
+    use crate::events::AppEvent;
+    use crate::wire::MaskKind;
+    use ym_core::vision::{FakeAnswer, FakeVision, VisionKind};
+    let h = Harness::with_vision(Arc::new(
+        FakeVision::new().answering(VisionKind::People, FakeAnswer::NothingFound),
+    ));
+    h.open(1);
+    let id = h.develop().photos[0].id;
+    h.rect(300.0, 200.0);
+    h.api.set_current(id).expect("current");
+    h.frame_of_size(300, 200);
+    assert!(h.api.viewport().wait_idle(WAIT));
+    let both: SettingsPatch = serde_json::from_value(json!({ "nodes": { "1": { "masks": { "items": [
+        { "kind": "subject", "mode": "add", "invert": false, "enabled": true, "opacity": 1, "feather": 0, "grow": 0, "refine": 0.5 },
+        { "kind": "people", "mode": "add", "invert": false, "enabled": true, "opacity": 1, "feather": 0, "grow": 0, "refine": 0.5 },
+    ] } } } }))
+    .expect("a patch");
+    h.api.update_settings(id, &both).expect("the rows");
+    let states = || -> Vec<(PhotoId, Vec<MaskKind>)> {
+        h.events
+            .events()
+            .into_iter()
+            .filter_map(|e| match e {
+                AppEvent::VisionState(s) => Some((s.photo_id, s.nothing_found)),
+                _ => None,
+            })
+            .collect()
+    };
+    wait_until("the worker to end", || !states().is_empty());
+    assert_eq!(states(), [(id, vec![MaskKind::People])]);
+    // The viewport said it was finding while the worker ran, and not busy after it.
+    let busy = crate::testing::busy_events(&h.events);
+    assert!(
+        busy.iter().any(|b| b.busy && b.finding),
+        "no busy-and-finding event in {busy:?}"
+    );
+    wait_until("the viewport to be idle", || {
+        crate::testing::busy_events(&h.events)
+            .last()
+            .is_some_and(|b| !b.busy && !b.finding)
+    });
+    // A drawn frame follows the end of the worker (the masks are there).
+    let before = h.api.viewport().frames_presented();
+    h.api.update_settings(id, &both).expect("again");
+    assert!(h.api.viewport().wait_idle(WAIT));
+    assert!(h.api.viewport().frames_presented() >= before);
+}
+
+/// A computer that cannot make Subject (no provider here) keeps the row, draws the photo, starts no worker (so `viewport_busy` never
+/// says finding), and refuses to export it with the sentence of `docs/23` section 3.10 under the `mask` scope.
+#[test]
+fn a_subject_row_on_a_computer_that_cannot_make_it_selects_nothing_and_starts_no_worker() {
+    let h = Harness::new();
+    h.open(1);
+    let id = h.develop().photos[0].id;
+    h.rect(300.0, 200.0);
+    h.api.set_current(id).expect("current");
+    h.frame_of_size(300, 200);
+    h.api
+        .update_settings(id, &row_patch("subject"))
+        .expect("a Subject row is kept");
+    assert!(h.api.viewport().wait_idle(WAIT));
+    assert!(
+        crate::testing::busy_events(&h.events)
+            .iter()
+            .all(|b| !b.finding),
+        "{:?}",
+        crate::testing::busy_events(&h.events)
+    );
+    assert!(
+        h.events
+            .events()
+            .iter()
+            .all(|e| !matches!(e, crate::events::AppEvent::VisionState(_)))
+    );
+    let core = h.api.core();
+    let core_id = ym_core::session::PhotoId(id.0);
+    let sentence = core
+        .renderer
+        .unmakeable_mask(&core.session.settings(core_id).expect("settings").settings);
+    assert_eq!(
+        sentence.as_deref(),
+        Some(
+            "Node 1 has a Subject mask, and this computer cannot make one. Use a Mac that supports Subject masks, or remove the mask."
+        )
+    );
+}
+
+// ---- Depth masks (docs/23 sections 4.8 and 9, task D-04) -------------------------------------------------------------------------------------
+
+/// A patch that gives node 1 one Depth row, in the full form of the wire (`MaskItem`: every field of the kind is required there).
+fn depth_row_patch(far: f64) -> SettingsPatch {
+    serde_json::from_value(json!({ "nodes": { "1": { "masks": { "items": [
+        { "kind": "depth", "mode": "add", "invert": false, "enabled": true, "opacity": 1,
+          "far": far, "feather": 0, "grow": 0, "refine": 0.5 },
+    ] } } } }))
+    .expect("a patch")
+}
+
+/// The whole path through the shell with a fake model: a Depth row on the photo being looked at starts the core's worker; the viewport is
+/// busy and finding while it works (`viewport_busy.finding`), and when it ends `depth_state` says the map is ready (`failed` null).
+/// Pick depth answers a far limit in the shapes of the wire, Focus plane answers at once that this file has no focus point, and nothing changes in
+/// the settings.
+#[test]
+fn a_depth_row_is_found_in_the_background_depth_state_comes_as_an_event_and_pick_depth_answers() {
+    use crate::events::AppEvent;
+    use crate::wire::{ErrorScope, FocusReason, MaskKind};
+    let h = Harness::with_depth(ym_core::pipeline::DepthModel::fake_default());
+    // The kind is offered, right after Background.
+    let kinds = h.api.mask_kinds().expect("kinds");
+    let at = kinds
+        .iter()
+        .position(|k| *k == MaskKind::Background)
+        .expect("Background");
+    assert_eq!(kinds[at + 1], MaskKind::Depth);
+    h.open(1);
+    let id = h.develop().photos[0].id;
+    h.rect(300.0, 200.0);
+    h.api.set_current(id).expect("current");
+    h.frame_of_size(300, 200);
+    assert!(h.api.viewport().wait_idle(WAIT));
+    h.api
+        .update_settings(id, &depth_row_patch(0.5))
+        .expect("a Depth row");
+    let states = || -> Vec<(PhotoId, Option<String>)> {
+        h.events
+            .events()
+            .into_iter()
+            .filter_map(|e| match e {
+                AppEvent::DepthState(s) => Some((s.photo_id, s.failed)),
+                _ => None,
+            })
+            .collect()
+    };
+    wait_until("the depth worker to end", || !states().is_empty());
+    assert_eq!(states(), [(id, None)]);
+    let busy = crate::testing::busy_events(&h.events);
+    assert!(
+        busy.iter().any(|b| b.busy && b.finding),
+        "no busy-and-finding event in {busy:?}"
+    );
+    wait_until("the viewport to be idle", || {
+        crate::testing::busy_events(&h.events)
+            .last()
+            .is_some_and(|b| !b.busy && !b.finding)
+    });
+    // Pick depth: the far limit for the depth under the click, the depth plus 0.1 and at most 1. The fake's map is nearer toward the
+    // bottom of the photo, so a click at the bottom picks a nearer limit than one at the top.
+    let low = h
+        .api
+        .sample_depth(id, Num(0.5), Num(0.95))
+        .expect("an answer")
+        .expect("a limit");
+    let high = h
+        .api
+        .sample_depth(id, Num(0.5), Num(0.05))
+        .expect("an answer")
+        .expect("a limit");
+    assert!(low.far.0 < high.far.0, "{low:?} {high:?}");
+    for pick in [low, high] {
+        assert!((0.1..=1.0).contains(&pick.far.0), "{pick:?}");
+    }
+    // The click ran no network of its own beyond the worker's: one map for the photo.
+    assert_eq!(
+        h.api
+            .core()
+            .renderer
+            .depth_networks(ym_core::session::PhotoId(id.0)),
+        1
+    );
+    // A click that is not a number is refused with the mask scope.
+    let err = h
+        .api
+        .sample_depth(id, Num(f64::NAN), Num(0.5))
+        .expect_err("not a place");
+    assert_eq!(err.scope, ErrorScope::Mask);
+    // The synthetic file has no focus point: answered at once, with the reason, and no limit.
+    let focus = h.api.focus_plane(id).expect("an answer");
+    assert_eq!(
+        (focus.far, focus.exact_centre, focus.reason),
+        (None, false, Some(FocusReason::NoFocusPoint))
+    );
+    // Nothing was written to the settings by either command: the row is as the patch made it.
+    let core = h.api.core();
+    let settings = core
+        .session
+        .settings(ym_core::session::PhotoId(id.0))
+        .expect("settings")
+        .settings;
+    let rows = &settings.nodes.corrector(1).expect("node 1").masks.items;
+    assert!(
+        matches!(&rows[0].shape, ym_core::settings::MaskShape::Depth(d) if d.far == 0.5),
+        "{rows:?}"
+    );
+}
+
+/// "Try again" through the shell: a map that failed is told by `depth_state` with the sentence; `retry_depth` starts it again, returns at
+/// once, changes no settings, and `depth_state` then says the map is ready. A retry on a photo whose map is made does nothing.
+#[test]
+fn retry_depth_starts_a_failed_map_again_and_depth_state_follows() {
+    use crate::events::AppEvent;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let broken = Arc::new(AtomicBool::new(true));
+    let model = {
+        let broken = Arc::clone(&broken);
+        ym_core::pipeline::DepthModel::fake(
+            "retry",
+            Arc::new(move |_, _, _, _| {
+                if broken.load(Ordering::SeqCst) {
+                    return Err("the model stopped before it finished".to_owned());
+                }
+                // Any grid will do: a ramp of 8 x 6 cells, near on the left.
+                Ok((8, 6, (0..48).map(|i| 1.0 - (i % 8) as f32 / 8.0).collect()))
+            }),
+        )
+    };
+    let h = Harness::with_depth(model);
+    h.open(1);
+    let id = h.develop().photos[0].id;
+    h.rect(300.0, 200.0);
+    h.api.set_current(id).expect("current");
+    h.frame_of_size(300, 200);
+    assert!(h.api.viewport().wait_idle(WAIT));
+    h.api
+        .update_settings(id, &depth_row_patch(0.5))
+        .expect("a Depth row");
+    let states = || -> Vec<Option<String>> {
+        h.events
+            .events()
+            .into_iter()
+            .filter_map(|e| match e {
+                AppEvent::DepthState(s) => Some(s.failed),
+                _ => None,
+            })
+            .collect()
+    };
+    let sentence = "The Depth mask can't be made: the model stopped before it finished.";
+    wait_until("the failure", || !states().is_empty());
+    assert_eq!(states(), [Some(sentence.to_owned())]);
+    // Retry while it still fails: the same sentence again.
+    h.api.retry_depth(id).expect("retry");
+    wait_until("the second failure", || states().len() == 2);
+    assert_eq!(states()[1].as_deref(), Some(sentence));
+    // The model works now.
+    broken.store(false, Ordering::SeqCst);
+    h.api.retry_depth(id).expect("retry");
+    wait_until("the map", || states().len() == 3);
+    assert_eq!(states()[2], None);
+    // A map that is made is left alone, and nothing was written to the settings.
+    h.api.retry_depth(id).expect("retry when ready");
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(states().len(), 3);
+    let settings = h
+        .api
+        .core()
+        .session
+        .settings(ym_core::session::PhotoId(id.0))
+        .expect("settings")
+        .settings;
+    let rows = &settings.nodes.corrector(1).expect("node 1").masks.items;
+    assert!(
+        matches!(&rows[0].shape, ym_core::settings::MaskShape::Depth(d) if d.far == 0.5),
+        "{rows:?}"
+    );
+}
+
+/// A copy of Yellowmoon without the depth weights (the harness's data folder has none) offers no Depth kind, keeps a Depth row, starts no
+/// worker (`viewport_busy` never says finding), answers the commands with the `mask` scope and the sentence of `docs/23` section 3.10a, and
+/// refuses to export the photo.
+#[test]
+fn a_depth_row_without_the_model_selects_nothing_starts_no_worker_and_refuses_the_commands() {
+    use crate::wire::{ErrorScope, MaskKind};
+    if ym_core::pipeline::DepthModel::probe(
+        &ym_core::data_dir::find_data_dir().expect("the data folder"),
+    )
+    .is_some()
+    {
+        eprintln!("\n* DEPTH WITHOUT THE MODEL SKIPPED: this data folder has the depth weights\n");
+        return;
+    }
+    let h = Harness::new();
+    assert!(
+        !h.api
+            .mask_kinds()
+            .expect("kinds")
+            .contains(&MaskKind::Depth)
+    );
+    h.open(1);
+    let id = h.develop().photos[0].id;
+    h.rect(300.0, 200.0);
+    h.api.set_current(id).expect("current");
+    h.frame_of_size(300, 200);
+    h.api
+        .update_settings(id, &depth_row_patch(0.5))
+        .expect("a Depth row is kept");
+    assert!(h.api.viewport().wait_idle(WAIT));
+    assert!(
+        crate::testing::busy_events(&h.events)
+            .iter()
+            .all(|b| !b.finding)
+    );
+    assert!(
+        h.events
+            .events()
+            .iter()
+            .all(|e| !matches!(e, crate::events::AppEvent::DepthState(_)))
+    );
+    let err = h
+        .api
+        .sample_depth(id, Num(0.5), Num(0.5))
+        .expect_err("no model");
+    assert_eq!(err.scope, ErrorScope::Mask);
+    assert_eq!(
+        err.message,
+        "This copy of Yellowmoon has no Depth model. Reinstall the app."
+    );
+    let err = h.api.focus_plane(id).expect_err("no model");
+    assert_eq!(err.scope, ErrorScope::Mask);
+    let core = h.api.core();
+    let core_id = ym_core::session::PhotoId(id.0);
+    let sentence = core
+        .renderer
+        .unmakeable_mask(&core.session.settings(core_id).expect("settings").settings);
+    assert_eq!(
+        sentence.as_deref(),
+        Some("This copy of Yellowmoon has no Depth model. Reinstall the app.")
+    );
+}
+
+// --- The damaged-file matrix --------------------------------------------------------------------
+
+/// Whether `reason` is a sentence a damaged file may show: the catalogue of `ym_raw::error`, the
+/// fixed sentence of a file that is not ARW, and the two forms of "not supported".
+fn is_damage_sentence(reason: &str) -> bool {
+    use ym_raw::error::{MESSAGE_CUT_SHORT, MESSAGE_DAMAGED, MESSAGE_EMPTY};
+    [
+        MESSAGE_EMPTY,
+        MESSAGE_CUT_SHORT,
+        MESSAGE_DAMAGED,
+        "This isn't an ARW file. Yellowmoon opens Sony ARW files only.",
+    ]
+    .contains(&reason)
+        || reason.contains("aren't supported yet")
+        || reason.starts_with("Yellowmoon can't open ")
+}
+
+/// Every file of `dir` by name with its bytes.
+fn files_with_bytes(dir: &Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+    std::fs::read_dir(dir)
+        .expect("read the folder")
+        .map(|entry| {
+            let entry = entry.expect("entry");
+            (
+                entry.file_name().to_string_lossy().into_owned(),
+                std::fs::read(entry.path()).expect("read"),
+            )
+        })
+        .collect()
+}
+
+/// The folder of `crates/ym-core/tests/damaged_files.rs` (ten valid files and 190 damaged ones,
+/// `ym_raw::testgen::damage::write_matrix`) through `open_paths` and `export_start` (`docs/26` P1-6,
+/// H-03). Every damaged file is `Skipped` with a catalogue sentence or `Ready`; the export has every
+/// `Ready` photo, none failing (a skipped photo is not in a job); the good files are byte for byte what
+/// the same files give in an app of their own.
+#[test]
+fn a_damaged_folder_opens_and_the_export_writes_every_photo_that_opened() {
+    use ym_raw::testgen::damage::{valid_files, write_matrix};
+    let h = Harness::new();
+    let files = write_matrix(h.photos.path()).expect("write the matrix");
+    assert_eq!(files.len(), 200);
+    let opened = h
+        .api
+        .open_paths(&[h.photos.path().to_string_lossy().into_owned()])
+        .expect("open the folder");
+    assert_eq!(opened.photos.len(), files.len());
+    wait_until("every photo to be developed or refused", || {
+        h.api.session_state().is_ok_and(|s| {
+            s.photos
+                .iter()
+                .all(|p| matches!(p.status, PhotoStatus::Ready | PhotoStatus::Skipped { .. }))
+        })
+    });
+    let state = h.api.session_state().expect("state");
+    let (mut ready, mut skipped) = (0usize, 0usize);
+    for file in &files {
+        let photo = state
+            .photos
+            .iter()
+            .find(|p| p.file_name == file.file)
+            .expect("the photo is in the session");
+        match (&file.damage, &photo.status) {
+            (None, PhotoStatus::Ready) => ready += 1,
+            (None, other) => panic!("the good file {} is {other:?}", file.file),
+            (Some(_), PhotoStatus::Ready) => {
+                assert!(
+                    file.damage.as_ref().is_some_and(|d| !d.always_refused()),
+                    "{} is Ready",
+                    file.file
+                );
+                ready += 1;
+            }
+            (Some(_), PhotoStatus::Skipped { reason }) => {
+                assert!(
+                    is_damage_sentence(reason),
+                    "{}: {reason:?} is not in the catalogue",
+                    file.file
+                );
+                skipped += 1;
+            }
+            (Some(_), other) => panic!("{}: {other:?}", file.file),
+        }
+    }
+    assert!(
+        ready >= 10 && skipped > 0,
+        "{ready} ready, {skipped} skipped"
+    );
+
+    let out = tempfile::tempdir().expect("out");
+    let id = h.api.export_start(&jpeg_job(out.path())).expect("start");
+    wait_until("the export to finish", || {
+        h.events.events().iter().any(
+            |e| matches!(e, AppEvent::ExportProgress(p) if p.job_id == id && p.done == p.total),
+        )
+    });
+    wait_until("the queue to go idle", || !h.api.export_busy());
+    let summary = h
+        .api
+        .core()
+        .export_summary(u64::from(id.0))
+        .expect("the job has a summary");
+    // The photos that were refused when the folder opened are not in the job; the ones that opened
+    // are all written.
+    assert_eq!(summary.total, ready);
+    assert_eq!((summary.saved, summary.failed), (ready, 0), "{summary:?}");
+    assert!(summary.errors.is_empty());
+    let together = files_with_bytes(out.path());
+    assert_eq!(together.len(), ready);
+
+    // The same ten good files in an app of their own give the same bytes.
+    let alone = Harness::new();
+    for (variant, bytes) in valid_files() {
+        std::fs::write(
+            alone.photos.path().join(format!("good_{variant}.ARW")),
+            bytes,
+        )
+        .expect("write");
+    }
+    alone
+        .api
+        .open_paths(&[alone.photos.path().to_string_lossy().into_owned()])
+        .expect("open the good files");
+    alone.develop();
+    let alone_out = tempfile::tempdir().expect("out");
+    let alone_id = alone
+        .api
+        .export_start(&jpeg_job(alone_out.path()))
+        .expect("start");
+    wait_until("the export of the good files to finish", || {
+        alone.events.events().iter().any(|e| {
+            matches!(e, AppEvent::ExportProgress(p) if p.job_id == alone_id && p.done == p.total)
+        })
+    });
+    wait_until("the queue of the good files to go idle", || {
+        !alone.api.export_busy()
+    });
+    let alone_files = files_with_bytes(alone_out.path());
+    assert_eq!(alone_files.len(), 10);
+    for (name, bytes) in &alone_files {
+        assert_eq!(
+            together.get(name).map(Vec::as_slice),
+            Some(bytes.as_slice()),
+            "{name} changed next to damaged files"
+        );
     }
 }

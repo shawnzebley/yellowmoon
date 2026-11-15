@@ -1,0 +1,71 @@
+# The iPhone web app (web/): builds `ym` for WebAssembly with threads, checks it in Chrome on a
+# synthetic A7C II raw (open, preview, change settings, export), then publishes web/dist to GitHub
+# Pages. Only in this fork; upstream has no web app.
+name: Web app
+
+on:
+  push:
+    branches: [main]
+    paths: ["web/**", "crates/**", "data/**", "Cargo.toml", "Cargo.lock", ".cargo/**", ".github/workflows/web.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: web-pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build and check in Chrome
+    if: ${{ github.repository == 'shawnzebley/yellowmoon' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust toolchain from rust-toolchain.toml, with the WebAssembly target
+        run: |
+          rustup toolchain install
+          rustup target add wasm32-wasip1-threads
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: web
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Build web/dist
+        run: web/build.sh
+      - name: Make an A7C II raw file (synthetic)
+        run: |
+          mkdir -p "$RUNNER_TEMP/raw"
+          cargo run -p ym-raw --features testgen --release --example gen_arw -- ILCE-7CM2 1536 1024 "$RUNNER_TEMP/raw/A7CII.ARW" iso=800
+      - name: Open, preview, adjust and export in Chrome
+        run: |
+          cd web && npm install --no-audit --no-fund
+          mkdir -p "$RUNNER_TEMP/e2e"
+          (cd dist && python3 -m http.server 8124 --bind 127.0.0.1 >/dev/null 2>&1 &)
+          sleep 1
+          node tools/e2e.mjs http://127.0.0.1:8124/ "$RUNNER_TEMP/raw/A7CII.ARW" "$RUNNER_TEMP/e2e"
+          test -s "$RUNNER_TEMP/e2e/A7CII_neutral.jpg"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: web-e2e
+          path: ${{ runner.temp }}/e2e
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: web/dist
+
+  deploy:
+    name: Publish to GitHub Pages
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

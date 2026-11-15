@@ -42,13 +42,14 @@ html.dark {
   /* The rules between the cells: a thin light rim. */
   --rim: color-mix(in oklch, var(--ink) 16%, transparent);
 
-  /* Tab colours: each keeps its hue, lightened where it was dark; black text on all six. */
+  /* Tab colours: each keeps its hue, lightened where it was dark; black text on all seven (Lens, the owner's request of 2026-10-25, is a soft violet). */
   --tab-look: #ffc20e;   --tab-look-ink: #000000;
   --tab-light: #2ec4f4;  --tab-light-ink: #000000;
   --tab-colour: #7be35f; --tab-colour-ink: #000000;
   --tab-detail: #f4b9ac; --tab-detail-ink: #000000;
   --tab-curve: #ff7340;  --tab-curve-ink: #000000;
   --tab-raw: #5b9bff;    --tab-raw-ink: #000000;
+  --tab-lens: #bd8cff;   --tab-lens-ink: #000000;
 }
 /* A tab's accent is the accent of its controls: glasscn paints sliders, switches, toggles, the tab underline and the focus ring from
    --primary, so setting it on the tab's subtree is all it takes. */
@@ -58,10 +59,37 @@ html.dark {
 [data-tab="detail"] { --primary: var(--tab-detail); --primary-foreground: var(--tab-detail-ink); --ring: var(--tab-detail); }
 [data-tab="curve"] { --primary: var(--tab-curve); --primary-foreground: var(--tab-curve-ink); --ring: var(--tab-curve); }
 [data-tab="raw"] { --primary: var(--tab-raw); --primary-foreground: var(--tab-raw-ink); --ring: var(--tab-raw); }
+[data-tab="lens"] { --primary: var(--tab-lens); --primary-foreground: var(--tab-lens-ink); --ring: var(--tab-lens); }
+/* The Mask tab of a corrector (docs/23 §7.6) has the mask accent, as the other tabs have theirs: --mask in tokens.css. */
+[data-tab="mask"] { --primary: var(--mask); --primary-foreground: var(--mask-ink); --ring: var(--mask); }
+/* The tabs of a Film node (docs/24 section 4.1) take the Look tab's yellow (screens 02 to 08 of design/film). */
+[data-tab="film"], [data-tab="print"], [data-tab="halation"], [data-tab="grain"], [data-tab="inputs"], [data-tab="blend"], [data-tab="channels"] { --primary: var(--tab-look); --primary-foreground: var(--tab-look-ink); --ring: var(--tab-look); }
 
 body {
   font-family: var(--font);
   color: var(--glass-label);
+}
+
+/* Floating layers (`docs/28` A-P4, `docs/11` *Floating layers*). A menu, a popover, a select list, a tooltip or a dialog opens over the photo as
+   well as over the panes, and at the glass's 40 % a white photo shows through it (the Fit menu was 2.3:1). So their tint never falls under
+   `--glass-floating-opacity`, whatever the glass is set to: the same glass, the same blur, rim and highlight, less see-through. A tint set
+   higher (the stock picker's 92 %) is kept, and Reduce Transparency's 100 % is higher still, so `max()` keeps both. The panes do not use this:
+   they stay translucent over the aurora, which is never a bright photo. It sets the background and not `--glass-liquid-opacity`, which every
+   control inside would inherit. */
+html.dark {
+  --glass-floating-opacity: 88%;
+}
+:is(
+  [data-slot="dropdown-menu-content"],
+  [data-slot="dropdown-menu-sub-content"],
+  [data-slot="context-menu-content"],
+  [data-slot="context-menu-sub-content"],
+  [data-slot="popover-content"],
+  [data-slot="select-content"],
+  [data-slot="tooltip-content"],
+  [data-slot="dialog-content"]
+) {
+  background-color: color-mix(in oklch, var(--glass-tinted, var(--glass-tint)) max(var(--glass-floating-opacity), var(--glass-liquid-opacity)), transparent);
 }
 
 /* ---- 2. Layout --------------------------------------------------------------------------------------------------------------------- */
@@ -88,6 +116,25 @@ html:has(.ym-screen[data-screen="photos"]) #root {
   mask-repeat: no-repeat;
   -webkit-mask-composite: xor;
   mask-composite: exclude;
+}
+
+/* Full screen (F, docs/11 §Full screen): the photo alone. The header, the filmstrip and the panel are `hidden` (Photos.tsx); the grid is
+   one cell and the photo cell, 3:2 everywhere else, takes all of it. Its rectangle is then the window's: PhotoCell reports it (a
+   ResizeObserver), the native viewport and the aurora's cut-out follow, and Fit fits the new cell as after a window resize. The camera
+   line under the photo goes too; the chips that answer a key (the look, Before, the ⌥ readout) stay. */
+.ym-screen[data-screen="photos"][data-fullscreen="true"] {
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr);
+}
+.ym-screen[data-screen="photos"][data-fullscreen="true"] .ym-photo-cell {
+  grid-column: 1;
+  grid-row: 1;
+  width: 100%;
+  height: 100%;
+  aspect-ratio: auto;
+}
+.ym-screen[data-screen="photos"][data-fullscreen="true"] .ym-photo-cell__camera {
+  display: none;
 }
 
 /* The header: the same row of cells (folder, actions, update, Export), one glass surface, a rim under it and between the cells. */
@@ -140,8 +187,24 @@ html:has(.ym-screen[data-screen="photos"]) #root {
     display: none;
   }
 }
-/* The Pick white hint is a whole sentence on one line (219 px). Beside the glass buttons it does not fit below about 1357 px: at 1347 it ran
-   9 px into the Export cell. There it floats over the top right of the photo area instead, just under the header. */
+/* Before, Crop and Nodes have an icon and a label. Where the header has no room for the labels (below 1360 px: at 1300 px the header
+   overflowed by 32 px with them), the label is visually hidden and stays the button's accessible name; the tooltip says it too. */
+@media (max-width: 1359px) {
+  .ym-header-label {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    margin: -1px;
+    padding: 0;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+    border: 0;
+  }
+}
+/* The header's hint is a whole sentence on one line (Pick colour's now; Pick white's is a pill on the photo, and the number is from that
+   longer one, 219 px). Beside the glass buttons it does not fit below about 1357 px: at 1347 it ran 9 px into the Export cell. There it
+   floats over the top right of the photo area instead, just under the header. */
 @media (max-width: 1359px) {
   .ym-status[data-hint="true"] {
     @apply glass-liquid;
@@ -365,6 +428,36 @@ html:has(.ym-screen[data-screen="photos"]) #root {
   font-size: var(--fs-label);
   font-weight: var(--fw-heavy);
 }
+/* A list of choices with a line under each name (`ChoiceList`, the Lens card, `docs/21` section 1): glasscn's RadioGroup of Item rows. The
+   row is a label, so a click anywhere on it chooses it; the chosen row has the tab colour as a 2 px ring drawn inside its box (an inset
+   ring: nothing outside the row for a clipping box to cut) and a circle filled with it. The name is bold, the line under it is in the
+   quieter label colour. */
+.ym-choice-list {
+  gap: 6px;
+}
+.ym-choice-row {
+  gap: 12px;
+  padding-block: 8px;
+}
+.ym-choice-row__radio {
+  margin-top: 1px;
+  /* The circle is what takes the focus, and the browser scrolls it into the panel with the panel's scroll padding (8 px) around it; the
+     row's box and its ring stand 9 px outside the circle, so without this the row's top or bottom edge was cut by a pixel. */
+  scroll-margin-block: 10px;
+}
+.ym-choice-row__text {
+  gap: 2px;
+  min-width: 0;
+}
+.ym-choice-row__name {
+  font-size: var(--fs-body);
+  font-weight: var(--fw-bold);
+}
+.ym-choice-row__line {
+  color: var(--glass-label-secondary);
+  font-size: var(--fs-small);
+  line-height: 1.35;
+}
 
 /* The histogram (an SVG: glasscn has none). */
 .ym-histogram {
@@ -548,16 +641,20 @@ html:has(.ym-screen[data-screen="photos"]) #root {
    --filmstrip-min-h); each thumbnail is as tall as that row less the tool panel's inset (--pad-panel, 24 px) above and below, so the space
    from a thumbnail to the edge of its cell is the space from a control to the edge of the tool panel. The row is a size container so
    the thumbnails can read its height; the scroller keeps the same inset on its left and right. */
+/* The strip's ground, shared with the node view's graph and its divider (`.ym-graph`, `.ym-divider`): the neutral graphite of 2026-10-17, the same grey as
+   the panes and a little darker at the foot. --strip-alpha is how much of the colour covers the glass (100% is an opaque surface). */
+.ym-filmstrip,
+.ym-graph,
+.ym-divider {
+  --strip-alpha: 96%;
+  --strip-neutral: linear-gradient(to bottom, color-mix(in oklch, oklch(0.27 0 0) var(--strip-alpha), transparent), color-mix(in oklch, oklch(0.17 0 0) var(--strip-alpha), transparent));
+}
 .ym-filmstrip {
   @apply glass rounded-none;
   --strip-inset: var(--pad-panel);
   --strip-gap: 8px;
   /* The strip has a surface of its own, so the warm part of the aurora no longer sits under warm thumbnails. Three tried, one
-     chosen: change --strip-surface to --strip-neutral, --strip-graphite, --strip-blue or --strip-tab and nothing else. --strip-alpha is how much of the
-     colour covers the glass (100% is an opaque surface; less lets the aurora and the blur through). */
-  --strip-alpha: 96%;
-  /* The neutral graphite ground (2026-10-17): the strip is the same grey as the panes, a little darker at the foot. */
-  --strip-neutral: linear-gradient(to bottom, color-mix(in oklch, oklch(0.27 0 0) var(--strip-alpha), transparent), color-mix(in oklch, oklch(0.17 0 0) var(--strip-alpha), transparent));
+     chosen: change --strip-surface to --strip-neutral, --strip-graphite, --strip-blue or --strip-tab and nothing else. */
   --strip-graphite: linear-gradient(to bottom, color-mix(in oklch, oklch(0.3 0.008 255) var(--strip-alpha), transparent), color-mix(in oklch, oklch(0.2 0.008 255) var(--strip-alpha), transparent));
   --strip-blue: linear-gradient(to bottom, color-mix(in oklch, oklch(0.27 0.045 232) var(--strip-alpha), transparent), color-mix(in oklch, oklch(0.165 0.035 240) var(--strip-alpha), transparent));
   --strip-tab: linear-gradient(to bottom, color-mix(in oklab, color-mix(in oklab, var(--primary) 9%, oklch(0.23 0.004 255)) var(--strip-alpha), transparent), color-mix(in oklab, color-mix(in oklab, var(--primary) 3%, oklch(0.16 0.004 255)) var(--strip-alpha), transparent));
@@ -583,6 +680,19 @@ html:has(.ym-screen[data-screen="photos"]) #root {
   min-width: 0;
   padding: var(--strip-inset);
   overflow-x: auto;
+}
+/* The list inside the scroller and the list item round each thumbnail (docs/28 A-08: the item carries the position in the set). Both are
+   plain boxes that lay out as the thumbnails did when they were the scroller's own flex items: the same gap, the same top alignment. The
+   item holds the margins that stand in for the thumbnails that are not drawn. */
+.ym-filmstrip__list {
+  display: flex;
+  flex-shrink: 0;
+  align-items: flex-start;
+  gap: var(--strip-gap);
+}
+.ym-filmstrip__item {
+  display: flex;
+  flex-shrink: 0;
 }
 /* Every thumbnail is the same 3:2 box, so a photo keeps its shape inside it (the picture is never stretched). The selected one is told
    apart by its ring, not by its size: a larger one could not keep the inset above and below it. */
@@ -645,6 +755,27 @@ html:has(.ym-screen[data-screen="photos"]) #root {
   background: var(--tab-look);
   box-shadow: 0 0 0 2px #000;
 }
+/* The nodes glyph of a photo whose graph the simple view does not show (docs/23 §6): a small glass square at the thumbnail's bottom left, the
+   chips' tint and rim; its tooltip says what the graph has ("4 nodes"). */
+.ym-filmstrip__nodes {
+  position: absolute;
+  bottom: 5px;
+  left: 5px;
+  z-index: 2;
+  display: grid;
+  place-items: center;
+  width: 20px;
+  height: 20px;
+  box-sizing: border-box;
+  border: 1px solid rgb(255 255 255 / 0.22);
+  border-radius: 7px;
+  background: rgb(14 14 18 / 0.74);
+  color: rgb(255 255 255 / 0.9);
+}
+.ym-filmstrip__nodes svg {
+  width: 12px;
+  height: 12px;
+}
 .ym-filmstrip__thumb[data-in-export="true"][aria-current="true"] {
   border-width: 3px;
 }
@@ -669,6 +800,1084 @@ span.ym-filmstrip__thumb {
   line-height: 14px;
   white-space: nowrap;
   pointer-events: none;
+}
+
+/* ---- Node view (docs/23 §7.1, layout A) ---------------------------------------------------------------------------------------------- */
+/* In the simple view the photo's wrapper makes no box: the cell is a grid item of the screen, as it was. In the node view (`data-nodes`,
+   not in full screen) the screen is five areas: the header, the photo on top at the left, the 10 px divider, the graph under it (its
+   height is --editor-h, the divider's place, set by Photos; the photo gets the rest), and the 400 px panel at the right, full height.
+   The photo cell is still 3:2: as wide as the row is tall times 1.5 (--viewer-h), or the whole column when that is narrower; the paper
+   on both sides of it is the wrapper's own, drawn beside the cell and never over it (the native viewport shows through the cell). */
+.ym-viewer {
+  display: contents;
+}
+.ym-screen[data-screen="photos"][data-nodes="true"] {
+  --divider-h: 10px;
+  grid-template-columns: minmax(0, 1fr) var(--panel-w);
+  grid-template-rows: var(--header-h) minmax(0, 1fr) var(--divider-h) var(--editor-h);
+  grid-template-areas:
+    "header header"
+    "photo tools"
+    "divider tools"
+    "graph tools";
+}
+.ym-screen[data-nodes="true"] .ym-header {
+  grid-area: header;
+}
+.ym-screen[data-nodes="true"] .ym-viewer {
+  grid-area: photo;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+}
+.ym-screen[data-nodes="true"] .ym-viewer::before,
+.ym-screen[data-nodes="true"] .ym-viewer::after {
+  content: "";
+  flex: 1 1 0;
+  align-self: stretch;
+  min-width: 0;
+  background: var(--paper);
+}
+.ym-screen[data-nodes="true"] .ym-viewer > .ym-photo-cell {
+  flex: 0 1 calc(var(--viewer-h) * 1.5);
+  width: auto;
+  min-width: 0;
+  margin: 0;
+}
+/* The landmark around the divider and the graph takes no box: both stay grid items of the screen. */
+.ym-node-view:not([hidden]) {
+  display: contents;
+}
+.ym-screen[data-nodes="true"] .ym-divider {
+  grid-area: divider;
+}
+.ym-screen[data-nodes="true"] .ym-graph {
+  grid-area: graph;
+}
+.ym-screen[data-nodes="true"] .ym-tools {
+  grid-area: tools;
+}
+
+/* The divider: a window splitter between the photo and the graph, in the strip's ground, with a grab handle. */
+.ym-divider {
+  position: relative;
+  display: grid;
+  place-items: center;
+  box-sizing: border-box;
+  cursor: row-resize;
+  touch-action: none;
+  background: var(--strip-neutral);
+  border-top: 1px solid var(--rim);
+}
+.ym-divider__grip {
+  width: 44px;
+  height: 4px;
+  border-radius: 4px;
+  background: color-mix(in oklch, var(--ink) 30%, transparent);
+  transition: background-color var(--glass-duration) ease-out;
+}
+.ym-divider:hover .ym-divider__grip,
+.ym-divider[data-dragging="true"] .ym-divider__grip {
+  background: color-mix(in oklch, var(--ink) 55%, transparent);
+}
+/* The two scrollers that are a keyboard stop of their own (Start's list, the Export strip): the ring sits inside the box, so no ancestor's
+   overflow clips it, the same as the divider's. */
+.ym-develop-list:focus-visible,
+.ym-filmstrip__scroll:focus-visible {
+  outline: var(--glass-ring-width) solid var(--ring);
+  outline-offset: -3px;
+}
+.ym-divider:focus-visible {
+  outline: var(--glass-ring-width) solid var(--ring);
+  outline-offset: -3px;
+}
+
+/* The graph area: a 44 px toolbar in the strip's ground and the canvas under it (docs/23 §7.3). */
+.ym-graph {
+  @apply glass rounded-none;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  background: var(--strip-neutral);
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+  border-width: 0;
+}
+.ym-graph[data-dimmed="true"] {
+  opacity: 0.45;
+}
+.ym-graph__bar {
+  display: flex;
+  flex-shrink: 0;
+  align-items: center;
+  gap: 8px;
+  box-sizing: border-box;
+  height: 44px;
+  padding: 0 12px;
+  border-bottom: 1px solid var(--rim);
+}
+.ym-graph__spacer {
+  flex: 1;
+}
+.ym-graph__canvas {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+  background-color: oklch(0.125 0 0);
+  background-image: radial-gradient(circle, color-mix(in oklch, var(--ink) 16%, transparent) 1px, transparent 1.3px);
+  background-size: 18px 18px;
+  background-position: 9px 9px;
+  box-shadow: inset 0 2px 8px rgb(0 0 0 / 0.35);
+}
+
+/* The graph (docs/23 §7.2, N-08): @xyflow/react's canvas over the dotted ground, with our own cards, markers, ports and links. The geometry
+   repeats src/screens/nodes/graphLayout.ts (a card is 150 × 112, its ports stick out 9 px; one grid unit is 214 × 150); the pictures are
+   design/nodes/html/pages/states.html and 05.html. */
+.ym-flow {
+  position: absolute;
+  inset: 0;
+  user-select: none;
+  -webkit-user-select: none;
+}
+.ym-flow .react-flow {
+  --xy-background-color: transparent;
+  /* xyflow's own rule for a selected or focused link (.react-flow__edge.selected .react-flow__edge-path) has the specificity of ours below, and in
+     the built app its sheet loads after this one and wins (a grey #555 link); its variable carries our yellow whichever rule wins. */
+  --xy-edge-stroke-selected: var(--tab-look);
+  --ym-link: color-mix(in oklch, var(--ink) 42%, transparent);
+  font-family: inherit;
+}
+/* One class more than xyflow's `.react-flow__node.draggable { cursor: grab }`, which has the specificity of a bare `.ym-flow .react-flow__node` and, in
+   the built app, its sheet loads after this one and wins (every card showed a grab hand; the dev server loads ours last). A card is picked up
+   by its body without a hand: the pointer stays an arrow, as in `design/nodes`. */
+.ym-flow .react-flow .react-flow__node {
+  cursor: default;
+}
+/* xyflow's corner link ("React Flow") would open its page in the webview itself and be one more Tab stop; the library's licence (MIT) is in
+   THIRD-PARTY.md with the others (docs/14). */
+.ym-flow .react-flow__attribution {
+  display: none;
+}
+.ym-link-markers {
+  position: absolute;
+  pointer-events: none;
+}
+.ym-arrow {
+  fill: color-mix(in oklch, var(--ink) 58%, transparent);
+}
+.ym-arrow--key {
+  fill: var(--mask);
+}
+.ym-arrow--selected {
+  fill: var(--tab-look);
+}
+
+/* A card: the name above, a box of a thumbnail band and a footer, a ring when selected, the ports on its sides. */
+.ym-gnode {
+  position: relative;
+  width: 150px;
+  height: 112px;
+  color: var(--glass-label);
+}
+.ym-gnode[data-dead] .ym-gnode__box,
+.ym-gnode[data-dead] .ym-gnode__name {
+  opacity: 0.45;
+}
+.ym-gnode[data-dead] .ym-port {
+  opacity: 0.45;
+}
+.ym-gnode__name {
+  position: absolute;
+  right: 0;
+  bottom: 100%;
+  left: 0;
+  margin-bottom: 4px;
+  overflow: hidden;
+  color: var(--glass-label-secondary);
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.01em;
+  line-height: 15px;
+  text-align: center;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ym-gnode[data-selected] .ym-gnode__name {
+  color: var(--glass-label);
+}
+.ym-gnode[data-bypass] .ym-gnode__name {
+  color: var(--glass-label-tertiary);
+}
+.ym-gnode__rename {
+  position: absolute;
+  right: -10px;
+  bottom: 100%;
+  left: -10px;
+  width: auto;
+  height: 24px;
+  margin-bottom: 2px;
+  padding: 0 8px;
+  font-size: 12px;
+  font-weight: 700;
+  text-align: center;
+  user-select: text;
+  -webkit-user-select: text;
+}
+.ym-gnode__box {
+  position: relative;
+  box-sizing: border-box;
+  width: 150px;
+  height: 112px;
+  overflow: hidden;
+  border: 1px solid var(--rim);
+  border-radius: 14px;
+  background: oklch(0.2 0 0);
+  box-shadow:
+    0 8px 18px rgb(0 0 0 / 0.38),
+    inset 0 0 0 0.5px rgb(255 255 255 / 0.04);
+  /* A button is an arrow, as everywhere in the app (docs/11 desktop feel): the hand is for links. */
+  cursor: default;
+}
+.ym-gnode__box:focus-visible {
+  outline: var(--glass-ring-width, 3px) solid var(--focus);
+  outline-offset: 7px;
+}
+.ym-gnode__thumb {
+  position: relative;
+  height: 81px;
+  overflow: hidden;
+  background: var(--code-bg);
+}
+.ym-gnode__thumb img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  pointer-events: none;
+}
+.ym-gnode[data-bypass] .ym-gnode__thumb img {
+  opacity: 0.5;
+  filter: grayscale(0.6);
+}
+.ym-gnode__slash {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background: linear-gradient(to top right, transparent calc(50% - 0.75px), rgb(255 255 255 / 0.55) calc(50% - 0.75px), rgb(255 255 255 / 0.55) calc(50% + 0.75px), transparent calc(50% + 0.75px));
+}
+.ym-gnode__foot {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: 30px;
+  padding: 0 7px;
+  border-top: 1px solid var(--rim);
+}
+.ym-gnode__num {
+  display: inline-grid;
+  place-items: center;
+  min-width: 22px;
+  height: 18px;
+  padding: 0 4px;
+  border-radius: 6px;
+  background: color-mix(in oklch, var(--ink) 16%, transparent);
+  box-shadow: inset 0 0 0 1px var(--rim);
+  color: var(--glass-label);
+  font-size: 10.5px;
+  font-weight: 800;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.04em;
+}
+.ym-gnode__tools {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  margin-left: auto;
+  color: var(--glass-label-secondary);
+}
+.ym-gnode__tools svg {
+  display: block;
+}
+.ym-gnode__mask {
+  color: var(--mask);
+}
+.ym-gnode__ring {
+  position: absolute;
+  inset: -4px;
+  display: none;
+  border: 2px solid var(--tab-look);
+  border-radius: 17px;
+  pointer-events: none;
+}
+.ym-gnode[data-selected] .ym-gnode__ring {
+  display: block;
+}
+/* A link is selected: the card the panel is on keeps a quiet ring, so that the link is the one thing that is selected. */
+.ym-gnode[data-quiet] .ym-gnode__ring,
+.ym-marker[data-quiet] .ym-marker__dot::after {
+  border-color: var(--rim);
+}
+
+/* The Input and the Output: a 32 px disc with a lock, the name under it. */
+.ym-marker {
+  position: relative;
+  width: 32px;
+  height: 32px;
+  color: var(--glass-label-secondary);
+}
+.ym-marker__dot {
+  position: relative;
+  display: grid;
+  place-items: center;
+  box-sizing: border-box;
+  width: 32px;
+  height: 32px;
+  border: 1.5px solid color-mix(in oklch, var(--ink) 55%, transparent);
+  border-radius: 50%;
+  background: oklch(0.22 0 0);
+  box-shadow: 0 5px 12px rgb(0 0 0 / 0.35);
+  color: var(--glass-label-secondary);
+  cursor: default;
+}
+.ym-marker__dot svg {
+  width: 13px;
+  height: 13px;
+}
+.ym-marker__dot:focus-visible {
+  outline: var(--glass-ring-width, 3px) solid var(--focus);
+  outline-offset: 8px;
+}
+.ym-marker[data-selected] .ym-marker__dot::after {
+  content: "";
+  position: absolute;
+  inset: -5px;
+  border: 2px solid var(--tab-look);
+  border-radius: 50%;
+}
+.ym-marker__word {
+  position: absolute;
+  top: 39px;
+  left: 50%;
+  color: var(--glass-label-secondary);
+  font-size: 12px;
+  font-weight: 700;
+  transform: translateX(-50%);
+}
+.ym-marker[data-selected] .ym-marker__word {
+  color: var(--glass-label);
+}
+
+/* A port: a triangle (an input) or a square (an output), light grey for a picture and the mask accent for a key. xyflow places the box; the
+   press lands on the larger target around it. While a link is dragged the inputs that take it light up and the others dim. */
+.ym-port.react-flow__handle {
+  display: block;
+  min-width: 0;
+  min-height: 0;
+  border: 0;
+  background: transparent;
+  color: oklch(0.82 0 0);
+  pointer-events: none;
+}
+.ym-port[data-port="key"] {
+  color: var(--mask);
+}
+.ym-port[data-port="key"]:not([data-linked]) {
+  opacity: 0.55;
+}
+.ym-port__glyph {
+  display: block;
+  pointer-events: none;
+}
+.ym-port__square {
+  width: 8px;
+  height: 8px;
+  border-radius: 2px;
+  background: currentColor;
+}
+.ym-port__hit {
+  position: absolute;
+  inset: -9px -8px;
+  pointer-events: auto;
+  cursor: crosshair;
+}
+.ym-port[data-side="in"]:not([data-linked]) .ym-port__hit {
+  cursor: default;
+}
+.ym-port[data-side="in"][data-linked] .ym-port__hit {
+  cursor: grab;
+}
+.ym-port[data-state="lit"] {
+  filter: drop-shadow(0 0 4px currentColor);
+  opacity: 1;
+}
+.ym-port[data-state="lit"] .ym-port__glyph {
+  transform: scale(1.35);
+}
+.ym-port[data-state="dim"] {
+  opacity: 0.25;
+}
+.ym-port[data-hover] .ym-port__glyph {
+  transform: scale(1.7);
+}
+.ym-flow[data-linking] .ym-port[data-side="in"] .ym-port__hit {
+  cursor: copy;
+}
+
+/* A link. */
+.ym-link .react-flow__edge-path {
+  stroke: var(--ym-link);
+  stroke-width: 1.6px;
+  stroke-linecap: round;
+}
+.ym-link[data-kind="key"] .react-flow__edge-path {
+  stroke: var(--mask);
+  stroke-dasharray: 5 4;
+}
+.ym-link[data-selected] .react-flow__edge-path,
+.ym-link[data-drop] .react-flow__edge-path {
+  stroke: var(--tab-look);
+  stroke-width: 3px;
+}
+.ym-link:hover .react-flow__edge-path {
+  stroke-width: 2.4px;
+}
+.react-flow__edge:has(.ym-link[data-selected]) {
+  outline: none;
+}
+/* The link being drawn or carried follows the pointer from the output it left. */
+.ym-draft {
+  position: absolute;
+  overflow: visible;
+  pointer-events: none;
+}
+.ym-draft path {
+  fill: none;
+  stroke: color-mix(in oklch, var(--ink) 75%, transparent);
+  stroke-width: 1.8px;
+  stroke-linecap: round;
+}
+.ym-draft[data-kind="key"] path {
+  stroke: var(--mask);
+  stroke-dasharray: 5 4;
+}
+.ym-graph-hint {
+  position: absolute;
+  color: var(--glass-label-tertiary);
+  font-size: 12px;
+  font-weight: 600;
+  text-align: center;
+  white-space: nowrap;
+  transform: translateX(-50%);
+  pointer-events: none;
+}
+
+/* The zoom control at the bottom right: "−", the zoom, "+" and Fit. */
+.ym-zoom {
+  position: absolute;
+  right: 12px;
+  bottom: 12px;
+  z-index: 10;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.ym-zoom__value {
+  min-width: 42px;
+  color: var(--glass-label-secondary);
+  font-size: 12px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  text-align: center;
+}
+.ym-more-menu {
+  min-width: 14rem;
+}
+
+/* "‹ 2 of 7 ›": two icon buttons and the count between them. */
+.ym-switcher {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  color: var(--glass-label-secondary);
+  font-size: var(--fs-small);
+  font-weight: var(--fw-semibold);
+  font-variant-numeric: tabular-nums;
+}
+.ym-switcher__count {
+  padding: 0 6px;
+  white-space: nowrap;
+}
+/* The Add node menu opens over the photo: a wide glass list, each item a name with a quiet line under it and, for what comes later, a tag. */
+.ym-add-node-menu {
+  min-width: 22rem;
+}
+.ym-menu-line {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+.ym-menu-line__name {
+  font-size: var(--fs-body);
+  line-height: 1.25;
+}
+.ym-menu-line__text {
+  color: var(--glass-label-tertiary);
+  font-size: var(--fs-small);
+  line-height: 1.3;
+}
+
+/* The notice of a photo that has more than the simple view shows (docs/23 §6): a pinned strip under the tab row, a glass pill (the chips'
+   tint and rim) with the nodes glyph, two lines of text and the link Open nodes at the end of the second. */
+.ym-tools__nodes {
+  flex-shrink: 0;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--rim);
+}
+.ym-nodes-notice {
+  flex-wrap: nowrap;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 9px 12px;
+  border: 1px solid rgb(255 255 255 / 0.2);
+  border-radius: 16px;
+  background: rgb(14 14 18 / 0.74);
+  color: #fff;
+  font-size: 12.5px;
+  font-weight: 650;
+  line-height: 1.35;
+}
+.ym-nodes-notice [data-slot="item-media"] {
+  flex-shrink: 0;
+  width: 16px;
+  height: 16px;
+  margin-top: 2px;
+  color: var(--glass-label-secondary);
+}
+.ym-nodes-notice__link {
+  display: inline;
+  height: auto;
+  padding: 0;
+  font-size: 12.5px;
+  font-weight: var(--fw-bold);
+  line-height: inherit;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  white-space: nowrap;
+  vertical-align: baseline;
+}
+
+/* ---- The node's head and the Mask tab (docs/23 §7.5, §7.6) ----------------------------------------------------------------------- */
+/* One line of 52 px at the top of the node view's panel: the number chip (a lock for the Input and the Output), the name at 20 px bold, the
+   quiet line, and round icon buttons at the right. There is no 40 px title block in the node view. */
+.ym-nodehead {
+  display: flex;
+  flex-shrink: 0;
+  align-items: center;
+  gap: 7px;
+  height: 52px;
+  box-sizing: border-box;
+  padding: 0 10px 0 14px;
+  border-bottom: 1px solid var(--rim);
+}
+.ym-nodehead__chip {
+  display: inline-grid;
+  flex-shrink: 0;
+  place-items: center;
+  min-width: 28px;
+  height: 22px;
+  padding: 0 5px;
+  box-sizing: border-box;
+  border-radius: 7px;
+  background: color-mix(in oklch, var(--ink) 16%, transparent);
+  box-shadow: inset 0 0 0 1px var(--rim);
+  color: var(--glass-label);
+  font-size: 11px;
+  font-weight: var(--fw-heavy);
+  letter-spacing: 0.04em;
+  font-variant-numeric: tabular-nums;
+}
+.ym-nodehead__chip svg {
+  width: 13px;
+  height: 13px;
+  color: var(--glass-label-secondary);
+}
+.ym-nodehead__text {
+  display: flex;
+  flex: 1;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+}
+.ym-nodehead__name {
+  flex-shrink: 0;
+  max-width: 58%;
+  margin: 0;
+  overflow: hidden;
+  font-size: 20px;
+  font-weight: var(--fw-heavy);
+  letter-spacing: -0.01em;
+  line-height: 1.15;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ym-nodehead__name:focus-visible {
+  outline: var(--ym-focus-width, 2px) solid var(--ring);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+.ym-nodehead__line {
+  min-width: 0;
+  margin: 0;
+  overflow: hidden;
+  color: var(--glass-label-secondary);
+  font-size: 12px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ym-nodehead__rename {
+  flex: 1;
+  min-width: 0;
+  font-size: 15px;
+  font-weight: var(--fw-heavy);
+}
+.ym-nodehead__actions {
+  display: flex;
+  flex-shrink: 0;
+  align-items: center;
+  gap: 3px;
+}
+.ym-nodehead button.ym-nodehead__btn {
+  width: 28px;
+  min-width: 0;
+  height: 28px;
+  padding: 0;
+  border-radius: 999px;
+}
+.ym-nodehead .ym-nodehead__btn svg {
+  width: 15px;
+  height: 15px;
+}
+
+/* The View card of the Mask tab (`ViewCard`, docs/23 section 7.6): the key chip at the right of the title, and the two-segment control filling
+   the field's column. */
+.ym-card__keys {
+  display: inline-flex;
+  align-items: center;
+  color: var(--glass-label-tertiary);
+}
+.ym-view-style {
+  min-width: 0;
+}
+
+/* The Mask tab (docs/23 section 7.6): the Masks card's rows, the Pick colour row of a Colour range, the Add mask menu and the handles on the photo. */
+.ym-mask-card {
+  display: contents;
+}
+.ym-mask-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 0 0 12px;
+  padding: 0;
+  list-style: none;
+}
+.ym-mask-row {
+  position: relative;
+  display: flex;
+  flex-wrap: nowrap;
+  align-items: center;
+  gap: 4px;
+  min-height: 54px;
+  box-sizing: border-box;
+  padding: 6px 6px 6px 8px;
+  border: 1px solid var(--rim);
+  border-radius: 14px;
+  background: color-mix(in oklch, var(--ink) 6%, transparent);
+}
+/* The selected row has a 2 px ring in the mask accent. */
+.ym-mask-row[data-selected] {
+  border-color: transparent;
+  box-shadow: 0 0 0 2px var(--mask);
+}
+/* A row that is off is dimmed: its name and kind; its switch, Add | Subtract and tools stay as they are, so it can be turned on. */
+.ym-mask-row[data-off] .ym-mask-row__select {
+  opacity: 0.55;
+}
+/* The on/off switch at the row's left, before the kind's icon: glasscn's small capsule, made compact here (28 × 16 px) so the subtitle fits at the panel's
+   default width. glasscn's `hit-area` keeps a 24 px square around it for the pointer. */
+.ym-mask-row__switch {
+  flex-shrink: 0;
+}
+.ym-mask-row .ym-mask-row__switch[data-size="sm"] {
+  width: 28px;
+  height: 16px;
+  padding: 2px;
+}
+.ym-mask-row .ym-mask-row__switch[data-size="sm"] > [data-slot="switch-thumb"] {
+  width: 16px;
+  height: 12px;
+}
+.ym-mask-row .ym-mask-row__switch[data-size="sm"] > [data-slot="switch-thumb"][data-state="checked"] {
+  margin-inline-start: 8px;
+}
+.ym-mask-row__select {
+  display: flex;
+  flex: 1;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 8px;
+  background: none;
+  color: inherit;
+  text-align: start;
+  cursor: default;
+}
+.ym-mask-row__select:focus-visible {
+  outline: var(--ym-focus-width, 3px) solid var(--focus);
+  outline-offset: 3px;
+}
+.ym-mask-row__icon {
+  display: inline-flex;
+  flex-shrink: 0;
+  color: var(--glass-label-secondary);
+}
+.ym-mask-row[data-selected] .ym-mask-row__icon {
+  color: var(--mask);
+}
+.ym-mask-row__icon svg {
+  width: 20px;
+  height: 20px;
+}
+.ym-mask-row__text {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-width: 0;
+}
+.ym-mask-row__name {
+  font-size: 13.5px;
+  font-weight: var(--fw-heavy);
+}
+/* A subtitle wraps to a second line when it does not fit, so the row grows; it is never cut with an ellipsis. */
+.ym-mask-row__sub {
+  color: var(--glass-label-secondary);
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.25;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+/* "Finding…" while a raster is being made for the first time on a photo (a Background row's blur map): a small spinner before the words. */
+.ym-mask-row__sub[data-finding] {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.ym-mask-row__sub[data-finding] svg {
+  width: 12px;
+  height: 12px;
+}
+/* Invert and the eye: 32 px icon toggles with a hairline; Invert pressed is the mask accent itself. */
+.ym-mask-row__tool {
+  width: 32px;
+  min-width: 32px;
+  height: 32px;
+  padding: 0;
+  border-radius: 10px;
+  box-shadow: inset 0 0 0 1px var(--rim);
+}
+.ym-mask-row__tool[data-tool="invert"][aria-pressed="true"] {
+  background: var(--mask);
+  color: var(--mask-ink);
+  box-shadow: none;
+}
+.ym-mask-row__tool[data-tool="eye"][aria-pressed="true"] {
+  background: color-mix(in oklch, var(--mask) 24%, transparent);
+  color: var(--mask);
+  box-shadow: inset 0 0 0 1px var(--mask);
+}
+.ym-mask-row__tool[data-tool="eye"][aria-pressed="false"] {
+  color: var(--glass-label-secondary);
+}
+.ym-mask-pick {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 0 0 8px;
+}
+.ym-mask-pick__right {
+  margin-left: auto;
+}
+.ym-card__header > .ym-mask-pick {
+  margin: 0;
+}
+
+/* The Add mask menu opens to the left of the panel, over the photo and the graph: up to 580 px tall (ten items with Depth are 573 px; a shorter window scrolls it). */
+.ym-add-mask-menu {
+  min-width: 19rem;
+  max-height: min(580px, var(--radix-dropdown-menu-content-available-height, 580px));
+  overflow-y: auto;
+}
+/* Ten items and three group titles fit in the 580 px without scrolling. The menu is over the photo, not over the dark panel as the other menus
+   are; like every menu it has the floating layers' tint floor (above, `docs/28` A-P4), which keeps the lines under the names readable. */
+.ym-add-mask-menu [data-slot="dropdown-menu-item"] {
+  padding-block: 5px;
+}
+.ym-add-mask-menu .ym-menu-line__text {
+  color: var(--glass-label-secondary);
+}
+.ym-menu-group {
+  color: var(--glass-label-tertiary);
+  font-size: 11px;
+  font-weight: var(--fw-heavy);
+  letter-spacing: var(--ls-tag);
+  text-transform: uppercase;
+}
+
+/* The handles of a Linear or a Radial on the photo (MaskHandles): drawn over the cell in the mask accent. The layer takes no pointer; the handles and
+   the centre line's wide hit stroke do. */
+.ym-mask-handles {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  pointer-events: none;
+}
+.ym-mask-handles__svg {
+  position: absolute;
+  inset: 0;
+  overflow: visible;
+}
+.ym-mask-line polyline {
+  fill: none;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.ym-mask-line__under {
+  stroke: rgb(0 0 0 / 0.55);
+  stroke-width: 4px;
+}
+.ym-mask-line__ink {
+  stroke: var(--mask);
+  stroke-width: 2px;
+}
+.ym-mask-line[data-dashed] .ym-mask-line__ink {
+  stroke-dasharray: 7 6;
+}
+.ym-mask-line[data-line="centre"] .ym-mask-line__ink {
+  stroke: #fff;
+  stroke-width: 1.6px;
+}
+.ym-mask-line__hit {
+  stroke: transparent;
+  stroke-width: 22px;
+  pointer-events: stroke;
+  cursor: move;
+}
+.ym-mask-handle {
+  position: absolute;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  box-sizing: border-box;
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  border: 2px solid var(--mask);
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 0 0 1.5px rgb(0 0 0 / 0.55);
+  transform: translate(-50%, -50%);
+  pointer-events: auto;
+  touch-action: none;
+  cursor: default;
+}
+/* A hit area wider than the handle is drawn. */
+.ym-mask-handle::after {
+  content: "";
+  position: absolute;
+  inset: -9px;
+}
+.ym-mask-handle:focus-visible {
+  outline: var(--ym-focus-width, 3px) solid var(--focus);
+  outline-offset: 3px;
+}
+.ym-mask-handle[data-kind="move"] {
+  width: 14px;
+  height: 14px;
+  background: var(--mask);
+  cursor: move;
+}
+.ym-mask-handle[data-kind="radius"] {
+  cursor: nesw-resize;
+}
+.ym-mask-handle[data-kind="feather"] {
+  width: 12px;
+  height: 12px;
+  border-radius: 3px;
+  /* One transform, so that the diamond turns about its own middle, which is the point it stands on. */
+  transform: translate(-50%, -50%) rotate(45deg);
+  cursor: ns-resize;
+}
+.ym-mask-handle[data-kind="rotate"] {
+  width: 28px;
+  height: 28px;
+  background: var(--mask);
+  color: var(--mask-ink);
+  cursor: grab;
+}
+.ym-mask-handles[data-dragging="true"] .ym-mask-handle {
+  cursor: grabbing;
+}
+.ym-mask-handle[data-kind="rotate"] svg {
+  width: 14px;
+  height: 14px;
+}
+
+/* The Brush tool on the photo (BrushLayer, docs/23 section 7.6): a layer over the cell that takes the press, the cursor circle at the brush's size and
+   the stroke being drawn, in the mask accent. It is a surface to draw on, not a control: nothing in it is a Tab stop. */
+.ym-brush-layer {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  touch-action: none;
+  cursor: none;
+}
+.ym-brush-layer[data-paper] {
+  cursor: default;
+}
+.ym-brush-layer__svg {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  pointer-events: none;
+}
+.ym-brush-stroke {
+  fill: none;
+  stroke: var(--mask);
+  stroke-opacity: 0.5;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.ym-brush-stroke[data-erase] {
+  stroke: #000;
+  stroke-opacity: 0.55;
+}
+.ym-brush-cursor {
+  position: absolute;
+  box-sizing: border-box;
+  border: 1.5px solid var(--mask);
+  border-radius: 50%;
+  box-shadow: 0 0 0 1.5px rgb(0 0 0 / 0.55), inset 0 0 0 1.5px rgb(0 0 0 / 0.35);
+  transform: translate(-50%, -50%);
+  pointer-events: none;
+}
+.ym-brush-cursor[data-erase] {
+  border-style: dashed;
+  border-color: #fff;
+}
+/* Where the brush starts to soften: a ring inside the circle, as wide as the hardness. */
+.ym-brush-cursor__core {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  box-sizing: border-box;
+  border: 1px solid rgb(255 255 255 / 0.7);
+  border-radius: 50%;
+  box-shadow: 0 0 0 1px rgb(0 0 0 / 0.4);
+  transform: translate(-50%, -50%);
+}
+.ym-brush-cursor__dot {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 3px;
+  height: 3px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 0 0 1px rgb(0 0 0 / 0.6);
+  transform: translate(-50%, -50%);
+}
+.ym-brush-tool {
+  margin: 0 0 8px;
+}
+
+/* The Object row on the photo (ObjectLayer, docs/23 section 7.6): its points as circles with a plus or a minus and its box, in the mask accent. With the
+   tool on the layer takes the press (a click finds an object, a drag with Box draws a box); with it off the layer takes nothing and the photo is the
+   person's again. It is a surface to click on, not a control: nothing in it is a Tab stop. */
+.ym-object-layer {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  pointer-events: none;
+}
+.ym-object-layer[data-tool] {
+  pointer-events: auto;
+  touch-action: none;
+  cursor: crosshair;
+}
+.ym-object-layer[data-tool="remove"] {
+  cursor: crosshair;
+}
+.ym-object-layer__svg {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  pointer-events: none;
+}
+.ym-object-point circle {
+  fill: rgb(255 255 255 / 0.92);
+  stroke: var(--mask);
+  stroke-width: 2px;
+  filter: drop-shadow(0 0 1.5px rgb(0 0 0 / 0.6));
+}
+.ym-object-point path {
+  fill: none;
+  stroke: #1a1a1f;
+  stroke-width: 2px;
+  stroke-linecap: round;
+}
+.ym-object-point[data-object-point="remove"] circle {
+  fill: #1a1a1f;
+  stroke: #fff;
+}
+.ym-object-point[data-object-point="remove"] path {
+  stroke: #fff;
+}
+.ym-object-box polygon {
+  fill: none;
+  stroke-linejoin: round;
+}
+.ym-object-box__under {
+  stroke: rgb(0 0 0 / 0.55);
+  stroke-width: 4px;
+}
+.ym-object-box__ink {
+  stroke: var(--mask);
+  stroke-width: 2px;
+  stroke-dasharray: 7 5;
+}
+.ym-object-box__band {
+  fill: rgb(255 111 210 / 0.12);
+  stroke: var(--mask);
+  stroke-width: 2px;
+  stroke-dasharray: 7 5;
+}
+.ym-object-tool {
+  margin: 0 0 8px;
+}
+.ym-photo-cell__found svg {
+  color: var(--mask);
 }
 
 /* ---- Export panel ---------------------------------------------------------------------------------------------------------------- */
@@ -699,6 +1908,17 @@ span.ym-filmstrip__thumb {
 .ym-export__footer-pair [data-slot="button"] {
   width: 100%;
 }
+/* The export stopped at a failure of the destination: one banner above the list, in the red of the wizard's error callout. */
+.ym-export__banner {
+  margin-top: 16px;
+  border: 0;
+  border-radius: calc(var(--glass-radius-surface) * 0.6);
+  background: color-mix(in oklch, var(--destructive) 20%, transparent);
+  color: var(--glass-label);
+  font-size: var(--fs-body);
+  font-weight: var(--fw-semibold);
+  line-height: 1.5;
+}
 
 /* ---- Dialogs: Preferences rows, About -------------------------------------------------------------------------------------------- */
 .ym-pref {
@@ -712,6 +1932,10 @@ span.ym-filmstrip__thumb {
   font-size: 0.9375rem;
   font-weight: 600;
 }
+/* A row with a paragraph of hint and a note (Auto grading): the control stays level with the title, not in the middle of the text. */
+.ym-pref--top {
+  align-items: flex-start;
+}
 .ym-pref__hint {
   color: var(--glass-label-secondary);
   font-size: 0.8125rem;
@@ -720,7 +1944,60 @@ span.ym-filmstrip__thumb {
   padding: 4px 0 0;
   border-bottom: 1px solid var(--rim);
 }
-/* The instructions for Apple Intelligence under the Apple Auto row (docs/19 section 2): a label, the text area, then the hint and the
+/* "Auto grading" (docs/22 section 12): one muted line under the row for each program that is installed but cannot be used and for a
+   saved choice that is not available. The row above gives up its rule, so the notes read as part of it. */
+.ym-pref:has(+ .ym-pref__notes) {
+  border-bottom: 0;
+}
+.ym-pref__notes {
+  display: grid;
+  gap: 6px;
+  padding: 0 0 12px;
+  border-bottom: 1px solid var(--rim);
+}
+/* The saved-choice note with its "Use Default Auto" button beside it, at the right end as the row's control is; the note wraps to give it room. */
+.ym-pref__saved {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+.ym-pref__saved .ym-pref__note {
+  flex: 1 1 0;
+  min-width: 0;
+}
+.ym-pref__saved [data-slot="button"] {
+  flex: none;
+}
+.ym-pref__note.ym-row-note {
+  margin: 0;
+  font-size: 0.8125rem;
+  line-height: 1.45;
+}
+/* Antigravity's Experimental note, under the hint, with its badge. */
+.ym-pref__experimental {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin-top: 6px;
+}
+.ym-pref__experimental [data-slot="badge"] {
+  flex: none;
+}
+/* The badge and the tag of an entry of the dropdown, after the name. */
+.ym-pref__badge,
+.ym-pref__tag {
+  flex: none;
+}
+.ym-pref__tag {
+  margin-inline-start: auto;
+}
+/* The same tag in the trigger, after the name of a saved program that cannot be chosen: tighter, so that the longest name and tag
+   ("Claude Code" and "Update needed") fit its 220 px whole. */
+.ym-pref__tag.ym-pref__tag--trigger {
+  padding-inline: 4px;
+}
+/* The instructions for the grading model under the Auto grading row (docs/19 section 2): a label, the text area, then the hint and the
    count beside the Reset to default button. */
 .ym-pref__instructions {
   display: grid;
@@ -776,4 +2053,452 @@ span.ym-filmstrip__thumb {
    (docs/11 §Desktop feel). glasscn's own buttons set no cursor, and the base rule `button { cursor: default }` is the arrow. */
 button[data-slot="button"][data-variant="link"]:not([aria-disabled="true"]) {
   cursor: pointer;
+}
+/* The span that carries a switch's tooltip: as wide as the switch, no more. */
+.ym-switch-tip {
+  display: inline-flex;
+  flex-shrink: 0;
+}
+
+/* ---- The Film node's panel (docs/24 section 4, design/film) ------------------------------------------------------------------------- */
+/* The Stock field: a glass field like the Select's trigger, which opens the tiles. */
+.ym-stock-field {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  box-sizing: border-box;
+  width: 100%;
+  min-width: 0;
+  height: var(--spacing-control, 2.5rem);
+  padding: 0 12px;
+  border: 0;
+  border-radius: var(--glass-radius-control);
+  background: var(--color-fill);
+  box-shadow: inset 0 0 0 1px var(--glass-border);
+  color: var(--glass-label);
+  font: inherit;
+  font-size: var(--fs-body);
+  text-align: left;
+  cursor: default;
+}
+.ym-stock-field[aria-expanded="true"] {
+  background: var(--color-fill-strong);
+}
+.ym-stock-field:focus-visible {
+  outline: var(--glass-ring-width) solid var(--ring);
+  outline-offset: 2px;
+}
+.ym-stock-field[data-disabled="true"] {
+  opacity: 0.6;
+}
+.ym-stock-field__value {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ym-stock-field svg {
+  flex: none;
+  width: 16px;
+  height: 16px;
+  color: var(--glass-label-secondary);
+}
+.ym-film-select {
+  width: 100%;
+}
+/* The quiet line under a field ("Colour negative · ISO 400", the matching paper's name, the lights' hint). */
+.ym-film-line {
+  margin: 6px 0 0 var(--label-col);
+  padding-left: var(--gap-row);
+  font-size: 13px;
+  line-height: 1.4;
+}
+.ym-film-line:last-child {
+  margin-bottom: 10px;
+}
+.ym-film-line[role="status"] {
+  color: var(--glass-label);
+}
+/* The tiles: six columns, no scrolling, over the photo from the panel's right edge. */
+.ym-stock-picker {
+  width: min(784px, calc(100vw - 32px));
+  gap: 14px;
+  padding: 18px 16px 16px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  /* It opens to the left, over the photo cell. In the app the page is transparent there and the photo is a native layer behind it, so
+     the backdrop blur has nothing to blur: the glass has to be dense on its own, or the names are lost on a bright photo. */
+  --glass-liquid-opacity: 92%;
+}
+.ym-stock-picker__heading {
+  margin: 0 0 8px 2px;
+  color: var(--glass-label-secondary);
+  font-size: 11px;
+  font-weight: var(--fw-heavy);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.ym-stock-picker__grid {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  gap: 10px 10px;
+}
+.ym-stock-tile {
+  gap: 4px;
+}
+.ym-stock-tile .ym-look-tile__picture {
+  background: var(--color-fill);
+}
+.ym-stock-tile__card {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 6px;
+  color: var(--glass-label-secondary);
+  font-size: 11px;
+  line-height: 1.25;
+  text-align: center;
+}
+.ym-stock-tile__check {
+  position: absolute;
+  top: 5px;
+  right: 5px;
+  display: grid;
+  place-items: center;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background: var(--primary);
+  color: var(--primary-foreground);
+}
+.ym-stock-tile__check svg {
+  width: 13px;
+  height: 13px;
+  stroke-width: 3;
+}
+.ym-stock-tile__name {
+  max-width: 100%;
+  font-size: var(--fs-label);
+  font-weight: var(--fw-semibold);
+  line-height: 1.25;
+  white-space: normal;
+}
+.ym-stock-tile__iso {
+  color: var(--glass-label-secondary);
+  font-size: 11px;
+}
+.ym-stock-tile[aria-pressed="true"] .ym-stock-tile__name {
+  font-weight: var(--fw-heavy);
+}
+/* The Print tab of a slide: the sentence, then the controls dimmed. */
+.ym-film-slide {
+  margin: 0;
+  padding: 14px var(--pad-panel) 6px;
+  color: var(--glass-label);
+  font-size: var(--fs-body);
+  font-weight: var(--fw-bold);
+  line-height: 1.4;
+}
+.ym-film-print[data-slide] > section {
+  opacity: 0.4;
+}
+.ym-film-more {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin: 4px 0 8px;
+  padding: 4px 0;
+  border: 0;
+  background: transparent;
+  color: var(--primary);
+  font: inherit;
+  font-size: var(--fs-body);
+  font-weight: var(--fw-heavy);
+  cursor: default;
+}
+.ym-film-more:disabled {
+  color: var(--glass-label-tertiary);
+}
+.ym-film-more:focus-visible {
+  outline: var(--glass-ring-width) solid var(--ring);
+  outline-offset: 2px;
+}
+.ym-film-more svg {
+  width: 16px;
+  height: 16px;
+  transition: rotate var(--glass-duration) var(--glass-ease);
+}
+.ym-film-more svg[data-open] {
+  rotate: 90deg;
+}
+/* The credit line at the foot of the Film tab and in About. */
+.ym-film-credit {
+  margin: 0;
+  padding: 18px var(--pad-panel) 8px;
+  color: var(--glass-label-secondary);
+  font-size: 13px;
+  line-height: 1.5;
+}
+.ym-film-credit__link {
+  display: inline;
+  height: auto;
+  padding: 0;
+  font-size: inherit;
+  font-weight: var(--fw-semibold);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  white-space: normal;
+}
+/* The note on the Output's Look tab while a Film node is live (design/film/10). */
+.ym-film-note {
+  align-items: flex-start;
+  margin: 14px 12px 0;
+  font-size: 13px;
+  line-height: 1.45;
+}
+.ym-film-note svg {
+  flex: none;
+  width: 16px;
+  height: 16px;
+  margin-top: 2px;
+  color: var(--glass-label-secondary);
+}
+.ym-about-dialog__film-credit {
+  margin: 0;
+  font-size: var(--fs-body);
+  line-height: 1.5;
+}
+.ym-about-dialog__film-credit .ym-film-credit__link {
+  font-weight: var(--fw-semibold);
+}
+.ym-about-dialog__film-legal {
+  margin: 8px 0 0;
+  color: var(--glass-label-secondary);
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+
+/* YM_GLASS=off (or ?glass=off): the glass without its blur, so the cost of the blur can be compared on the same machine (U-02). The attribute
+   is set by src/main.tsx only when asked for; nothing here changes the look otherwise. */
+html[data-glass="off"] *,
+html[data-glass="off"] *::before,
+html[data-glass="off"] *::after {
+  -webkit-backdrop-filter: none !important;
+  backdrop-filter: none !important;
+}
+
+/* ======================================================================================================================================
+   The four kinds of docs/25 (X-06): glyph cards, their ports, and the rows of their panels (design/mixers/).
+   ====================================================================================================================================== */
+/* A glyph card: 56 px wide, a rounded box with the kind's glyph; no thumbnail, no number, no footer. Its pos is its middle line. */
+.ym-gnode--glyph {
+  height: auto;
+}
+.ym-gnode__glyphbox {
+  display: grid;
+  place-items: center;
+  border-radius: 16px;
+  background: oklch(0.225 0 0);
+}
+.ym-gnode--glyph .ym-gnode__box {
+  width: 100%;
+}
+.ym-glyph {
+  color: var(--glass-label-secondary);
+}
+.ym-gnode--glyph[data-selected] .ym-glyph {
+  color: var(--glass-label);
+}
+.ym-gnode--glyph[data-bypass] .ym-glyph {
+  opacity: 0.5;
+}
+.ym-gnode--glyph[data-dead] .ym-glyph {
+  opacity: 1;
+}
+.ym-gnode--glyph .ym-gnode__ring {
+  border-radius: 20px;
+}
+/* The name is wider than the card: it is cut at ten letters, and "Combiner" and "Splitter" are about 56 px. */
+.ym-gnode--glyph .ym-gnode__name {
+  right: -24px;
+  left: -24px;
+}
+.ym-gnode--glyph .ym-gnode__rename {
+  right: -34px;
+  left: -34px;
+}
+/* The Splitter's glyph sits toward its one input, the Combiner's toward its one output, so the channel letters have the other side. */
+.ym-gnode--glyph[data-glyph="splitter"] .ym-glyph {
+  transform: translateX(-9px);
+}
+.ym-gnode--glyph[data-glyph="combiner"] .ym-glyph {
+  transform: translateX(9px);
+}
+.ym-gnode__letter {
+  position: absolute;
+  width: 10px;
+  height: 14px;
+  color: var(--ch);
+  font-size: 10px;
+  font-weight: 800;
+  line-height: 14px;
+  text-align: center;
+  pointer-events: none;
+}
+.ym-gnode__letter[data-side="right"] {
+  right: 7px;
+}
+.ym-gnode__letter[data-side="left"] {
+  left: 7px;
+}
+
+/* The "+" port: an empty triangle with a plus, a little larger than an arrowhead; yellow and larger while a link is over it. */
+.ym-port--plus {
+  color: oklch(0.82 0 0);
+  opacity: 0.85;
+}
+.ym-port--plus[data-state="lit"] {
+  opacity: 1;
+}
+.ym-port--plus[data-hover] .ym-port__glyph {
+  transform: scale(1.25);
+  transform-origin: 100% 50%;
+}
+.ym-port--plus[data-hover] {
+  color: var(--tab-look);
+}
+.ym-port--plus .ym-port__hit {
+  inset: -6px -8px;
+}
+/* The channel ports of a Splitter and a Combiner: tinted, with a letter in the card. */
+.ym-port.react-flow__handle.ym-port--ch {
+  color: var(--ch);
+}
+
+/* The rows of a mixer's Inputs card. */
+.ym-input-rows,
+.ym-channel-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 8px 0 4px;
+  padding: 0;
+  list-style: none;
+}
+.ym-input-row,
+.ym-channel-row {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 54px;
+  box-sizing: border-box;
+  padding: 6px 12px 6px 8px;
+  border: 1px solid var(--rim);
+  border-radius: 14px;
+  background: color-mix(in oklch, var(--ink) 6%, transparent);
+}
+.ym-input-row:focus-visible {
+  outline: var(--ym-focus-width, 3px) solid var(--focus);
+  outline-offset: 2px;
+}
+.ym-input-row[data-dragging] {
+  z-index: 2;
+  background: color-mix(in oklch, var(--ink) 14%, transparent);
+  box-shadow: 0 8px 18px rgb(0 0 0 / 0.38);
+  pointer-events: none;
+}
+.ym-input-row[data-over] {
+  box-shadow: 0 0 0 2px var(--tab-look);
+}
+.ym-input-row__grip {
+  display: grid;
+  place-items: center;
+  width: 16px;
+  color: var(--glass-label-tertiary);
+  cursor: grab;
+  touch-action: none;
+}
+.ym-input-row__grip svg {
+  width: 16px;
+  height: 16px;
+}
+.ym-input-row__thumb {
+  display: grid;
+  flex-shrink: 0;
+  place-items: center;
+  width: 62px;
+  height: 40px;
+  overflow: hidden;
+  border-radius: 7px;
+  background: var(--code-bg);
+  color: var(--glass-label-secondary);
+}
+.ym-input-row__thumb img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+.ym-input-row__thumb svg {
+  width: 18px;
+  height: 18px;
+}
+.ym-input-row__num {
+  display: inline-grid;
+  place-items: center;
+  flex-shrink: 0;
+  min-width: 22px;
+  height: 18px;
+  padding: 0 4px;
+  border-radius: 6px;
+  background: color-mix(in oklch, var(--ink) 16%, transparent);
+  box-shadow: inset 0 0 0 1px var(--rim);
+  font-size: 10.5px;
+  font-weight: 800;
+  font-variant-numeric: tabular-nums;
+}
+.ym-input-row__name {
+  min-width: 0;
+  flex: 1;
+  overflow: hidden;
+  font-size: 15px;
+  font-weight: var(--fw-heavy);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ym-input-row__sub {
+  flex-shrink: 0;
+  color: var(--glass-label-secondary);
+  font-size: 12px;
+  font-weight: 600;
+}
+.ym-mixer-line {
+  margin: 4px 0 8px;
+}
+.ym-channel-row__chip {
+  display: inline-grid;
+  place-items: center;
+  flex-shrink: 0;
+  width: 22px;
+  height: 22px;
+  border-radius: 7px;
+  background: color-mix(in oklch, var(--ch) 16%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in oklch, var(--ch) 45%, transparent);
+  color: var(--ch);
+  font-size: 11px;
+  font-weight: 800;
+}
+.ym-channel-row__name {
+  flex: 1;
+  font-size: 15px;
+  font-weight: var(--fw-heavy);
+}
+.ym-channel-row__where {
+  color: var(--glass-label-secondary);
+  font-size: 12.5px;
+  font-weight: 600;
 }

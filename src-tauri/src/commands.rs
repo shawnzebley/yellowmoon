@@ -16,12 +16,14 @@ use tauri_specta::{Builder, collect_commands, collect_events};
 use crate::api::AppApi;
 use crate::system;
 use crate::wire::{
-    self, AppError, AppInfo, AppleAutoStatus, ApplyScope, ChromaSample, ChromaScatter,
-    CliLinkResult, CliLinkStatus, DisplayLut, ErrorScope, ExportEstimate, ExportJob, ExportJobId,
-    HistogramData, Look, LookId, LookInput, LooksImportResult, MenuState, Num, OpenKind,
-    PasteReport, PhotoId, PixelSample, Preferences, PreferencesPatch, ResolvedSettings,
-    SessionChange, SessionState, SettingsPatch, SourceRecognition, ThumbnailReady, ViewportInfo,
-    ViewportInput, ViewportMode, ViewportRect, WatchStatus,
+    self, AppError, AppInfo, ApplyScope, AutoStatus, ChromaSample, ChromaScatter, ChromaTap,
+    CliLinkResult, CliLinkStatus, CropAspect, CropSuggestion, DepthFar, ErrorScope, ExportEstimate,
+    ExportJob, ExportJobId, FilmCatalogue, FocusPlaneResult, HistogramData, LensInfo, Look, LookId,
+    LookInput, LooksImportResult, MapFrom, MaskFindPrompt, MaskFindResult, MaskKind, MaskView,
+    MenuState, NodeId, Num, OpenKind, Orientation, PasteReport, PhotoId, PixelSample, Preferences,
+    PreferencesPatch, ResolvedSettings, SessionChange, SessionState, SettingsPatch,
+    SourceRecognition, ThumbnailReady, ViewportInfo, ViewportInput, ViewportMode, ViewportRect,
+    WatchStatus,
 };
 
 /// The managed state: the command handlers, or why the application could not start.
@@ -121,6 +123,17 @@ pub async fn open_dialog(
     .await
 }
 
+/// `cancel_open()`: stops the `open_paths` or `open_dialog` call that is reading files; the files read so far stay.
+#[tauri::command]
+#[specta::specta]
+pub async fn cancel_open(state: State<'_, AppState>) -> Result<(), AppError> {
+    run(&state, |api| {
+        api.cancel_open();
+        Ok(())
+    })
+    .await
+}
+
 /// `session_state()`.
 #[tauri::command]
 #[specta::specta]
@@ -195,7 +208,21 @@ pub async fn update_settings(
     photo_id: PhotoId,
     patch: SettingsPatch,
 ) -> Result<ResolvedSettings, AppError> {
-    run(&state, move |api| api.update_settings(photo_id, &patch)).await
+    // Stamped for the timeline of a slider tick when `YM_PERF` is on (`timeline`): a flag check otherwise.
+    let tick = crate::timeline::begin_update();
+    let reply = run(&state, move |api| api.update_settings(photo_id, &patch)).await;
+    crate::timeline::end_update(tick);
+    reply
+}
+
+/// `perf_report(report)`: the page's stamps of the slider ticks and clicks of the last second, as a string of JSON
+/// (`src/perfTimeline.ts`), joined with the shell's own and written to the local log (`timeline`). Sent only when the page was told to
+/// measure (`YM_PERF`); with the switch off it does nothing. Nothing leaves the machine.
+#[tauri::command]
+#[specta::specta]
+pub async fn perf_report(report: String) -> Result<(), AppError> {
+    crate::timeline::report(&report);
+    Ok(())
 }
 
 /// `apply_look(scope, look_id, intensity)`: to This photo, the Picked photos or All.
@@ -257,24 +284,43 @@ pub fn set_menu_state(app: AppHandle, state: MenuState) -> Result<(), AppError> 
     crate::menu::apply_state(&app, &state).map_err(AppError::internal)
 }
 
-/// `histogram(photo_id)`: the RGB histogram of the photo as it is rendered now.
+/// `histogram(photo_id, at)`: the RGB histogram of the signal at a node (`docs/01`): the input of
+/// its curve, or `"input"`, the Input's output; `null` is Main's, the photo as it is rendered now.
 #[tauri::command]
 #[specta::specta]
 pub async fn histogram(
     state: State<'_, AppState>,
     photo_id: PhotoId,
+    at: Option<NodeId>,
 ) -> Result<HistogramData, AppError> {
-    run(&state, move |api| api.histogram(photo_id)).await
+    run(&state, move |api| api.histogram(photo_id, at)).await
 }
 
-/// `chroma_scatter(photo_id)`: the photo's colours at the colour warp's input, for its plane.
+/// `chroma_scatter(photo_id, at)`: the photo's colours at the input of a node's colour warp, for
+/// its plane; `null` is Main's.
 #[tauri::command]
 #[specta::specta]
 pub async fn chroma_scatter(
     state: State<'_, AppState>,
     photo_id: PhotoId,
+    at: Option<NodeId>,
 ) -> Result<ChromaScatter, AppError> {
-    run(&state, move |api| api.chroma_scatter(photo_id)).await
+    run(&state, move |api| api.chroma_scatter(photo_id, at)).await
+}
+
+/// `suggest_crop(photo_id, aspect, orientation)`: Auto crop's proposal (`docs/20-auto-crop.md` §3).
+#[tauri::command]
+#[specta::specta]
+pub async fn suggest_crop(
+    state: State<'_, AppState>,
+    photo_id: PhotoId,
+    aspect: CropAspect,
+    orientation: Orientation,
+) -> Result<CropSuggestion, AppError> {
+    run(&state, move |api| {
+        api.suggest_crop(photo_id, aspect, orientation)
+    })
+    .await
 }
 
 // --- Viewport ---------------------------------------------------------------------------------
@@ -310,14 +356,19 @@ pub async fn viewport_input(
     run(&state, move |api| api.viewport_input(&event)).await
 }
 
-/// `viewport_set_mode(mode)`: Fit, or a fixed zoom.
+/// `viewport_set_mode(mode, mask_view)`: Fit, or a fixed zoom, and the mask view of the node view: a
+/// corrector's mask shown over the photo or alone, `None` for the photo (`docs/23` section 5.8).
 #[tauri::command]
 #[specta::specta]
 pub async fn viewport_set_mode(
     state: State<'_, AppState>,
     mode: ViewportMode,
+    mask_view: Option<MaskView>,
 ) -> Result<(), AppError> {
-    run(&state, move |api| api.viewport_set_mode(&mode)).await
+    run(&state, move |api| {
+        api.viewport_set_mode(&mode, mask_view.as_ref())
+    })
+    .await
 }
 
 /// `set_before(before)`: the photo before the look and the display transform.
@@ -342,16 +393,105 @@ pub async fn sample_pixel(
     run(&state, move |api| api.sample_pixel(x.0, y.0)).await
 }
 
-/// `sample_chroma(x, y)`: the chroma at the colour warp's input under a point of the photo cell
-/// (Pick colour); `null` on the paper around the photo.
+/// `sample_chroma(x, y, at, tap)`: the chroma under a point of the photo cell (Pick colour; `null` for `at` is Main's).
+/// `tap` is `warp_input` (or `null`): at the input of the node's colour warp, after its trim and grade; or `node_input`:
+/// at the picture the node reads, before its trim and grade, which is what a Colour range selects on. `null` on the paper
+/// around the photo.
 #[tauri::command]
 #[specta::specta]
 pub async fn sample_chroma(
     state: State<'_, AppState>,
     x: Num,
     y: Num,
+    at: Option<NodeId>,
+    tap: Option<ChromaTap>,
 ) -> Result<Option<ChromaSample>, AppError> {
-    run(&state, move |api| api.sample_chroma(x.0, y.0)).await
+    run(&state, move |api| api.sample_chroma(x.0, y.0, at, tap)).await
+}
+
+/// `viewport_map_points(points, from)` (`docs/23` sections 3.6 and 9): maps points between the photo frame and the cell,
+/// for the handles and outlines the page draws over the photo. `from` is `photo` (points in the photo frame, answered as
+/// CSS pixels from the cell's corner, which may lie outside the cell) or `cell` (CSS pixels, answered as photo-frame
+/// fractions, `null` for a point on the paper). One answer per point, in order.
+#[tauri::command]
+#[specta::specta]
+pub async fn viewport_map_points(
+    state: State<'_, AppState>,
+    points: Vec<[Num; 2]>,
+    from: MapFrom,
+) -> Result<Vec<Option<[Num; 2]>>, AppError> {
+    run(&state, move |api| api.viewport_map_points(&points, from)).await
+}
+
+/// `mask_kinds()` (`docs/23` section 9): the kinds of mask this machine can make now. The Add mask menu lists exactly
+/// these.
+#[tauri::command]
+#[specta::specta]
+pub async fn mask_kinds(state: State<'_, AppState>) -> Result<Vec<MaskKind>, AppError> {
+    run(&state, |api| api.mask_kinds()).await
+}
+
+/// `mask_find(photo_id, node, mask, prompt)` (`docs/23` section 9): runs SAM for the Object row `mask` of `node` with the
+/// person's click or box added, and answers what the row's `points` and `box` become, or that nothing was found. It changes no
+/// settings: the page sends a found answer as one row patch (one undo step). It waits for the encoder if it is still
+/// running.
+#[tauri::command]
+#[specta::specta]
+pub async fn mask_find(
+    state: State<'_, AppState>,
+    photo_id: PhotoId,
+    node: u32,
+    mask: u32,
+    prompt: MaskFindPrompt,
+) -> Result<MaskFindResult, AppError> {
+    run(&state, move |api| {
+        api.mask_find(photo_id, node, mask, prompt)
+    })
+    .await
+}
+
+/// `sample_depth(photo_id, x, y)` (`docs/23` section 9, Pick depth): the far limit `{ far }` for the depth at the
+/// photo-frame point, or null when no depth map can be made. It changes no settings: the page writes the answer
+/// as one row patch (one undo step). It waits for the depth map if the worker is still making it.
+#[tauri::command]
+#[specta::specta]
+pub async fn sample_depth(
+    state: State<'_, AppState>,
+    photo_id: PhotoId,
+    x: Num,
+    y: Num,
+) -> Result<Option<DepthFar>, AppError> {
+    run(&state, move |api| api.sample_depth(photo_id, x, y)).await
+}
+
+/// `focus_plane(photo_id)` (`docs/23` section 9, Focus plane): the far limit for the plane the camera focused on, or why
+/// there is none (`no_focus_point` at once, `map_failed`). It changes no settings: the page writes the limit as one row patch
+/// (one undo step).
+#[tauri::command]
+#[specta::specta]
+pub async fn focus_plane(
+    state: State<'_, AppState>,
+    photo_id: PhotoId,
+) -> Result<FocusPlaneResult, AppError> {
+    run(&state, move |api| api.focus_plane(photo_id)).await
+}
+
+/// `retry_depth(photo_id)` (`docs/23` section 4.8, "Try again"): starts the depth map of a photo again after it failed. It
+/// returns at once; `depth_state` says how the worker ended. It changes no settings.
+#[tauri::command]
+#[specta::specta]
+pub async fn retry_depth(state: State<'_, AppState>, photo_id: PhotoId) -> Result<(), AppError> {
+    run(&state, move |api| api.retry_depth(photo_id)).await
+}
+
+// --- Lens -------------------------------------------------------------------------------------
+
+/// `lens_list()`: the lenses of the Lens card's menu, in menu order, with their names, lines and
+/// starting amounts. Empty when the lens data could not be loaded.
+#[tauri::command]
+#[specta::specta]
+pub async fn lens_list(state: State<'_, AppState>) -> Result<Vec<LensInfo>, AppError> {
+    run(&state, |api| api.lens_list()).await
 }
 
 // --- Looks ------------------------------------------------------------------------------------
@@ -377,6 +517,45 @@ pub async fn look_thumbnail(
     run(&state, move |api| api.look_thumbnail(photo_id, &look_id)).await
 }
 
+/// `film_catalogue()` (`docs/24` section 4.1): the camera films and papers the Film node's pickers list, from `names.json`, with the
+/// credit, disclaimer and trademark lines.
+#[tauri::command]
+#[specta::specta]
+pub async fn film_catalogue(state: State<'_, AppState>) -> Result<FilmCatalogue, AppError> {
+    run(&state, |api| api.film_catalogue()).await
+}
+
+/// `film_tile(photo_id, node, stock)` (`docs/24` section 4.4): the photo through one stock in Film node `node`, at the photo's
+/// settings. The answer is the address of a PNG of at most 240 px on the `ym-frame` scheme
+/// (`ym-frame://localhost/<launch>/look-<photo>-<n>.png`), made at the thumbnails' priority and cancelled when the person moves to
+/// another photo.
+#[tauri::command]
+#[specta::specta]
+pub async fn film_tile(
+    state: State<'_, AppState>,
+    photo_id: PhotoId,
+    node: u32,
+    stock: String,
+) -> Result<String, AppError> {
+    run(&state, move |api| api.film_tile(photo_id, node, &stock)).await
+}
+
+/// `node_thumbnails(photo_id)` (`docs/23` sections 5.7 and 9): asks for the thumbnails of every node of
+/// the photo. Answers `null` at once; the pictures that changed arrive as a `node_thumbnails_ready`
+/// event, each the address of a PNG on the `ym-frame` scheme.
+#[tauri::command]
+#[specta::specta]
+pub async fn node_thumbnails(
+    state: State<'_, AppState>,
+    photo_id: PhotoId,
+) -> Result<(), AppError> {
+    run(&state, move |api| {
+        api.node_thumbnails(photo_id);
+        Ok(())
+    })
+    .await
+}
+
 /// `looks_import(path, input)`: a zip, a folder or a `.cube` file.
 #[tauri::command]
 #[specta::specta]
@@ -396,13 +575,6 @@ pub async fn looks_recognise(
     path: String,
 ) -> Result<SourceRecognition, AppError> {
     run(&state, move |api| Ok(api.looks_recognise(&path))).await
-}
-
-/// `looks_display_luts()`.
-#[tauri::command]
-#[specta::specta]
-pub async fn looks_display_luts(state: State<'_, AppState>) -> Result<Vec<DisplayLut>, AppError> {
-    run(&state, |api| api.looks_display_luts()).await
 }
 
 /// `looks_watch_downloads(enabled)`: starts or stops the Downloads watcher.
@@ -496,6 +668,18 @@ pub async fn restart_app(app: AppHandle, state: State<'_, AppState>) -> Result<(
 #[specta::specta]
 pub async fn thumbnails(state: State<'_, AppState>) -> Result<Vec<ThumbnailReady>, AppError> {
     run(&state, |api| Ok(api.thumbnails_now())).await
+}
+
+/// `thumbnails_in_view(photo_ids)` (`docs/26` H-11): the filmstrip shows these photos. Answers with the
+/// address of the thumbnail the shell holds for each of them; the ones it let go of to keep its byte
+/// budget are made again and arrive as `thumbnail_ready`.
+#[tauri::command]
+#[specta::specta]
+pub async fn thumbnails_in_view(
+    state: State<'_, AppState>,
+    photo_ids: Vec<PhotoId>,
+) -> Result<Vec<ThumbnailReady>, AppError> {
+    run(&state, move |api| Ok(api.thumbnails_in_view(&photo_ids))).await
 }
 
 // --- The system -------------------------------------------------------------------------------
@@ -605,12 +789,23 @@ pub async fn preferences_set(
     run(&state, move |api| api.preferences_set(&patch)).await
 }
 
-/// `apple_auto_status()`: whether Apple Auto is available on this computer (read again now) and
-/// whether it acts; Preferences asks when it opens (`docs/19` sections 1 and 2).
+/// `auto_status()` (`docs/22` sections 11 and 12.6; it replaces `apple_auto_status()`): the four
+/// providers and which one grades now. The core refreshes every provider's availability in the
+/// background and answers what it has cached, so this never waits for a program. Only Preferences
+/// opening asks for it: it makes `agy` check its sign-in, which contacts its service.
 #[tauri::command]
 #[specta::specta]
-pub async fn apple_auto_status(state: State<'_, AppState>) -> Result<AppleAutoStatus, AppError> {
-    run(&state, |api| api.apple_auto_status()).await
+pub async fn auto_status(state: State<'_, AppState>) -> Result<AutoStatus, AppError> {
+    run(&state, |api| api.auto_status()).await
+}
+
+/// `auto_status_cached()` (`docs/22` sections 3.3 and 12.6): the same status as each provider last
+/// said it, and no program is asked to check anything. The webview reads it after a change of the
+/// choice, the consent or the instructions and on `auto_status_changed`.
+#[tauri::command]
+#[specta::specta]
+pub async fn auto_status_cached(state: State<'_, AppState>) -> Result<AutoStatus, AppError> {
+    run(&state, |api| api.auto_status_cached()).await
 }
 
 /// `install_cli_link()`: the "Install Command-Line Tool…" menu item.
@@ -634,6 +829,15 @@ pub async fn app_info(state: State<'_, AppState>) -> Result<AppInfo, AppError> {
     run(&state, |api| Ok(api.app_info())).await
 }
 
+/// `display_options()`: the system's Reduce Transparency, Reduce Motion and Increase Contrast settings (`docs/28` A-P12). It does not
+/// need the core, so it answers even when the application could not start. A synchronous command runs on the main thread, where
+/// AppKit is read; off macOS it answers all false.
+#[tauri::command]
+#[specta::specta]
+pub fn display_options() -> wire::DisplayOptions {
+    crate::a11y::read()
+}
+
 // --- The registry -----------------------------------------------------------------------------
 
 /// Builds the typed command and event registry shared by the app and the TypeScript bindings.
@@ -649,6 +853,7 @@ pub fn builder() -> Builder<tauri::Wry> {
         .commands(collect_commands![
             open_paths,
             open_dialog,
+            cancel_open,
             session_state,
             close_session,
             set_current,
@@ -657,6 +862,7 @@ pub fn builder() -> Builder<tauri::Wry> {
             restore_photos,
             get_settings,
             update_settings,
+            perf_report,
             apply_look,
             rerun_auto,
             copy_settings,
@@ -664,6 +870,7 @@ pub fn builder() -> Builder<tauri::Wry> {
             set_menu_state,
             histogram,
             chroma_scatter,
+            suggest_crop,
             viewport_info,
             viewport_set_rect,
             viewport_input,
@@ -671,11 +878,20 @@ pub fn builder() -> Builder<tauri::Wry> {
             set_before,
             sample_pixel,
             sample_chroma,
+            viewport_map_points,
+            mask_kinds,
+            mask_find,
+            sample_depth,
+            focus_plane,
+            retry_depth,
+            lens_list,
             looks_list,
             look_thumbnail,
+            film_catalogue,
+            film_tile,
+            node_thumbnails,
             looks_import,
             looks_recognise,
-            looks_display_luts,
             looks_watch_downloads,
             looks_set_default,
             looks_remove,
@@ -686,6 +902,7 @@ pub fn builder() -> Builder<tauri::Wry> {
             export_busy,
             restart_app,
             thumbnails,
+            thumbnails_in_view,
             choose_folder,
             choose_look_files,
             open_url,
@@ -693,25 +910,36 @@ pub fn builder() -> Builder<tauri::Wry> {
             trash_path,
             preferences_get,
             preferences_set,
-            apple_auto_status,
+            auto_status,
+            auto_status_cached,
             install_cli_link,
             cli_link_status,
             app_info,
+            display_options,
         ])
         .events(collect_events![
             wire::PhotoProgress,
             wire::ThumbnailReady,
+            wire::NodeThumbnailsReady,
             wire::RenderStats,
             wire::ExportProgress,
             wire::LooksChanged,
+            wire::AutoStatusChanged,
             wire::UpdateState,
             wire::ErrorEvent,
             wire::LooksImportProgress,
+            wire::OpenProgress,
             wire::DownloadFound,
             wire::MenuActionEvent,
             wire::SettingsChanged,
             wire::ExportBusy,
+            wire::ViewportBusy,
             wire::ViewportFrame,
+            wire::ObjectState,
+            wire::VisionState,
+            wire::DepthState,
+            wire::MemoryNotice,
+            wire::DisplayOptions,
         ])
         .typ::<ErrorScope>()
 }
@@ -746,11 +974,20 @@ mod tests {
                 paste_settings,
                 viewport_info,
                 viewport_set_rect,
+                viewport_map_points,
+                mask_kinds,
+                mask_find,
+                sample_depth,
+                focus_plane,
+                retry_depth,
                 export_busy,
+                node_thumbnails,
                 looks_recognise,
                 preferences_get,
-                apple_auto_status,
+                auto_status,
+                auto_status_cached,
                 app_info,
+                display_options,
             ])
             .manage(state)
             .build(mock_context(noop_assets()))
@@ -769,6 +1006,22 @@ mod tests {
     fn the_menu_state_command_runs_on_the_main_thread_in_order() {
         fn assert_sync<F: Fn(AppHandle, MenuState) -> Result<(), AppError>>(_: F) {}
         assert_sync(set_menu_state);
+    }
+
+    /// One provider of `auto_status` as the webview reads it (`docs/22` section 12.6): no model and no
+    /// program version, and a consent that only the two programs lack until it is given.
+    fn provider_json(
+        id: &str,
+        state: &str,
+        reason: Option<&str>,
+        listed: bool,
+        selectable: bool,
+    ) -> Value {
+        json!({
+            "provider": id, "state": state, "reason": reason, "info": null, "tool_version": null,
+            "consent": !matches!(id, "claude" | "agy"), "experimental": id == "agy",
+            "listed": listed, "selectable": selectable
+        })
     }
 
     fn call(window: &WebviewWindow<MockRuntime>, cmd: &str, args: Value) -> Result<Value, Value> {
@@ -814,6 +1067,49 @@ mod tests {
             call(&window, "viewport_set_rect", json!({ "rect": { "x": 1 } })).is_err(),
             "a rectangle without a size is refused before the handler runs"
         );
+        // The kinds of mask this machine makes, and points mapped between the photo and the cell: with no photo
+        // shown nothing has a place; the side is `photo` or `cell`.
+        // The list is the core's own (`ym_core::settings::mask_kinds_with`, by the kinds' wire names), so a kind that a
+        // later task makes does not leave this expectation stale; Object is in it where the SAM weights are.
+        let object = ym_core::pipeline::ObjectModel::probe(
+            &ym_core::data_dir::find_data_dir().expect("the data folder"),
+        )
+        .is_some();
+        // Subject and People follow the Vision probe; the harness's app has no provider, which is a computer that cannot make them.
+        // Depth follows its own weights (`data/models/depth`).
+        let depth = ym_core::pipeline::DepthModel::probe(
+            &ym_core::data_dir::find_data_dir().expect("the data folder"),
+        )
+        .is_some();
+        let kinds: Vec<&str> = ym_core::settings::mask_kinds_with(
+            ym_core::settings::MaskSupport::new(
+                object,
+                ym_core::vision::VisionSupport::none_here(),
+            )
+            .with_depth(depth),
+        )
+        .into_iter()
+        .map(|k| k.name())
+        .collect();
+        assert!(!kinds.is_empty());
+        assert_eq!(call(&window, "mask_kinds", json!({})), Ok(json!(kinds)));
+        assert_eq!(
+            call(
+                &window,
+                "viewport_map_points",
+                json!({ "points": [[0.5, 0.5], [0.1, 0.2]], "from": "photo" })
+            ),
+            Ok(json!([null, null]))
+        );
+        assert!(
+            call(
+                &window,
+                "viewport_map_points",
+                json!({ "points": [[0.5, 0.5]], "from": "sideways" })
+            )
+            .is_err(),
+            "a side that is neither photo nor cell is refused before the handler runs"
+        );
         assert_eq!(
             call(&window, "app_info", json!({})).expect("app_info")["version"].as_str(),
             Some(ym_core::version::app_version())
@@ -840,75 +1136,124 @@ mod tests {
         let settings =
             call(&window, "get_settings", json!({ "photoId": id })).expect("get_settings");
         assert_eq!(settings["photo_id"], json!(id));
-        assert_eq!(settings["settings"]["exposure"], json!({ "kind": "auto" }));
-        assert_eq!(settings["auto"]["exposure"], json!(true));
+        // The node thumbnails are asked for with `photoId` and answered with `null` at once; the pictures
+        // come as the `node_thumbnails_ready` event.
+        assert_eq!(
+            call(&window, "node_thumbnails", json!({ "photoId": id })),
+            Ok(json!(null))
+        );
+        assert!(
+            call(&window, "node_thumbnails", json!({})).is_err(),
+            "a request without a photo is refused before the handler runs"
+        );
+        // The settings are the graph: the Input first, Main, the Output last.
+        let input = |r: &serde_json::Value| r["settings"]["nodes"]["items"][0].clone();
+        let main = |r: &serde_json::Value| r["settings"]["nodes"]["items"][1].clone();
+        assert_eq!(input(&settings)["id"], json!("input"));
+        assert_eq!(input(&settings)["exposure"], json!({ "kind": "auto" }));
+        assert_eq!(main(&settings)["id"], json!(1));
+        assert_eq!(settings["auto"]["input"]["exposure"], json!(true));
         let updated = call(
             &window,
             "update_settings",
-            json!({ "photoId": id, "patch": { "exposure": { "kind": "manual", "ev": 0.25 }, "crop": null } }),
+            json!({ "photoId": id, "patch": { "nodes": { "input": { "exposure": { "kind": "manual", "ev": 0.25 }, "crop": null } } } }),
         )
         .expect("update_settings");
         assert_eq!(
-            updated["settings"]["exposure"],
+            input(&updated)["exposure"],
             json!({ "kind": "manual", "ev": 0.25 })
         );
-        assert_eq!(updated["values"]["exposure_ev"], json!(0.25));
-        assert_eq!(updated["settings"]["orientation"], json!(0));
+        assert_eq!(updated["values"]["input"]["exposure_ev"], json!(0.25));
+        assert_eq!(input(&updated)["orientation"], json!(0));
+        // A flat patch of Yellowmoon 0.1 is refused.
+        assert!(
+            call(
+                &window,
+                "update_settings",
+                json!({ "photoId": id, "patch": { "exposure": { "kind": "auto" } } }),
+            )
+            .is_err()
+        );
 
         // Copy and paste: the patch leaves out the crop, the orientation and the white pick, and a
         // paste answers with one undo step per photo and the photos it left out.
         let copied =
             call(&window, "copy_settings", json!({ "photoId": id })).expect("copy_settings");
         assert_eq!(
-            copied["exposure"],
+            copied["nodes"]["input"]["exposure"],
             json!({ "kind": "manual", "ev": 0.25 }),
             "a manual exposure is copied as it is"
         );
         for left_out in ["crop", "orientation", "white_pick"] {
-            assert!(copied.get(left_out).is_none(), "{left_out} is not copied");
+            assert!(
+                copied["nodes"]["input"].get(left_out).is_none(),
+                "{left_out} is not copied"
+            );
         }
-        assert_eq!(copied["white_balance"], json!({ "kind": "auto" }));
+        assert_eq!(
+            copied["nodes"]["input"]["white_balance"],
+            json!({ "kind": "auto" })
+        );
+        // The copy holds the whole graph: every node, the links, nothing to remove.
+        assert!(copied["nodes"]["1"]["grade"].is_object());
+        assert!(copied["nodes"]["output"]["look"].is_string());
+        assert_eq!(copied["links"].as_array().map(Vec::len), Some(2));
+        assert!(copied.get("remove").is_none());
         // Contrast is Auto or a manual value (`docs/19` section 5); the step says which.
         let pasted = call(
             &window,
             "paste_settings",
-            json!({ "photoIds": [id, 9999], "patch": { "contrast": { "kind": "manual", "value": 33 } } }),
+            json!({ "photoIds": [id, 9999], "patch": { "nodes": { "1": { "grade": { "contrast": { "kind": "manual", "value": 33 } } } } } }),
         )
         .expect("paste_settings");
         assert_eq!(pasted["skipped"], json!([9999]));
         assert_eq!(pasted["pasted"][0]["id"], json!(id));
         assert_eq!(
             pasted["pasted"][0]["before"],
-            json!({ "contrast": { "kind": "auto" } })
+            json!({ "nodes": { "1": { "grade": { "contrast": { "kind": "auto" } } } } })
         );
         assert_eq!(
             pasted["pasted"][0]["after"],
-            json!({ "contrast": { "kind": "manual", "value": 33.0 } })
+            json!({ "nodes": { "1": { "grade": { "contrast": { "kind": "manual", "value": 33.0 } } } } })
         );
         // The older plain number still reads: 0 is Auto, any other number Manual.
         let plain = call(
             &window,
             "update_settings",
-            json!({ "photoId": id, "patch": { "contrast": 0, "saturation": -12 } }),
+            json!({ "photoId": id, "patch": { "nodes": { "1": { "grade": { "contrast": 0, "saturation": -12 } } } } }),
         )
         .expect("a plain number");
-        assert_eq!(plain["settings"]["contrast"], json!({ "kind": "auto" }));
+        assert_eq!(main(&plain)["grade"]["contrast"], json!({ "kind": "auto" }));
         assert_eq!(
-            plain["settings"]["saturation"],
+            main(&plain)["grade"]["saturation"],
             json!({ "kind": "manual", "value": -12.0 })
         );
-        assert_eq!(plain["auto"]["contrast"], json!(true));
-        assert_eq!(plain["auto"]["saturation"], json!(false));
-        assert_eq!(plain["values"]["saturation"], json!(-12.0));
+        assert_eq!(plain["auto"]["main"]["contrast"], json!(true));
+        assert_eq!(plain["auto"]["main"]["saturation"], json!(false));
+        assert_eq!(plain["values"]["main"]["grade"]["saturation"], json!(-12.0));
         // Without an advisor Apple Auto is off: the rule's 0, and the photo says so.
-        assert_eq!(plain["estimates"]["contrast"], json!(0.0));
+        assert_eq!(plain["estimates"]["main"]["contrast"], json!(0.0));
         assert_eq!(plain["estimates"]["source"], json!("rule"));
         assert_eq!(plain["estimates"]["apple"], json!({ "state": "off" }));
+        let status = call(&window, "auto_status", json!({})).expect("auto_status");
+        // The cached read has the same shape and, with nothing changed, the same content.
         assert_eq!(
-            call(&window, "apple_auto_status", json!({})).expect("apple_auto_status"),
+            call(&window, "auto_status_cached", json!({})).expect("auto_status_cached"),
+            status
+        );
+        assert_eq!(
+            status,
             json!({
-                "available": false, "reason": null, "info": null, "preference": true,
-                "mode": "from_preference", "active": false, "prompt": 3, "table": 2,
+                "providers": [
+                    provider_json("yellowmoon", "available", None, true, true),
+                    provider_json("apple", "not_installed", Some("not_installed"), false, false),
+                    provider_json("claude", "not_installed", Some("not_installed"), false, false),
+                    provider_json("agy", "not_installed", Some("not_installed"), false, false),
+                ],
+                "preference": "apple", "chosen": "apple", "effective": "yellowmoon",
+                "active": false, "visible": false,
+                "consent": { "claude": false, "agy": false },
+                "table": 2,
                 "instructions": "default",
                 "instructions_sha256": ym_core::apple_auto::InstructionsId::default().instructions_sha256,
                 "own_instructions": "",
@@ -956,11 +1301,36 @@ mod tests {
         .expect("recognise");
         assert_eq!(seen["recognition"]["kind"], json!("missing"));
         assert_eq!(seen["source"], json!("zip"));
-        assert!(call(&window, "preferences_get", json!({})).expect("prefs")["export_defaults"]["bit_depth"].is_number());
+        let prefs = call(&window, "preferences_get", json!({})).expect("prefs");
+        assert!(prefs["export_defaults"]["bit_depth"].is_number());
+        // Who grades and whether the person agreed (`docs/22` section 12.6); the old switch is gone.
+        assert_eq!(prefs["auto_provider"], json!("apple"));
+        assert_eq!(
+            prefs["auto_consent"],
+            json!({ "claude": false, "agy": false })
+        );
+        assert!(prefs.get("apple_auto").is_none());
+        assert_eq!(
+            call(&window, "app_info", json!({})).expect("app_info")["os"],
+            json!(std::env::consts::OS)
+        );
         call(&window, "close_session", json!({})).expect("close");
         assert_eq!(
             call(&window, "session_state", json!({})).expect("state")["photos"],
             json!([])
+        );
+    }
+
+    #[test]
+    fn display_options_answers_without_the_core() {
+        let reason = AppError::new(
+            ErrorScope::App,
+            "Yellowmoon's data folder is missing. Reinstall the app.",
+        );
+        let (_app, window) = app_with(AppState::failed(reason));
+        assert_eq!(
+            call(&window, "display_options", json!({})).expect("display_options"),
+            serde_json::to_value(crate::a11y::read()).expect("serialise")
         );
     }
 
@@ -974,7 +1344,8 @@ mod tests {
         for cmd in [
             "session_state",
             "preferences_get",
-            "apple_auto_status",
+            "auto_status",
+            "auto_status_cached",
             "app_info",
             "export_busy",
         ] {

@@ -15,7 +15,9 @@
 //!   `ym-frame://localhost/<launch>/frame-<seq>.png`; the `viewport_frame` event says when a new one
 //!   is there. The same store and scheme serve the filmstrip's thumbnails
 //!   (`ym-frame://localhost/<launch>/thumb-<photo>-<version>.png`) and the Look tab's tiles
-//!   (`ym-frame://localhost/<launch>/look-<photo>-<version>.png`), whichever sink draws the photo.
+//!   (`ym-frame://localhost/<launch>/look-<photo>-<version>.png`) and the node thumbnails of the node
+//!   view (`ym-frame://localhost/<launch>/node-<photo>-<node>-<version>.png`), whichever sink draws
+//!   the photo.
 //!   `<launch>` is made from the start time of the app, so an address from an earlier launch is
 //!   never one of this launch's (see [`FrameStore`]). This breaks the rule "full images never cross
 //!   the bridge" (`docs/01`), and is meant for development builds on other systems and as the
@@ -40,9 +42,24 @@
 //! pass that computes sharp tiles ([`Flight::Tiles`]), and, for a request that makes the frame
 //! being drawn wrong rather than old (another photo, a cell of another size: [`Shared::request_now`]),
 //! the frame itself.
+//!
+//! **Busy.** From just before a round asks for its frame until the round is over (the pass that makes
+//! the sharp tiles included, and whichever way it ends: shown, stopped, failed), the worker holds a
+//! [`BusyGuard`], which tells the webview `viewport_busy { busy: true, cpu, finding }`, where `cpu` says that
+//! the photo's views are drawn on the CPU (`Renderer::views_on_cpu`: its raw stages run there, or the device
+//! refused its last viewport frame and no device frame has come since; asked as the round
+//! starts and asked again when its frame is back, together with the frame report's `device_refused`, so that a
+//! round whose frame the CPU made because the device failed during it, for good or for this frame only, says
+//! `cpu: true` at once, while the tile pass is still running, and not only from the next round on) and `finding` that the round makes the photo's first blur map for a Background mask
+//! (`Renderer::finding_masks`, asked the same way; the mask rows say "Finding…"), and `busy: false` when
+//! it is dropped. Only a change is sent, and the shell's throttle
+//! merges what a stream of rounds sends. The photo cell shows "Rendering on the CPU" from it. While the core's
+//! background worker makes Subject or People masks ([`Shared::masks_finding`]) the viewport is also busy and `finding`
+//! whatever the rounds say: the round that asked for the masks ends at once, and the rows keep saying "Finding…" until
+//! the masks are there.
 
 use std::borrow::Cow;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 use std::thread::JoinHandle;
@@ -50,8 +67,8 @@ use std::time::{Duration, Instant};
 
 use ym_core::app::Core;
 use ym_core::pipeline::{
-    FrameOptions, FrameOutput, PhotoSource, RenderError, RenderedFrame, ViewportInput as CoreInput,
-    ViewportMode as CoreMode, ViewportRect as CoreRect, ViewportState,
+    FrameOptions, FrameOutput, MaskView as CoreMaskView, PhotoSource, RenderError, RenderedFrame,
+    ViewportInput as CoreInput, ViewportMode as CoreMode, ViewportRect as CoreRect, ViewportState,
 };
 use ym_core::session::{PhotoId as CorePhotoId, SessionError};
 use ym_gpu::queue::{CancelToken, JobError};
@@ -59,8 +76,8 @@ use ym_gpu::queue::{CancelToken, JobError};
 use crate::events::{AppEvent, Emitter};
 use crate::perf;
 use crate::wire::{
-    AppError, ErrorScope, PhotoId, ViewportBackendKind, ViewportFrame, ViewportInput, ViewportMode,
-    ViewportRect, convert,
+    AppError, ErrorScope, MaskView, PhotoId, ViewportBackendKind, ViewportBusy, ViewportFrame,
+    ViewportInput, ViewportMode, ViewportRect, convert,
 };
 
 /// The URI scheme the fallback viewport serves frames on.
@@ -128,6 +145,7 @@ pub struct FrameStore {
     frames: Mutex<VecDeque<(u32, Arc<Vec<u8>>)>>,
     thumbnails: Mutex<Thumbnails>,
     look_tiles: Mutex<LookTiles>,
+    node_thumbnails: Mutex<NodeThumbnails>,
 }
 
 impl Default for FrameStore {
@@ -187,7 +205,7 @@ pub struct Served {
 type Png = Arc<Vec<u8>>;
 
 /// The thumbnails the store holds.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct Thumbnails {
     /// Counts up with every thumbnail put, so that a new picture is a new address.
     version: u32,
@@ -196,6 +214,82 @@ struct Thumbnails {
     /// The thumbnails of the photos the last removal took out of the filmstrip, kept for the Undo of that removal
     /// ([`FrameStore::set_aside_photos`]) and nowhere else: they are not served.
     set_aside: BTreeMap<u32, Vec<(u32, Png)>>,
+    /// The bytes of the PNGs in `by_photo` (not `set_aside`: those are one removal's worth, and leave
+    /// the count while they wait).
+    bytes: usize,
+    /// The most bytes kept (see [`THUMBNAIL_BUDGET_BYTES`]).
+    budget: usize,
+    /// Counts up whenever a photo's thumbnail is put, served or asked for by the page.
+    clock: u64,
+    /// When each photo's thumbnail was last put, served or asked for, by `clock`.
+    last_used: BTreeMap<u32, u64>,
+    /// The photos that lost their thumbnail to the budget and have not been given a new one: what
+    /// [`FrameStore::thumbnails_in_view`] re-renders when the page shows them.
+    evicted: BTreeSet<u32>,
+    /// The photo on screen: its thumbnail is never let go.
+    current: Option<u32>,
+}
+
+impl Default for Thumbnails {
+    fn default() -> Self {
+        Self::with_budget(THUMBNAIL_BUDGET_BYTES)
+    }
+}
+
+impl Thumbnails {
+    fn with_budget(budget: usize) -> Self {
+        Self {
+            version: 0,
+            by_photo: BTreeMap::new(),
+            set_aside: BTreeMap::new(),
+            bytes: 0,
+            budget,
+            clock: 0,
+            last_used: BTreeMap::new(),
+            evicted: BTreeSet::new(),
+            current: None,
+        }
+    }
+
+    fn touch(&mut self, photo: u32) {
+        self.clock += 1;
+        self.last_used.insert(photo, self.clock);
+    }
+
+    /// Forgets the thumbnails of the photos used least recently until the budget holds. The photo
+    /// that was just given one (`newest`) and the photo on screen stay, even if they alone pass the
+    /// budget. The photos that lose theirs are remembered in `evicted`.
+    fn enforce_budget(&mut self, newest: Option<u32>) {
+        while self.bytes > self.budget {
+            let Some(victim) = self
+                .last_used
+                .iter()
+                .filter(|(photo, _)| Some(**photo) != newest && Some(**photo) != self.current)
+                .min_by_key(|(_, used)| **used)
+                .map(|(photo, _)| *photo)
+            else {
+                break;
+            };
+            self.take_photo(victim);
+            self.evicted.insert(victim);
+        }
+    }
+
+    /// Takes a photo's thumbnails out of the count and the use list, and returns them.
+    fn take_photo(&mut self, photo: u32) -> Option<Vec<(u32, Png)>> {
+        self.last_used.remove(&photo);
+        let versions = self.by_photo.remove(&photo)?;
+        self.bytes -= versions.iter().map(|(_, png)| png.len()).sum::<usize>();
+        Some(versions)
+    }
+
+    fn clear(&mut self) {
+        self.by_photo.clear();
+        self.set_aside.clear();
+        self.last_used.clear();
+        self.evicted.clear();
+        self.bytes = 0;
+    }
 }
 
 /// The look tiles the store holds: a photo through one look, at most 240 px.
@@ -278,6 +372,89 @@ impl LookTiles {
     }
 }
 
+/// The node thumbnails the store holds (`docs/23` section 5.7): a photo after one node and the Output,
+/// about 160 px, per photo and node.
+#[derive(Debug)]
+struct NodeThumbnails {
+    /// Per photo and node, the newest versions (see [`THUMBNAIL_VERSIONS_KEPT`]), oldest first. A
+    /// version is the core's: it names the picture, so an address is the same picture for good.
+    by_node: BTreeMap<(u32, u32), Vec<(u64, Png)>>,
+    /// The bytes of the PNGs in `by_node`.
+    bytes: usize,
+    /// The most bytes kept (see [`NODE_THUMBNAIL_BUDGET_BYTES`]).
+    budget: usize,
+    /// Counts up whenever a photo's thumbnails are put or served.
+    clock: u64,
+    /// When each photo's thumbnails were last put or served, by `clock`.
+    last_used: BTreeMap<u32, u64>,
+}
+
+impl Default for NodeThumbnails {
+    fn default() -> Self {
+        Self::with_budget(NODE_THUMBNAIL_BUDGET_BYTES)
+    }
+}
+
+impl NodeThumbnails {
+    fn with_budget(budget: usize) -> Self {
+        Self {
+            by_node: BTreeMap::new(),
+            bytes: 0,
+            budget,
+            clock: 0,
+            last_used: BTreeMap::new(),
+        }
+    }
+
+    fn touch(&mut self, photo: u32) {
+        self.clock += 1;
+        self.last_used.insert(photo, self.clock);
+    }
+
+    /// Forgets the thumbnails of the photos used least recently until the budget holds. The photo
+    /// that was just given a thumbnail stays, even if its own pass the budget.
+    fn enforce_budget(&mut self, newest: u32) {
+        while self.bytes > self.budget {
+            let Some(victim) = self
+                .last_used
+                .iter()
+                .filter(|(photo, _)| **photo != newest)
+                .min_by_key(|(_, used)| **used)
+                .map(|(photo, _)| *photo)
+            else {
+                break;
+            };
+            self.forget_photo(victim);
+        }
+    }
+
+    fn forget_photo(&mut self, photo: u32) {
+        let keys: Vec<(u32, u32)> = self
+            .by_node
+            .range((photo, 0)..=(photo, u32::MAX))
+            .map(|(key, _)| *key)
+            .collect();
+        for key in keys {
+            if let Some(versions) = self.by_node.remove(&key) {
+                self.bytes -= versions.iter().map(|(_, png)| png.len()).sum::<usize>();
+            }
+        }
+        self.last_used.remove(&photo);
+    }
+
+    fn clear(&mut self) {
+        self.by_node.clear();
+        self.last_used.clear();
+        self.bytes = 0;
+    }
+}
+
+/// How many bytes of node thumbnails the store keeps: about 4,000 pictures of 16 KB (a 160 px PNG),
+/// which is every node of a 450-photo session at three nodes each with a changed version of each on
+/// show. Past it the photos used least recently lose theirs; the page asks again when it shows one
+/// of them (`node_thumbnails`), and the core still holds the pictures.
+pub const NODE_THUMBNAIL_BUDGET_BYTES: usize = 64 << 20;
+
 /// How many bytes of look tiles the store keeps: about 4,500 tiles of 57 KB (a 240 px PNG), which is
 /// every tile of a 450-photo session with ten looks on show. Past it the photos used least recently
 /// lose their tiles. (With ARRI looks imported and the whole grid scrolled, each photo asks for a
@@ -285,6 +462,15 @@ impl LookTiles {
 /// gigabytes until it closes.) A photo whose tiles are gone answers 404 for the addresses it was
 /// given; the webview asks for new ones when the photo's settings change.
 pub const LOOK_TILE_BUDGET_BYTES: usize = 256 << 20;
+
+/// How many bytes of filmstrip thumbnails the store keeps: 128 MiB. A thumbnail PNG of a real
+/// photograph is about 63 KB on average and 79 KB at the largest of the owner's photographs
+/// (`ym-core/tests/thumbnail_sizes.rs`; `docs/01` §Thumbnails and tiles by address), so the budget
+/// holds about 2,100 photographs at one version each: a folder of 2,000 fits whole, and one of
+/// 5,000 keeps the 2,000 or so used most recently. Past it the photos used least recently lose
+/// theirs (the one on screen and the one just made never); the page asks for the ones it shows
+/// ([`FrameStore::thumbnails_in_view`]) and the core makes them again.
+pub const THUMBNAIL_BUDGET_BYTES: usize = 128 << 20;
 
 /// How many frames the store keeps: the webview may still be loading the previous one.
 const FRAMES_KEPT: usize = 3;
@@ -312,6 +498,28 @@ impl FrameStore {
         }
     }
 
+    /// An empty store that keeps at most `bytes` of filmstrip thumbnails (the tests' way to reach
+    /// the limit with a few bytes; the application uses [`THUMBNAIL_BUDGET_BYTES`]).
+    #[cfg(test)]
+    #[must_use]
+    pub fn with_thumbnail_budget(bytes: usize) -> Self {
+        Self {
+            thumbnails: Mutex::new(Thumbnails::with_budget(bytes)),
+            ..Self::default()
+        }
+    }
+
+    /// An empty store that keeps at most `bytes` of node thumbnails (the tests' way to reach the
+    /// limit with a few bytes; the application uses [`NODE_THUMBNAIL_BUDGET_BYTES`]).
+    #[cfg(test)]
+    #[must_use]
+    pub fn with_node_thumbnail_budget(bytes: usize) -> Self {
+        Self {
+            node_thumbnails: Mutex::new(NodeThumbnails::with_budget(bytes)),
+            ..Self::default()
+        }
+    }
+
     /// An empty store with this launch id (the tests' way to make two launches).
     #[must_use]
     pub fn with_launch_id(launch: String) -> Self {
@@ -320,6 +528,7 @@ impl FrameStore {
             frames: Mutex::new(VecDeque::new()),
             thumbnails: Mutex::new(Thumbnails::default()),
             look_tiles: Mutex::new(LookTiles::default()),
+            node_thumbnails: Mutex::new(NodeThumbnails::default()),
         }
     }
 
@@ -346,6 +555,47 @@ impl FrameStore {
     #[must_use]
     pub fn look_tile_url(&self, photo: u32, version: u32) -> String {
         scheme_url(&self.launch, &format!("look-{photo}-{version}.png"))
+    }
+
+    /// The address of version `version` of a photo's node thumbnail in the webview.
+    #[must_use]
+    pub fn node_thumbnail_url(&self, photo: u32, node: u32, version: u64) -> String {
+        scheme_url(&self.launch, &format!("node-{photo}-{node}-{version}.png"))
+    }
+
+    /// Keeps the thumbnail of one node of a photo (a PNG of about 160 px, made by the core under the
+    /// version `version`) and returns the address it is served at. The address names the version, so
+    /// the same picture put again has the same address, and a new picture has a new one. Only the
+    /// newest few versions of each (photo, node) are kept, the photos used least recently lose all
+    /// theirs when the thumbnails together pass [`NODE_THUMBNAIL_BUDGET_BYTES`], and none survive
+    /// [`FrameStore::clear_thumbnails`] or the photo's removal ([`FrameStore::set_aside_photos`]).
+    pub fn put_node_thumbnail(&self, photo: u32, node: u32, version: u64, png: Png) -> String {
+        let mut thumbs = lock(&self.node_thumbnails);
+        let versions = thumbs.by_node.entry((photo, node)).or_default();
+        let mut added = 0;
+        let mut dropped = 0;
+        if !versions.iter().any(|(v, _)| *v == version) {
+            added = png.len();
+            versions.push((version, png));
+            versions.sort_by_key(|(v, _)| *v);
+            while versions.len() > THUMBNAIL_VERSIONS_KEPT {
+                dropped += versions.remove(0).1.len();
+            }
+        }
+        thumbs.bytes = thumbs.bytes + added - dropped;
+        thumbs.touch(photo);
+        thumbs.enforce_budget(photo);
+        self.node_thumbnail_url(photo, node, version)
+    }
+
+    /// Whether the thumbnail of a node at this version is kept, and so served: the webview was told
+    /// its address and can load it.
+    #[must_use]
+    pub fn has_node_thumbnail(&self, photo: u32, node: u32, version: u64) -> bool {
+        lock(&self.node_thumbnails)
+            .by_node
+            .get(&(photo, node))
+            .is_some_and(|versions| versions.iter().any(|(v, _)| *v == version))
     }
 
     /// Keeps the PNG of frame `seq`.
@@ -380,17 +630,52 @@ impl FrameStore {
 
     /// Keeps the thumbnail of a photo (a PNG of at most 240 px) and returns the address it is
     /// served at. Every call gives a new address, so a refreshed thumbnail never meets a cached
-    /// older picture.
+    /// older picture. Only the newest few versions of a photo are kept, and the photos used least
+    /// recently lose theirs when the thumbnails together pass [`THUMBNAIL_BUDGET_BYTES`] (never this
+    /// photo, never the one on screen). A photo that had lost its thumbnail has one again.
     pub fn put_thumbnail(&self, photo: u32, png: Vec<u8>) -> String {
         let mut thumbs = lock(&self.thumbnails);
         thumbs.version = thumbs.version.wrapping_add(1);
         let version = thumbs.version;
+        let added = png.len();
+        let mut dropped = 0;
         let versions = thumbs.by_photo.entry(photo).or_default();
         versions.push((version, Arc::new(png)));
         while versions.len() > THUMBNAIL_VERSIONS_KEPT {
-            versions.remove(0);
+            dropped += versions.remove(0).1.len();
         }
+        thumbs.bytes = thumbs.bytes + added - dropped;
+        thumbs.evicted.remove(&photo);
+        thumbs.touch(photo);
+        thumbs.enforce_budget(Some(photo));
         self.thumbnail_url(photo, version)
+    }
+
+    /// The photo on screen, whose thumbnail is never let go (`None`: no photo is).
+    pub fn set_current_photo(&self, photo: Option<u32>) {
+        lock(&self.thumbnails).current = photo;
+    }
+
+    /// The page shows these photos (the windowed filmstrip's range). Returns the address of the
+    /// thumbnail of each that the store holds, in the order asked, and counts them as used. The
+    /// second list holds the ones the budget let go: the caller makes their thumbnails again.
+    pub fn thumbnails_in_view(&self, photos: &[u32]) -> (Vec<(u32, String)>, Vec<u32>) {
+        let mut thumbs = lock(&self.thumbnails);
+        let mut held = Vec::new();
+        let mut lost = Vec::new();
+        for &photo in photos {
+            let newest = thumbs
+                .by_photo
+                .get(&photo)
+                .and_then(|versions| versions.last().map(|(version, _)| *version));
+            if let Some(version) = newest {
+                thumbs.touch(photo);
+                held.push((photo, self.thumbnail_url(photo, version)));
+            } else if thumbs.evicted.contains(&photo) {
+                lost.push(photo);
+            }
+        }
+        (held, lost)
     }
 
     /// The address of the newest thumbnail of every photo that has one, in photo order.
@@ -405,6 +690,32 @@ impl FrameStore {
                     .map(|(version, _)| (*photo, self.thumbnail_url(*photo, *version)))
             })
             .collect()
+    }
+
+    /// The bytes of the thumbnails the store holds now (every version of every photo), counted
+    /// afresh from the pictures, for the 2000-file test.
+    #[cfg(test)]
+    #[must_use]
+    pub fn thumbnail_bytes(&self) -> usize {
+        lock(&self.thumbnails)
+            .by_photo
+            .values()
+            .flat_map(|versions| versions.iter().map(|(_, png)| png.len()))
+            .sum()
+    }
+
+    /// The bytes the store counts for its thumbnails: what the budget is compared with.
+    #[cfg(test)]
+    #[must_use]
+    pub fn thumbnail_bytes_counted(&self) -> usize {
+        lock(&self.thumbnails).bytes
+    }
+
+    /// The photos that lost their thumbnail to the budget and have none yet.
+    #[cfg(test)]
+    #[must_use]
+    pub fn evicted_thumbnails(&self) -> Vec<u32> {
+        lock(&self.thumbnails).evicted.iter().copied().collect()
     }
 
     /// Keeps the tile of a photo through one look (a PNG of at most 240 px) and returns the
@@ -434,10 +745,11 @@ impl FrameStore {
     pub fn clear_thumbnails(&self) {
         {
             let mut thumbs = lock(&self.thumbnails);
-            thumbs.by_photo.clear();
-            thumbs.set_aside.clear();
+            thumbs.clear();
+            thumbs.current = None;
         }
         lock(&self.look_tiles).clear();
+        lock(&self.node_thumbnails).clear();
     }
 
     /// Photos were taken out of the filmstrip (Remove from filmstrip): their look tiles are forgotten, and their
@@ -448,11 +760,14 @@ impl FrameStore {
         let mut thumbs = lock(&self.thumbnails);
         thumbs.set_aside.clear();
         let mut tiles = lock(&self.look_tiles);
+        let mut nodes = lock(&self.node_thumbnails);
         for photo in photos {
-            if let Some(versions) = thumbs.by_photo.remove(photo) {
+            thumbs.evicted.remove(photo);
+            if let Some(versions) = thumbs.take_photo(*photo) {
                 thumbs.set_aside.insert(*photo, versions);
             }
             tiles.forget_photo(*photo);
+            nodes.forget_photo(*photo);
         }
     }
 
@@ -466,9 +781,13 @@ impl FrameStore {
                 if let Some((version, _)) = versions.last() {
                     back.push((*photo, self.thumbnail_url(*photo, *version)));
                 }
+                thumbs.bytes += versions.iter().map(|(_, png)| png.len()).sum::<usize>();
                 thumbs.by_photo.insert(*photo, versions);
+                thumbs.touch(*photo);
             }
         }
+        thumbs.enforce_budget(None);
+        back.retain(|(photo, _)| thumbs.by_photo.contains_key(photo));
         back.sort_by_key(|(photo, _)| *photo);
         back
     }
@@ -488,20 +807,38 @@ impl FrameStore {
         Some(png)
     }
 
-    /// The thumbnail at `photo` and `version`, if it is still kept.
+    /// The node thumbnail at `photo`, `node` and `version`, if it is still kept. Serving one counts as
+    /// using its photo.
+    fn node_thumbnail(&self, photo: u32, node: u32, version: u64) -> Option<Png> {
+        let mut thumbs = lock(&self.node_thumbnails);
+        let png = thumbs
+            .by_node
+            .get(&(photo, node))?
+            .iter()
+            .find(|(v, _)| *v == version)
+            .map(|(_, png)| Arc::clone(png))?;
+        thumbs.touch(photo);
+        Some(png)
+    }
+
+    /// The thumbnail at `photo` and `version`, if it is still kept. Serving one counts as using its photo.
     fn thumbnail(&self, photo: u32, version: u32) -> Option<Arc<Vec<u8>>> {
-        lock(&self.thumbnails)
+        let mut thumbs = lock(&self.thumbnails);
+        let png = thumbs
             .by_photo
             .get(&photo)?
             .iter()
             .find(|(v, _)| *v == version)
-            .map(|(_, png)| Arc::clone(png))
+            .map(|(_, png)| Arc::clone(png))?;
+        thumbs.touch(photo);
+        Some(png)
     }
 
     /// What the scheme answers for the path of a request,
-    /// `/<launch>/frame-<seq>.png`, `/<launch>/thumb-<photo>-<version>.png` or
-    /// `/<launch>/look-<photo>-<version>.png`: the file, or a 404. Only a thumbnail or a tile that
-    /// is there is [`Cache::Forever`]; frames and every 404 are [`Cache::Never`].
+    /// `/<launch>/frame-<seq>.png`, `/<launch>/thumb-<photo>-<version>.png`,
+    /// `/<launch>/look-<photo>-<version>.png` or `/<launch>/node-<photo>-<node>-<version>.png`: the
+    /// file, or a 404. Only a thumbnail or a tile that is there is [`Cache::Forever`]; frames and
+    /// every 404 are [`Cache::Never`].
     #[must_use]
     pub fn serve(&self, path: &str) -> Served {
         match self.find(path) {
@@ -543,6 +880,15 @@ impl FrameStore {
         } else if let Some(rest) = name.strip_prefix("look-") {
             let (photo, version) = rest.split_once('-')?;
             let png = self.look_tile(photo.parse().ok()?, version.parse().ok()?)?;
+            Some((png, Cache::Forever))
+        } else if let Some(rest) = name.strip_prefix("node-") {
+            let mut parts = rest.splitn(3, '-');
+            let (photo, node, version) = (parts.next()?, parts.next()?, parts.next()?);
+            let png = self.node_thumbnail(
+                photo.parse().ok()?,
+                node.parse().ok()?,
+                version.parse().ok()?,
+            )?;
             Some((png, Cache::Forever))
         } else {
             None
@@ -663,6 +1009,8 @@ enum Op {
     Input(CoreInput),
     Mode(CoreMode),
     Before(bool),
+    /// The mask view of the node view: a corrector's mask over the photo or alone, or none.
+    MaskView(Option<CoreMaskView>),
 }
 
 /// What the render in flight is, which decides whether a request stops it.
@@ -733,9 +1081,135 @@ pub struct Shared {
     sink: Arc<dyn FrameSink>,
     core: OnceLock<Weak<Core>>,
     shutdown: AtomicBool,
+    /// What the webview was last told with `viewport_busy` (not busy, not on the CPU, before anything
+    /// was sent), and what it is made from. Held while a change is sent, so that the worker and a clear on another
+    /// thread tell the webview in the order they made the changes.
+    busy_told: Mutex<BusyState>,
+}
+
+/// What `viewport_busy` is made from: the round the worker is in, and the masks the core makes in the background.
+#[derive(Debug, Clone, Copy)]
+struct BusyState {
+    /// What the worker's rounds say ([`BusyGuard`]); a clear ends it.
+    round: ViewportBusy,
+    /// How many background workers of the core are making Subject or People masks (`Renderer::set_vision_listener`):
+    /// while there is one the viewport is busy and `finding` (the rows say "Finding…") whatever the rounds say, because
+    /// the round that asked for the masks ends at once, with those rows selecting nothing, and the masks come later.
+    masks: usize,
+    /// What the webview was last told.
+    told: ViewportBusy,
+}
+
+impl BusyState {
+    /// What the webview should be told now.
+    fn effective(&self) -> ViewportBusy {
+        let mut busy = self.round;
+        if self.masks > 0 {
+            busy.busy = true;
+            busy.finding = true;
+        }
+        busy
+    }
+}
+
+/// Not busy, not on the CPU, not finding: what `viewport_busy` is before anything is sent.
+const IDLE: ViewportBusy = ViewportBusy {
+    busy: false,
+    cpu: false,
+    finding: false,
+};
+
+/// Holds `viewport_busy` true while a round renders, and sends it false when the round lets go of it,
+/// whichever way the round ends (a cancel, an error, the tile pass, a panic that unwinds).
+struct BusyGuard<'a> {
+    shared: &'a Shared,
+    cpu: bool,
+    finding: bool,
+}
+
+impl<'a> BusyGuard<'a> {
+    /// Tells the webview the viewport is busy; `cpu`: the photo's views are drawn on the CPU (`Renderer::views_on_cpu`); `finding`: the
+    /// round makes the photo's first blur map for a Background mask.
+    fn new(shared: &'a Shared, cpu: bool, finding: bool) -> Self {
+        shared.tell_busy(ViewportBusy {
+            busy: true,
+            cpu,
+            finding,
+        });
+        Self {
+            shared,
+            cpu,
+            finding,
+        }
+    }
+
+    /// The round's frame is back; `on_cpu` is the renderer's answer now (`Renderer::views_on_cpu`). When the device route
+    /// ended during that frame (a device error made the frame on the CPU and the photo's views stay there), the round
+    /// says `cpu` at once, while it is still busy with the tile pass, and not only from the next round on. Never
+    /// takes it back within the round.
+    fn frame_came_back(&mut self, on_cpu: bool) {
+        if on_cpu && !self.cpu {
+            self.cpu = true;
+            self.shared.tell_busy(ViewportBusy {
+                busy: true,
+                cpu: true,
+                finding: self.finding,
+            });
+        }
+    }
+}
+
+impl Drop for BusyGuard<'_> {
+    fn drop(&mut self) {
+        self.shared.tell_busy(ViewportBusy {
+            busy: false,
+            cpu: self.cpu,
+            finding: false,
+        });
+    }
 }
 
 impl Shared {
+    /// Sends `viewport_busy` when it says something the webview was not told last. The state is held, so that the
+    /// event is the same whichever thread changed it.
+    fn flush_busy(&self, state: &mut BusyState) {
+        let busy = state.effective();
+        if state.told == busy {
+            return;
+        }
+        state.told = busy;
+        self.emitter.emit(AppEvent::ViewportBusy(busy));
+    }
+
+    /// A round's own state (`busy: true` as it starts, `false` as it ends): sent when it says something the webview
+    /// was not told last.
+    fn tell_busy(&self, busy: ViewportBusy) {
+        let mut state = lock(&self.busy_told);
+        state.round = busy;
+        self.flush_busy(&mut state);
+    }
+
+    /// The viewport is not busy (the cell shows no photo): `viewport_busy` false, if it was true, unless the core is
+    /// still making masks for the rows to say "Finding…".
+    fn tell_idle(&self) {
+        let mut state = lock(&self.busy_told);
+        state.round.busy = false;
+        self.flush_busy(&mut state);
+    }
+
+    /// The core's background worker for Subject and People masks started (`on`) or ended its work for a photo
+    /// (`docs/23` section 7.6): `viewport_busy` is busy and `finding` while any is making masks, so the rows say
+    /// "Finding…" until the masks are there.
+    pub fn masks_finding(&self, on: bool) {
+        let mut state = lock(&self.busy_told);
+        state.masks = if on {
+            state.masks + 1
+        } else {
+            state.masks.saturating_sub(1)
+        };
+        self.flush_busy(&mut state);
+    }
+
     /// A new frame is wanted: an input, a settings patch, a look, a cell that moved or kept its
     /// size, Before, a mode. The frame being drawn finishes and is shown and the next round starts
     /// at once from the newest state; only the pass that makes sharp tiles is stopped, because the
@@ -766,7 +1240,7 @@ impl Shared {
         perf::viewport().request();
     }
 
-    /// Something about the photo changed (settings, look, display rendering): draw it again.
+    /// Something about the photo changed (settings, look): draw it again.
     pub fn invalidate(&self) {
         let mut st = lock(&self.state);
         self.request(&mut st);
@@ -850,6 +1324,7 @@ impl Shared {
                     st.vp.centre = [0.5, 0.5];
                 }
                 Op::Before(b) => st.vp.before = b,
+                Op::MaskView(v) => st.vp.mask_view = v,
                 Op::Input(_) => {}
             }
         }
@@ -897,8 +1372,10 @@ impl Shared {
         self.settled.notify_all();
     }
 
-    /// Tells the sink that nothing is shown (not twice in a row).
+    /// Tells the sink that nothing is shown (not twice in a row), and the webview that nothing is
+    /// being drawn.
     fn clear_sink(&self) {
+        self.tell_idle();
         let seq = {
             let mut st = lock(&self.state);
             if st.cleared {
@@ -1007,6 +1484,7 @@ impl Shared {
                         st.vp.input(&i, image);
                     }
                     Op::Before(b) => st.vp.before = b,
+                    Op::MaskView(v) => st.vp.mask_view = v,
                 }
             }
             st.applying = false;
@@ -1022,6 +1500,12 @@ impl Shared {
         } else {
             FrameOutput::Host
         };
+        // Busy from here until the round returns, the tile pass included.
+        let mut busy = BusyGuard::new(
+            self,
+            core.renderer.views_on_cpu(photo),
+            core.renderer.finding_masks(photo, &src.settings),
+        );
         let handle =
             core.renderer
                 .spawn_viewport_frame_to(src.clone(), vp.clone(), options, output);
@@ -1054,6 +1538,11 @@ impl Shared {
             }
         };
         lock(&self.state).last_error = None;
+        // The pill from the first CPU frame: a frame the device failed on (the route ended, or only this frame was
+        // refused) is on screen with the CPU's word.
+        // A Film node runs on the device (`docs/24` section 3.9c): the pill is for a frame the device refused, which the
+        // CPU's Film passes then made (`frame.report.device_refused`), like any other kernel.
+        busy.frame_came_back(core.renderer.views_on_cpu(photo) || frame.report.device_refused);
         self.present(&frame, photo, requested_at);
         if !frame.sharp {
             // The zoom needs full-resolution tiles that were not ready: compute them at tile
@@ -1149,6 +1638,11 @@ impl Viewport {
                 sink,
                 core: OnceLock::new(),
                 shutdown: AtomicBool::new(false),
+                busy_told: Mutex::new(BusyState {
+                    round: IDLE,
+                    masks: 0,
+                    told: IDLE,
+                }),
             }),
             worker: Mutex::new(None),
         }
@@ -1207,6 +1701,8 @@ impl Viewport {
         st.vp.mode = CoreMode::Fit;
         st.vp.centre = [0.5, 0.5];
         st.vp.before = false;
+        // A mask view names a node of the photo that was on screen.
+        st.vp.mask_view = None;
         st.last_error = None;
         // What the webview did to the photo that was on screen is not done to this one; the cell
         // (the window's own) stays.
@@ -1273,11 +1769,18 @@ impl Viewport {
         Ok(())
     }
 
-    /// `viewport_set_mode`.
-    pub fn set_mode(&self, mode: &ViewportMode) -> Result<(), AppError> {
+    /// `viewport_set_mode(mode, mask_view)`: the zoom mode (the page sends the one it mirrors, which the
+    /// core takes about the middle of the cell, so a pan is kept) and the mask view.
+    pub fn set_mode(
+        &self,
+        mode: &ViewportMode,
+        mask_view: Option<&MaskView>,
+    ) -> Result<(), AppError> {
         let core_mode: CoreMode = convert(mode)?;
+        let core_mask: Option<CoreMaskView> = mask_view.map(convert).transpose()?;
         let mut st = lock(&self.shared.state);
         st.ops.push(Op::Mode(core_mode));
+        st.ops.push(Op::MaskView(core_mask));
         self.shared.request(&mut st);
         Ok(())
     }
@@ -1368,6 +1871,7 @@ pub fn core_id(id: PhotoId) -> CorePhotoId {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::busy_events;
 
     /// The path of an address of the scheme: `/<launch>/<file>`.
     pub(crate) fn path_of_url(url: &str) -> &str {
@@ -1395,7 +1899,10 @@ mod tests {
                 runs: ym_core::pipeline::StageRuns::default(),
                 timings: ym_core::pipeline::StageTimings::default(),
                 notes: Vec::new(),
+                device_refused: false,
+                cpu_reason: None,
                 zoom: None,
+                lens: None,
             },
         }
     }
@@ -1491,6 +1998,113 @@ mod tests {
     }
 
     #[test]
+    fn node_thumbnails_are_kept_per_photo_node_and_version_and_served_by_address() {
+        let store = FrameStore::new();
+        let path = |url: &str| path_of_url(url).to_owned();
+        let status = |url: &str| store.respond(&path(url)).0;
+        let at = |file: &str| format!("/{}/{file}", store.launch_id());
+        let one = store.put_node_thumbnail(3, 1, 10, Arc::new(vec![1]));
+        let two = store.put_node_thumbnail(3, 2, 11, Arc::new(vec![2]));
+        let other_photo = store.put_node_thumbnail(4, 1, 12, Arc::new(vec![3]));
+        assert!(one.contains("node-3-1-10.png"), "{one}");
+        assert_eq!(one, store.node_thumbnail_url(3, 1, 10));
+        for (url, byte) in [(&one, 1u8), (&two, 2), (&other_photo, 3)] {
+            let (code, mime, body) = store.respond(&path(url));
+            assert_eq!((code, mime), (200, "image/png"), "{url}");
+            assert_eq!(&*body, &[byte]);
+        }
+        // The same version put again is the same address and the same picture, not a second copy.
+        assert_eq!(store.put_node_thumbnail(3, 1, 10, Arc::new(vec![1])), one);
+        assert!(store.has_node_thumbnail(3, 1, 10));
+        assert!(!store.has_node_thumbnail(3, 1, 11));
+        assert!(!store.has_node_thumbnail(3, 5, 10));
+        // The newest two versions of one node stay; the other nodes are not touched.
+        let second = store.put_node_thumbnail(3, 1, 20, Arc::new(vec![4]));
+        assert_eq!(status(&one), 200);
+        let third = store.put_node_thumbnail(3, 1, 30, Arc::new(vec![5]));
+        assert_eq!(status(&one), 404, "the oldest of three is dropped");
+        assert!(!store.has_node_thumbnail(3, 1, 10));
+        assert_eq!((status(&second), status(&third)), (200, 200));
+        assert_eq!((status(&two), status(&other_photo)), (200, 200));
+        // A node thumbnail is not a thumbnail, a tile or a frame, and the numbers must all match.
+        for bad in [
+            "node-3-1.png",
+            "node-3.png",
+            "node-x-1-10.png",
+            "node-3-x-10.png",
+            "node-3-1-x.png",
+            "node-4-2-11.png",
+            "node-3-2-12.png",
+            "node---.png",
+            "thumb-3-2-11.png",
+        ] {
+            assert_eq!(store.respond(&at(bad)).0, 404, "{bad}");
+        }
+        // A photo that leaves loses its thumbnails (they are not set aside for Undo: the page asks again); another launch's
+        // address is a 404.
+        store.set_aside_photos(&[3]);
+        assert_eq!((status(&two), status(&third)), (404, 404));
+        assert_eq!(status(&other_photo), 200);
+        assert!(!store.has_node_thumbnail(3, 2, 11));
+        assert_eq!(
+            FrameStore::with_launch_id("old".to_owned())
+                .respond(&path(&other_photo))
+                .0,
+            404
+        );
+        // Undo brings back only the filmstrip's thumbnails: the page asks for these again.
+        store.set_aside_photos(&[4]);
+        assert_eq!(status(&other_photo), 404);
+        assert!(store.bring_back_photos(&[3, 4]).is_empty());
+        let again = store.put_node_thumbnail(5, 1, 40, Arc::new(vec![6]));
+        store.clear_thumbnails();
+        assert_eq!(status(&again), 404);
+    }
+
+    #[test]
+    fn node_thumbnails_are_bounded_by_bytes_and_the_photos_least_recently_used_go_first() {
+        let store = FrameStore::with_node_thumbnail_budget(600);
+        let path = |url: &str| path_of_url(url).to_owned();
+        let status = |url: &str| store.respond(&path(url)).0;
+        let mut urls = Vec::new();
+        for photo in 1..=4u32 {
+            urls.push(store.put_node_thumbnail(photo, 1, u64::from(photo), Arc::new(vec![1; 100])));
+            urls.push(store.put_node_thumbnail(
+                photo,
+                2,
+                u64::from(photo) + 10,
+                Arc::new(vec![2; 25]),
+            ));
+        }
+        for photo in [2usize, 3, 4, 1] {
+            for url in &urls[2 * (photo - 1)..2 * photo] {
+                assert_eq!(status(url), 200, "photo {photo}");
+            }
+        }
+        // Photo 5 takes the store to 650 bytes: photo 2 goes, whole.
+        let five = store.put_node_thumbnail(5, 1, 50, Arc::new(vec![5; 150]));
+        assert_eq!((status(&urls[2]), status(&urls[3])), (404, 404));
+        for kept in [0, 1, 4, 5, 6, 7] {
+            assert_eq!(status(&urls[kept]), 200, "{kept}");
+        }
+        assert_eq!(status(&five), 200);
+        // A version that was replaced stops counting: 3 x 300 put for one node, 600 held.
+        let store = FrameStore::with_node_thumbnail_budget(700);
+        let first = store.put_node_thumbnail(1, 1, 1, Arc::new(vec![1; 300]));
+        store.put_node_thumbnail(1, 1, 2, Arc::new(vec![1; 300]));
+        let third = store.put_node_thumbnail(1, 1, 3, Arc::new(vec![1; 300]));
+        assert_eq!(store.respond(path_of_url(&first)).0, 404);
+        let other = store.put_node_thumbnail(2, 1, 4, Arc::new(vec![2; 50]));
+        assert_eq!(
+            (
+                store.respond(path_of_url(&third)).0,
+                store.respond(path_of_url(&other)).0
+            ),
+            (200, 200)
+        );
+    }
+
+    #[test]
     fn the_thumbnails_of_removed_photos_are_set_aside_for_undo_and_the_next_removal_drops_them() {
         let store = FrameStore::new();
         let path = |url: &str| path_of_url(url).to_owned();
@@ -1563,6 +2177,95 @@ mod tests {
         for u in urls.iter().chain([&five]) {
             assert_eq!(status(u), 404, "everything older went: {u}");
         }
+    }
+
+    #[test]
+    fn filmstrip_thumbnails_are_bounded_by_bytes_and_the_photos_least_recently_used_go_first() {
+        // Put, serve, evict: three photos of 100 bytes fit in 350; the fourth sends the photo used
+        // least recently away, whole.
+        let store = FrameStore::with_thumbnail_budget(350);
+        let path = |url: &str| path_of_url(url).to_owned();
+        let status = |url: &str| store.respond(&path(url)).0;
+        let urls: Vec<String> = (1..=3)
+            .map(|photo| store.put_thumbnail(photo, vec![photo as u8; 100]))
+            .collect();
+        assert_eq!(store.thumbnail_bytes_counted(), 300);
+        // Photo 1 is loaded again, so photo 2 is the one used least recently.
+        assert_eq!(status(&urls[0]), 200);
+        let four = store.put_thumbnail(4, vec![4; 100]);
+        assert_eq!(status(&urls[1]), 404, "photo 2 went");
+        for kept in [&urls[0], &urls[2], &four] {
+            assert_eq!(status(kept), 200);
+        }
+        assert_eq!(store.thumbnail_bytes_counted(), 300);
+        assert_eq!(store.thumbnail_bytes(), 300);
+        assert_eq!(store.evicted_thumbnails(), vec![2]);
+        assert!(
+            !store.thumbnail_urls().iter().any(|(p, _)| *p == 2),
+            "a photo that lost its thumbnail has no address to hand out"
+        );
+    }
+
+    #[test]
+    fn the_photo_just_given_a_thumbnail_and_the_photo_on_screen_are_never_let_go() {
+        let store = FrameStore::with_thumbnail_budget(250);
+        let path = |url: &str| path_of_url(url).to_owned();
+        let status = |url: &str| store.respond(&path(url)).0;
+        let one = store.put_thumbnail(1, vec![1; 100]);
+        store.set_current_photo(Some(1));
+        let two = store.put_thumbnail(2, vec![2; 100]);
+        // 300 bytes: photo 1 is the least recently used but it is on screen and photo 3 is the
+        // newest, which leaves photo 2.
+        let three = store.put_thumbnail(3, vec![3; 100]);
+        assert_eq!(status(&two), 404);
+        assert_eq!((status(&one), status(&three)), (200, 200));
+        // Alone over the budget, a photo is kept all the same.
+        let big = store.put_thumbnail(9, vec![9; 1000]);
+        assert_eq!(status(&big), 200);
+        assert_eq!(status(&one), 200, "the one on screen");
+        assert_eq!(status(&three), 404);
+    }
+
+    #[test]
+    fn only_the_newest_versions_of_a_thumbnail_count_against_the_budget() {
+        let store = FrameStore::with_thumbnail_budget(1000);
+        for _ in 0..5 {
+            store.put_thumbnail(1, vec![1; 100]);
+        }
+        assert_eq!(store.thumbnail_bytes_counted(), 200);
+        assert_eq!(store.thumbnail_bytes(), 200);
+    }
+
+    #[test]
+    fn a_photo_in_view_that_lost_its_thumbnail_is_reported_and_one_put_again_ends_that() {
+        let store = FrameStore::with_thumbnail_budget(250);
+        for photo in 1..=3 {
+            store.put_thumbnail(photo, vec![photo as u8; 100]);
+        }
+        // Photo 1 went. Asking for 1 (lost), 2 (held), 3 (held) and 7 (never had one).
+        let (held, lost) = store.thumbnails_in_view(&[1, 2, 3, 7]);
+        assert_eq!(held.iter().map(|(p, _)| *p).collect::<Vec<_>>(), vec![2, 3]);
+        assert_eq!(lost, vec![1]);
+        // The photo made again is held, and no longer lost; photo 2 or 3 (not the ones in view
+        // just now, which counted as used) pays for it.
+        store.put_thumbnail(1, vec![1; 100]);
+        let (held, lost) = store.thumbnails_in_view(&[1]);
+        assert_eq!((held.len(), lost.len()), (1, 0));
+        assert_eq!(store.thumbnail_bytes_counted(), 200);
+    }
+
+    #[test]
+    fn a_removed_photo_leaves_the_count_and_comes_back_with_undo() {
+        let store = FrameStore::with_thumbnail_budget(1000);
+        store.put_thumbnail(1, vec![1; 100]);
+        store.put_thumbnail(2, vec![2; 100]);
+        store.set_aside_photos(&[1]);
+        assert_eq!(store.thumbnail_bytes_counted(), 100);
+        assert_eq!(store.bring_back_photos(&[1]).len(), 1);
+        assert_eq!(store.thumbnail_bytes_counted(), 200);
+        store.clear_thumbnails();
+        assert_eq!(store.thumbnail_bytes_counted(), 0);
+        assert!(store.evicted_thumbnails().is_empty());
     }
 
     #[test]
@@ -1738,6 +2441,139 @@ mod tests {
         assert_eq!(clears().len(), 2);
     }
 
+    const fn busy(busy: bool, cpu: bool) -> ViewportBusy {
+        ViewportBusy {
+            busy,
+            cpu,
+            finding: false,
+        }
+    }
+
+    #[test]
+    fn busy_is_told_when_it_changes_and_ends_with_the_round_or_a_clear() {
+        let (vp, events) = controller();
+        let shared = vp.shared();
+        // Nothing was busy: a clear says nothing.
+        shared.clear_sink();
+        assert!(busy_events(&events).is_empty());
+        // A round on the CPU: busy, then not, whichever way it ends.
+        drop(BusyGuard::new(&shared, true, false));
+        assert_eq!(busy_events(&events), [busy(true, true), busy(false, true)]);
+        // The same state again is not news: a round's end, and a clear while nothing is busy.
+        shared.tell_busy(busy(false, true));
+        shared.clear_sink();
+        assert_eq!(busy_events(&events).len(), 2);
+        // A round that a clear overtakes (the session closed while it drew): the clear ends it and the
+        // round's own end has nothing new to say.
+        let round = BusyGuard::new(&shared, false, false);
+        shared.clear_sink();
+        drop(round);
+        assert_eq!(
+            busy_events(&events)[2..],
+            [busy(true, false), busy(false, false)]
+        );
+        // A panic in a round unwinds through the guard.
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _busy = BusyGuard::new(&shared, true, false);
+            panic!("a render panicked");
+        }));
+        assert!(caught.is_err());
+        assert_eq!(
+            busy_events(&events)[4..],
+            [busy(true, true), busy(false, true)]
+        );
+        // A round that makes the photo's first blur map says so while it runs and not after it (N-15).
+        let finding = ViewportBusy {
+            busy: true,
+            cpu: false,
+            finding: true,
+        };
+        drop(BusyGuard::new(&shared, false, true));
+        assert_eq!(busy_events(&events)[6..], [finding, busy(false, false)]);
+    }
+
+    /// A round whose frame came back from the CPU because the device failed during it says `cpu` at once, while it is
+    /// still busy (the tile pass), and keeps saying it when it ends; a frame back from the device changes nothing.
+    #[test]
+    fn a_round_whose_frame_the_cpu_made_says_cpu_before_it_ends() {
+        let (vp, events) = controller();
+        let shared = vp.shared();
+        let mut round = BusyGuard::new(&shared, false, true);
+        round.frame_came_back(false);
+        assert_eq!(
+            busy_events(&events).len(),
+            1,
+            "the device made it: nothing new"
+        );
+        round.frame_came_back(true);
+        let finding = |cpu| ViewportBusy {
+            busy: true,
+            cpu,
+            finding: true,
+        };
+        assert_eq!(
+            busy_events(&events),
+            [finding(false), finding(true)],
+            "still busy, now on the CPU"
+        );
+        round.frame_came_back(true);
+        round.frame_came_back(false);
+        assert_eq!(busy_events(&events).len(), 2, "said once, never taken back");
+        drop(round);
+        assert_eq!(busy_events(&events)[2..], [busy(false, true)]);
+    }
+
+    /// While the core makes Subject or People masks in the background the viewport is busy and finding, whatever the rounds say: the
+    /// round that asked for them ends at once, and "Finding…" stays until the worker ends (`docs/23` section 7.6, N-19).
+    #[test]
+    fn the_background_masks_keep_the_viewport_finding_after_the_round_that_asked_for_them() {
+        let (vp, events) = controller();
+        let shared = vp.shared();
+        let finding = ViewportBusy {
+            busy: true,
+            cpu: false,
+            finding: true,
+        };
+        // The worker starts while nothing is drawn: busy and finding.
+        shared.masks_finding(true);
+        assert_eq!(busy_events(&events), [finding]);
+        // A round comes and goes (it selects nothing for those rows): the viewport stays finding.
+        drop(BusyGuard::new(&shared, false, false));
+        assert_eq!(busy_events(&events), [finding]);
+        // A round on the CPU adds its own word ("cpu") and its end takes nothing away while the worker works: one event.
+        drop(BusyGuard::new(&shared, true, false));
+        assert_eq!(
+            busy_events(&events)[1..],
+            [ViewportBusy {
+                busy: true,
+                cpu: true,
+                finding: true
+            }]
+        );
+        // A clear (the cell shows no photo) cannot end it either.
+        shared.clear_sink();
+        // The worker ends: not busy, not finding.
+        shared.masks_finding(false);
+        let last = *busy_events(&events).last().expect("an event");
+        assert!(!last.busy && !last.finding, "{last:?}");
+        // Two workers (two photos in a hurry) keep it until both have ended; an extra end does no harm.
+        shared.masks_finding(true);
+        shared.masks_finding(true);
+        shared.masks_finding(false);
+        assert!(
+            busy_events(&events)
+                .last()
+                .is_some_and(|b| b.busy && b.finding)
+        );
+        shared.masks_finding(false);
+        shared.masks_finding(false);
+        assert!(
+            busy_events(&events)
+                .last()
+                .is_some_and(|b| !b.busy && !b.finding)
+        );
+    }
+
     #[test]
     fn a_photo_that_finishes_just_before_the_worker_parks_is_still_drawn() {
         use crate::testing::{Harness, WAIT};
@@ -1902,7 +2738,7 @@ mod tests {
             ("a settings patch", Box::new(|| vp.invalidate())),
             (
                 "a mode",
-                Box::new(|| vp.set_mode(&ViewportMode::Fit).expect("mode")),
+                Box::new(|| vp.set_mode(&ViewportMode::Fit, None).expect("mode")),
             ),
             ("Before", Box::new(|| vp.set_before(true))),
             // The cell moved and kept its size.

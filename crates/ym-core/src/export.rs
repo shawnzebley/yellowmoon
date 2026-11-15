@@ -11,9 +11,8 @@
 //!
 //! # What an export does
 //!
-//! 1. **Checks** that the look (and the imported display LUT, if one is chosen) can be loaded: an
-//!    export never quietly falls back to Neutral the way the viewport does, because the file's XMP
-//!    says which look made it.
+//! 1. **Checks** that the look can be loaded: an export never quietly falls back to Neutral the way
+//!    the viewport does, because the file's XMP says which look made it.
 //! 2. **Names** the file from the template and resolves the destination folder (`docs/09` Options).
 //!    With "If the file exists: Skip" and a file in the way nothing is rendered at all.
 //! 3. **Renders** at full resolution, tile by tile, on the render scheduler's export worker, which
@@ -31,9 +30,9 @@
 //!      orientation ([`FullTarget::DngLinearAwg4`]) and the sRGB preview of what the user sees
 //!      ([`FullTarget::DngPreview`]). The `Orientation` tag carries the camera's and the user's
 //!      turns, the default crop tags the user's crop, so other editors can undo both. With a look
-//!      that carries its own display rendering (LogC3 to Rec.709), or an imported display LUT, the
-//!      pixels are the scene values ACES 2 turns into that picture, so the DNG is close to, not the
-//!      same as, the picture of the app (`docs/09`, "What a DNG carries").
+//!      that carries its own display rendering (LogC3 to Rec.709), the pixels are the scene values
+//!      the cine rendering turns into that picture, so the DNG is close to, not the same as, the picture of the
+//!      app (`docs/09`, "What a DNG carries").
 //! 4. **Writes** through `ym_export::write_export`: a temporary file in the destination folder, then
 //!    a rename; a cancel or an error deletes the temporary file.
 //!
@@ -43,7 +42,7 @@
 //! file), with the GPS position left out when the preference "Remove location from exports" is on.
 //! The XMP carries the `ym:` properties of `docs/09`: the pipeline version, the camera profile with
 //! its version and how it was matched, the look with its SHA-256 and intensity, the display
-//! transform, the models (none yet: the classical demosaic has none) and the **pinned settings** as
+//! transform, the models (the lens data when a lens is used; the classical demosaic has none) and the **pinned settings** as
 //! JSON ([`ResolvedSettings::pinned_settings`]: exposure, sharpening and noise reduction as the
 //! numbers they resolved to, white balance as it was set). All dates are the capture time, never
 //! "now".
@@ -62,18 +61,18 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use ym_color::display::OutputTarget;
 use ym_export::dng::{CropRect, DngReport, FittedProfile, compose_orientation};
 use ym_export::exif::{CaptureTime, ExifInfo, Gps};
-use ym_export::naming::{self, NameFields, Placement};
+use ym_export::naming::{self, NameFields, Placement, STALE_TEMP_AGE, remove_stale_temps};
 use ym_export::request::{BandRequest, PictureStages, write_export_bands, write_export_with};
 use ym_export::xmp::{XmpInfo, YmInfo};
 use ym_export::{
-    ColorSpace, DetailStat, DngInputs, ExportDestination, ExportFormat, ExportHooks, ExportOptions,
-    ExportRequest, FormatKind, IfExists, ImageRef, Metadata, PixelEncoding,
-    estimate_bytes_with_detail, write_export,
+    ColorSpace, DestinationProblem, DetailStat, DngInputs, ExportDestination, ExportFormat,
+    ExportHooks, ExportOptions, ExportRequest, FormatKind, IfExists, ImageRef, Metadata,
+    PixelEncoding, estimate_bytes_with_detail, write_export,
 };
 use ym_gpu::queue::{CancelToken, JobError};
 use ym_looks::library::LookId;
@@ -85,11 +84,11 @@ use crate::auto::meta_image_size;
 use crate::camera::PhotoCamera;
 use crate::pipeline::frame::TailRequest;
 use crate::pipeline::{
-    ComputeDevice, DisplayChoice, FullImage, FullRequest, FullTarget, PhotoSource, RenderError,
-    RenderReport, Renderer,
+    ComputeDevice, FullImage, FullRequest, FullTarget, PhotoSource, RenderError, RenderReport,
+    Renderer,
 };
 use crate::session::{PhotoId, PhotoView, Session, SessionError};
-use crate::settings::{DevelopSettings, ResolvedSettings, SettingsError};
+use crate::settings::{DevelopSettings, LensSettings, ResolvedSettings, SettingsError};
 use crate::version::{PIPELINE_VERSION, app_version};
 
 /// `<source folder> export` next to the source folder of a photo, spelled the way the path gives
@@ -101,13 +100,33 @@ pub use ym_export::naming::default_destination;
 /// template gives (see [`WrittenFiles`]).
 pub const SAME_NAME_IN_JOB_NOTE: &str = "Another photo of this export has the same file name, so this one was saved with a number instead of replacing it.";
 
+/// The note of a DNG made from a photo with a Film node (`docs/24` section 4.5): the node is in the pixels.
+pub const DNG_FILM_NOTE: &str = "The Film node is baked into this DNG, halation and grain included. Another app cannot take it out.";
+
+/// The note on a JPEG whose `ym:Settings` was left out because the XMP packet would not fit a JPEG
+/// segment (`docs/23` section 3.9): a graph with a lot of brush work. TIFF, PNG and DNG have no
+/// such limit.
+pub const SETTINGS_TOO_LONG_NOTE: &str =
+    "The settings of this photo are too long for a JPEG's XMP, so they are not recorded.";
+
+/// The most bytes an XMP packet may have in a JPEG: the segment holds 65,533 bytes, 29 of them the
+/// header (`docs/23` section 3.9 says 65,502). The margin of the packet's few variable bytes is
+/// inside the 65,502.
+const JPEG_XMP_PACKET_MAX: usize = 65_502;
+
+/// Whether the XMP packet of `xmp` would not fit a JPEG segment.
+fn xmp_too_long_for_jpeg(xmp: &ym_export::xmp::XmpInfo) -> bool {
+    ym_export::xmp::build_xmp(xmp, "image/jpeg")
+        .is_ok_and(|packet| packet.len() > JPEG_XMP_PACKET_MAX)
+}
+
 /// Why a photo could not be exported. The text is plain words with a next step.
 #[derive(Debug, thiserror::Error)]
 pub enum ExportError {
     /// The job was cancelled; the partial file was removed.
     #[error("The export was cancelled and the partial file was removed.")]
     Cancelled,
-    /// The look or the display LUT cannot be used ("File missing or changed. Import again.").
+    /// The look cannot be used ("File missing or changed. Import again.").
     #[error("{0}")]
     Look(String),
     /// The photo could not be rendered.
@@ -164,12 +183,51 @@ impl ExportError {
             Self::Cancelled => "cancelled",
             Self::Look(_) => "look",
             Self::Render(RenderError::Gpu(_)) => "gpu",
+            Self::Render(RenderError::Mask(_)) => "mask",
             Self::Render(_) => "render",
-            Self::Write(_) => "write",
+            Self::Write(e) => match e.destination_problem() {
+                Some(DestinationProblem::DiskFull) => "disk_full",
+                Some(_) => "destination",
+                None => "write",
+            },
             Self::Session(SessionError::Skipped(_)) => "unsupported",
             Self::Session(_) => "session",
             Self::Settings(_) | Self::Options(_) => "usage",
             Self::Decode(_) => "decode",
+        }
+    }
+
+    /// The destination problem behind a failed write, when there is one: the whole job cannot go on
+    /// (the disk is full, the folder is read-only, gone or not allowed), as opposed to a failure of
+    /// one photo (`docs/26-hardening.md` P2-2). The queue stops on it.
+    #[must_use]
+    pub fn destination_problem(&self) -> Option<DestinationProblem> {
+        match self {
+            Self::Write(e) => e.destination_problem(),
+            _ => None,
+        }
+    }
+
+    /// The sentence for `ym` (stderr and `--json` `error.message`). It is the app's sentence, except
+    /// for a failure of the destination, which names the folder by its full path and says which
+    /// option to use (`docs/26-hardening.md` section 2).
+    #[must_use]
+    pub fn cli_message(&self) -> String {
+        if let Self::Write(e) = self
+            && let (Some(problem), Some(folder)) = (e.destination_problem(), e.folder())
+        {
+            return problem.cli_message(folder);
+        }
+        self.to_string()
+    }
+
+    /// The operating system's own text of a write failure, for the log and `error.detail` of
+    /// `--json`. Never part of a sentence.
+    #[must_use]
+    pub fn detail(&self) -> Option<String> {
+        match self {
+            Self::Write(e) => e.detail(),
+            _ => None,
         }
     }
 
@@ -428,7 +486,7 @@ impl ExportContext {
             renderer,
             home: naming::home_dir(),
             app_version: app_version().to_owned(),
-            // The tone curve and look table `tools/dngfit` fitted to ACES 2 (`data/dng/profile.json`,
+            // The tone curve and look table `tools/dngfit` fitted to the cine rendering (`data/dng/profile.json`,
             // embedded in `ym-export`), and the `BaselineExposure` offset they were fitted with.
             // The app and the CLI both come through here, so their DNGs are the same bytes.
             dng_profile: FittedProfile::embedded().clone(),
@@ -530,7 +588,14 @@ impl PhotoSnapshot {
     #[must_use]
     pub fn planned_file_name(&self, options: &ExportOptions, seq: u32) -> String {
         let v = &self.view;
-        planned_file_name_of(&v.path, &v.meta, &v.camera, &v.settings.look, options, seq)
+        planned_file_name_of(
+            &v.path,
+            &v.meta,
+            &v.camera,
+            &v.settings.output().look,
+            options,
+            seq,
+        )
     }
 
     /// The snapshot with the decoded image attached.
@@ -582,7 +647,7 @@ impl ExportPhoto {
     /// The look the photo is exported with.
     #[must_use]
     pub fn look(&self) -> &LookId {
-        &self.source.settings.look
+        &self.source.settings.output().look
     }
 }
 
@@ -890,6 +955,50 @@ pub fn exif_of(meta: &RawMetadata, remove_location: bool) -> ExifInfo {
     }
 }
 
+/// The `ym:Models` text of a photo's lens (`docs/09`): `lens vintage 1 (sha256:0123456789ab)`, and
+/// `, anamorphic 1 (sha256:…)` after it when Anamorphic is above 0. The version is the lens data's
+/// own, the digits are the first 12 of the SHA-256 of `lens.json` (`anamorphic.json`) that the shipped
+/// `data/lenses/SHA256SUMS` lists (the library was checked against it when it was loaded); a data folder
+/// the renderer does not know, or a file the sums do not list, leaves the digits out. `None` when the
+/// photo has no lens: all three amounts at 0, or no lens data (the render had none either).
+fn lens_models(renderer: &Renderer, lens: &LensSettings) -> Option<String> {
+    if lens.is_identity() {
+        return None;
+    }
+    let options = renderer.options();
+    let library = options.lens.as_ref()?;
+    let info = library.lenses().iter().find(|i| i.kind == lens.kind)?;
+    let sums = options
+        .data_root
+        .as_ref()
+        .and_then(|root| std::fs::read_to_string(root.join("lenses").join("SHA256SUMS")).ok());
+    let digest = |file: &str| -> String {
+        sums.as_deref()
+            .and_then(|text| {
+                text.lines().find_map(|line| {
+                    let (hash, name) = line.split_once(char::is_whitespace)?;
+                    (name.trim_start_matches([' ', '*']) == file && hash.len() >= 12)
+                        .then(|| format!(" (sha256:{})", &hash[..12]))
+                })
+            })
+            .unwrap_or_default()
+    };
+    let mut text = format!(
+        "lens {} {}{}",
+        lens.kind,
+        info.version,
+        digest(&format!("{}/lens.json", lens.kind))
+    );
+    if lens.anamorphic > 0.0 {
+        text.push_str(&format!(
+            ", anamorphic {}{}",
+            library.attachment().version,
+            digest("anamorphic.json")
+        ));
+    }
+    Some(text)
+}
+
 /// How the profile was matched, as `ym:ProfileMatch` says it: `exact`, `sensor family`, `default`
 /// (or `forced` for the CLI's `--profile`).
 #[must_use]
@@ -902,19 +1011,15 @@ pub fn profile_match_text(kind: &MatchKind) -> &'static str {
     }
 }
 
-/// The id of the display transform that makes the picture: `aces2-sdr100-rec709lim` for sRGB,
-/// `aces2-sdr100-p3lim` for Display P3, `aces2-sdr100-p3lim-rec2020` for Rec.2020 (the limiting
-/// primaries and, where it differs from them, the encoding), or the id of the imported ARRI
-/// display LUT (`arri-display:logc4:rec709-g24`).
+/// The id of the display transform that makes the picture: `cine-rec709` for sRGB,
+/// `cine-p3` for Display P3, `cine-rec2020` for Rec.2020: the cine rendering, whose gamut stage runs on the
+/// output's own primaries.
 #[must_use]
-pub fn display_transform_id(choice: &DisplayChoice, space: ColorSpace) -> String {
-    match choice {
-        DisplayChoice::ArriLut(id) => id.to_string(),
-        DisplayChoice::Aces2 => match space {
-            ColorSpace::Srgb => "aces2-sdr100-rec709lim".to_owned(),
-            ColorSpace::DisplayP3 => "aces2-sdr100-p3lim".to_owned(),
-            ColorSpace::Rec2020 => "aces2-sdr100-p3lim-rec2020".to_owned(),
-        },
+pub fn display_transform_id(space: ColorSpace) -> String {
+    match space {
+        ColorSpace::Srgb => "cine-rec709".to_owned(),
+        ColorSpace::DisplayP3 => "cine-p3".to_owned(),
+        ColorSpace::Rec2020 => "cine-rec2020".to_owned(),
     }
 }
 
@@ -1003,9 +1108,9 @@ fn render(
 ///
 /// # Errors
 ///
-/// [`ExportError::Look`] for a look or display LUT that cannot be loaded, or that was replaced,
-/// removed or switched while the photo was rendering ([`CHANGED_DURING_EXPORT_MESSAGE`]; nothing is
-/// written under a look the pixels were not made with),
+/// [`ExportError::Look`] for a look that cannot be loaded, or that was replaced, removed or
+/// switched while the photo was rendering ([`CHANGED_DURING_EXPORT_MESSAGE`]; nothing is written
+/// under a look the pixels were not made with),
 /// [`ExportError::Render`] (memory, an unusable photo, a panic
 /// below this function, which is caught and logged),
 /// [`ExportError::Write`] (the folder, the disk, the original in the way), and
@@ -1017,6 +1122,11 @@ pub fn export_photo(
     params: &ExportParams,
     control: &ExportControl<'_>,
 ) -> Result<ExportReport, ExportError> {
+    // From here to the return (the file written, an error, a cancel, a panic) this export is running: the fill of a
+    // whole-image level starts no band, also while no export job is queued (reading, encoding, writing, the gaps
+    // between device jobs), where a fast device would fit its bands (`docs/17-gpu.md` section 19). Dropped on every
+    // way out, unwinding included.
+    let _running = ctx.renderer.scheduler().begin_export();
     // A bug below this function (a writer, a look provider) is this photo's error, not an
     // unwinding queue thread that leaves the panel waiting for a file that never comes. The
     // writers delete their temporary file when they unwind.
@@ -1037,45 +1147,20 @@ pub fn export_photo(
     })
 }
 
-/// The message of a photo whose look or display rendering changed while it was exporting.
+/// The message of a photo whose look changed while it was exporting.
 pub const CHANGED_DURING_EXPORT_MESSAGE: &str =
-    "The look or the display rendering changed while this photo was exporting. Export it again.";
+    "The look changed while this photo was exporting. Export it again.";
 
-/// What the render reads from the look library and from Preferences › Display rendering, for
-/// noticing that either changed between the start of an export and the file being written: the
-/// file's XMP says which look and transform made it, so it must say it truthfully.
-#[derive(Debug, PartialEq, Eq)]
-struct RenderInputs {
-    /// The look's fingerprint (the SHA-256 of its LUT, or its id for a built-in look).
-    look: String,
-    /// The display rendering in effect.
-    display: DisplayChoice,
-    /// The fingerprint of the chosen display LUT.
-    display_lut: Option<String>,
-}
-
-/// The look and display rendering as they are now. An error when either cannot be loaded: an
-/// export never falls back.
-fn render_inputs(ctx: &ExportContext, photo: &ExportPhoto) -> Result<RenderInputs, ExportError> {
-    let looks = ctx.renderer.looks();
-    let look = looks
+/// The look's fingerprint as the library has it now (the SHA-256 of its LUT, or its id for a
+/// built-in look), for noticing that it changed between the start of an export and the file being
+/// written: the file's XMP says which look made it, so it must say it truthfully. An error when the
+/// look cannot be loaded: an export never falls back.
+fn look_fingerprint(ctx: &ExportContext, photo: &ExportPhoto) -> Result<String, ExportError> {
+    ctx.renderer
+        .looks()
         .look(photo.look())
-        .map_err(|e| ExportError::Look(e.to_string()))?;
-    let display = ctx.renderer.display();
-    let display_lut = match &display {
-        DisplayChoice::ArriLut(id) => Some(
-            looks
-                .display_transform(id)
-                .map_err(|e| ExportError::Look(e.to_string()))?
-                .1,
-        ),
-        DisplayChoice::Aces2 => None,
-    };
-    Ok(RenderInputs {
-        look: look.fingerprint,
-        display,
-        display_lut,
-    })
+        .map(|look| look.fingerprint)
+        .map_err(|e| ExportError::Look(e.to_string()))
 }
 
 fn export_photo_unguarded(
@@ -1107,15 +1192,18 @@ fn export_photo_unguarded(
         progress: Some(&monotone),
     };
 
-    // 1. The look and the display rendering must be usable: an export does not fall back.
+    // 1. The look must be usable: an export does not fall back. Nor does a mask: a photo with a mask this
+    // computer cannot make is never written without it (`error.kind` `mask`, `docs/23` section 3.10).
     let looks = ctx.renderer.looks();
-    let inputs = render_inputs(ctx, photo)?;
-    let display = inputs.display.clone();
+    let fingerprint = look_fingerprint(ctx, photo)?;
+    if let Some(sentence) = ctx.renderer.unmakeable_mask(&photo.source.settings) {
+        return Err(ExportError::Render(RenderError::Mask(sentence)));
+    }
     let is_dng = options.format == FormatKind::Dng;
     let look_sha256 = looks.look_sha256(photo.look());
     // Checked again once the pixels are rendered (which takes seconds to minutes).
     let still_the_same = || -> Result<(), ExportError> {
-        if render_inputs(ctx, photo)? == inputs {
+        if look_fingerprint(ctx, photo)? == fingerprint {
             Ok(())
         } else {
             Err(ExportError::Look(CHANGED_DURING_EXPORT_MESSAGE.to_owned()))
@@ -1124,8 +1212,15 @@ fn export_photo_unguarded(
 
     // 2. The file name and the folder; a skipped file costs nothing.
     let fields = name_fields(photo, params.seq);
-    let mut dest =
-        ExportDestination::resolve(options, &fields, Some(&photo.path), ctx.home.as_deref())?;
+    // Only the job's first photo may make the folder the options name; a later photo finds it gone
+    // ("Folder gone", `docs/26-hardening.md` P2-4).
+    let mut dest = ExportDestination::resolve_with(
+        options,
+        &fields,
+        Some(&photo.path),
+        ctx.home.as_deref(),
+        params.seq <= 1,
+    )?;
     // A name this job has already written is numbered whatever "If the file exists" says: Replace
     // would overwrite the job's own earlier photo and Skip would take it for a file from before.
     let mut notes: Vec<String> = Vec::new();
@@ -1168,7 +1263,7 @@ fn export_photo_unguarded(
         options.color_space
     };
     let exif = exif_of(&photo.meta, params.remove_location);
-    let metadata = Metadata {
+    let mut metadata = Metadata {
         xmp: XmpInfo {
             app_version: ctx.app_version.clone(),
             capture_time: exif.capture_time,
@@ -1179,17 +1274,32 @@ fn export_photo_unguarded(
                 profile_match: Some(profile_match_text(&camera.matched.how).to_owned()),
                 look: Some(photo.look().to_string()),
                 look_sha256,
-                look_intensity_pct: Some(rounded_percent(photo.source.settings.look_intensity)),
-                display_transform: Some(display_transform_id(&display, space)),
-                models: None,
-                // Which Auto made the values, and what Apple Auto said (`docs/19` section 9).
+                look_intensity_pct: Some(rounded_percent(
+                    photo.source.settings.output().look_intensity,
+                )),
+                display_transform: Some(display_transform_id(space)),
+                models: lens_models(&ctx.renderer, &photo.source.settings.input().lens),
+                // Which Auto made the values, and what the provider said (`docs/22` section 14.2).
                 auto: Some(photo.source.estimates.source().name().to_owned()),
-                apple_auto: photo.source.estimates.apple.xmp_json(),
+                auto_advisor: photo.source.estimates.apple.advisor_json(),
+                film_data: crate::film::film_data_of(&photo.source.settings),
                 settings: serde_json::to_value(photo.resolved.pinned_settings()).ok(),
             },
         },
         exif,
     };
+
+    // A DNG carries the Film node in its pixels (the passes run at the DNG's own grid).
+    if is_dng && crate::pipeline::color::has_film(&photo.source.settings) {
+        notes.push(DNG_FILM_NOTE.to_owned());
+    }
+
+    // A JPEG's XMP is one segment of 65,502 bytes: the pinned settings of a graph with a lot of brush
+    // work may not fit. The file then says nothing of them, and the report says so.
+    if options.format == FormatKind::Jpeg && xmp_too_long_for_jpeg(&metadata.xmp) {
+        metadata.xmp.ym.settings = None;
+        notes.push(SETTINGS_TOO_LONG_NOTE.to_owned());
+    }
 
     // 4. Render and write.
     let cancel_flag = || control.cancel.is_cancelled();
@@ -1267,7 +1377,7 @@ fn export_photo_unguarded(
         rendered = (raw.width as u32, raw.height as u32);
         let orientation = compose_orientation(
             photo.source.exif_orientation(),
-            photo.source.settings.orientation.degrees(),
+            photo.source.settings.input().orientation.degrees(),
         )
         .unwrap_or(1);
         let crop = raw.window.map(|w| CropRect {
@@ -1309,8 +1419,9 @@ fn export_photo_unguarded(
     } else {
         // Output sharpening (Detail › Sharpening › Output) runs right after the Lanczos-3 resize, on
         // the picture at the size it is written. Never for a DNG.
-        let stages =
-            PictureStages::output_sharpening(photo.source.settings.output_sharpening as f32);
+        let stages = PictureStages::output_sharpening(
+            photo.source.settings.output().output_sharpening as f32,
+        );
         // With the export tail on the device the picture is never a host frame: the device makes
         // the encoded rows and the writer pulls them (`pipeline::frame::export_tail`). A device
         // error ends that attempt, and the whole photo is made again on the CPU reference path.
@@ -1319,6 +1430,8 @@ fn export_photo_unguarded(
         if let Some(why) = ctx.renderer.export_tail_refused() {
             return Err(ExportError::Render(RenderError::Gpu(why)));
         }
+        // A Film node runs on the device too: its pictures are made for each tile before the colour pass
+        // (`pipeline::frame::film_pass`, `ym_gpu::kernels::film_stack`).
         if ctx.renderer.export_tail_enabled() {
             let began = Instant::now();
             let request = TailRequest {
@@ -1406,6 +1519,7 @@ fn export_photo_unguarded(
             let request = ExportRequest::new(pixels, options, &metadata)
                 .remove_location(params.remove_location);
             encode_started = Instant::now();
+            let _encoder = jpeg_encoder_hold(ctx, options.format_spec(), rendered);
             outcome = write_export_with(
                 &request,
                 &dest,
@@ -1482,6 +1596,24 @@ struct DeviceExport {
     rendered: (u32, u32),
 }
 
+/// What the JPEG writer holds while it encodes, counted in the ledger: the 8-bit picture (3 bytes a
+/// pixel) and the encoder's quantised blocks (2 bytes a sample for the optimised tables: 3 bytes a
+/// pixel at 4:2:0, 6 at 4:4:4). The scans and the file are small beside them. `None` for the other
+/// formats. Forced, as the render's own reservation is: the count stays true and the next request
+/// is the one refused.
+fn jpeg_encoder_hold(
+    ctx: &ExportContext,
+    format: ExportFormat,
+    (width, height): (u32, u32),
+) -> Option<crate::scheduler::Reservation> {
+    let ExportFormat::Jpeg { quality } = format else {
+        return None;
+    };
+    let per_pixel = if quality.is_full_chroma() { 9 } else { 6 };
+    let bytes = u64::from(width) * u64::from(height) * per_pixel;
+    Some(ctx.renderer.ledger().reserve_forced(bytes))
+}
+
 /// The depth of a raster export's samples.
 fn bit_depth_of(format: ExportFormat) -> ym_export::BitDepth {
     match format {
@@ -1536,6 +1668,7 @@ fn export_on_device(
         metadata,
         remove_location: params.remove_location,
     };
+    let _encoder = jpeg_encoder_hold(ctx, options.format_spec(), rendered);
     let written = write_export_bands(&band_request, &mut bands, dest, hooks);
     let failure = bands.take_failure();
     let finished = bands.finish();
@@ -1584,10 +1717,10 @@ fn megapixels(w: usize, h: usize) -> f64 {
 #[must_use]
 pub fn estimated_output_size(meta: &RawMetadata, settings: &DevelopSettings) -> (u32, u32) {
     let (mut w, mut h) = meta_image_size(meta);
-    if matches!(settings.orientation.degrees(), 90 | 270) {
+    if matches!(settings.input().orientation.degrees(), 90 | 270) {
         std::mem::swap(&mut w, &mut h);
     }
-    if let Some(crop) = &settings.crop {
+    if let Some(crop) = &settings.input().crop {
         w = ((w as f64 * crop.rect.width).round() as usize).max(1);
         h = ((h as f64 * crop.rect.height).round() as usize).max(1);
     }
@@ -1640,6 +1773,100 @@ pub fn estimate<'a>(
     Estimate { bytes, seconds }
 }
 
+/// Resolves the destination of a photo the way [`export_photo`] will (the folder is made and probed with a
+/// temporary file), without decoding or rendering anything. The queue calls it **before** the photo is
+/// decoded, so a folder that has gone or became read-only ends the job before any work is spent on it
+/// (`docs/26-hardening.md` P2-2). Any error is returned as `export_photo` would return it; the caller stops
+/// the job only for one with a [`ExportError::destination_problem`].
+///
+/// # Errors
+/// [`ExportError::Write`] when the folder cannot be made or written.
+pub fn check_destination(
+    ctx: &ExportContext,
+    snapshot: &PhotoSnapshot,
+    options: &ExportOptions,
+    seq: u32,
+) -> Result<(), ExportError> {
+    let v = &snapshot.view;
+    let fields = name_fields_of(&v.path, &v.meta, &v.camera, &v.settings.output().look, seq);
+    let dest = ExportDestination::resolve_with(
+        options,
+        &fields,
+        Some(&v.path),
+        ctx.home.as_deref(),
+        seq <= 1,
+    )?;
+    if seq <= 1 {
+        // The start of a job: a crash of an earlier run left its temporary files here.
+        remove_stale_temps(&dest.dir, SystemTime::now(), STALE_TEMP_AGE);
+    }
+    Ok(())
+}
+
+/// The warning threshold of `docs/26-hardening.md` P2-3: the free space is compared with the size
+/// estimate times this factor, the estimate's documented 90th-percentile error (`docs/09`, "Size
+/// estimate": 90 % of the real renders within 35 %).
+pub const LOW_SPACE_FACTOR: f64 = 1.35;
+
+/// Whether an export that the estimate puts at `estimate_bytes` should be warned about on a disk with
+/// `free_bytes` available: exactly when `free_bytes < LOW_SPACE_FACTOR * estimate_bytes`. A warning
+/// only; the export is never refused (the stop on a full disk is the exact one).
+#[must_use]
+pub fn is_low_on_space(estimate_bytes: u64, free_bytes: u64) -> bool {
+    (free_bytes as f64) < LOW_SPACE_FACTOR * estimate_bytes as f64
+}
+
+/// A size as the panel writes it: decimal megabytes, or gigabytes from 1000 MB ("120 MB", "1.2 GB").
+#[must_use]
+pub fn size_text(bytes: u64) -> String {
+    let mb = bytes as f64 / 1e6;
+    if mb >= 1000.0 {
+        format!("{:.1} GB", mb / 1000.0)
+    } else {
+        format!("{} MB", mb.round().max(1.0) as u64)
+    }
+}
+
+/// The sentence under the Export button, and on stderr in `ym`, when [`is_low_on_space`]. `folder` is
+/// how the destination is named: its last component in the app, its full path in `ym`.
+#[must_use]
+pub fn low_space_message(estimate_bytes: u64, free_bytes: u64, folder: &str) -> String {
+    format!(
+        "This export needs about {} and {} is free in {folder}. It may stop part way.",
+        size_text(estimate_bytes),
+        size_text(free_bytes)
+    )
+}
+
+/// The last component of a folder, the way the app names it in a sentence (the whole path when it has
+/// none, as for `/`).
+#[must_use]
+pub fn folder_label(dir: &Path) -> String {
+    dir.file_name().map_or_else(
+        || dir.display().to_string(),
+        |n| n.to_string_lossy().into_owned(),
+    )
+}
+
+/// The bytes available to this user on the volume that holds `dir`, or of its nearest existing
+/// parent when the folder is not made yet. `None` when no volume can be read (the warning is then
+/// left out, never invented).
+#[must_use]
+pub fn free_bytes_in(dir: &Path) -> Option<u64> {
+    let existing = dir
+        .ancestors()
+        .filter(|a| !a.as_os_str().is_empty())
+        .find(|a| a.exists());
+    // A WebAssembly build (the iPhone web app) writes to memory, which has no volume to read.
+    #[cfg(target_family = "wasm")]
+    {
+        let _ = existing;
+        None
+    }
+    #[cfg(not(target_family = "wasm"))]
+    existing.and_then(|a| fs4::available_space(a).ok())
+}
+
 /// The destination folder an export of `photo` would use, worked out without touching the disk:
 /// the folder the options name, else `<source folder> export`, else `~/Pictures/Yellowmoon export`.
 #[must_use]
@@ -1676,4 +1903,49 @@ pub fn predicted_name_in(dir: &Path, file_name: &str, if_exists: IfExists) -> St
         }
     }
     file_name.to_owned()
+}
+
+#[cfg(test)]
+mod space_tests {
+    use super::*;
+
+    #[test]
+    fn the_warning_is_exactly_free_space_under_135_percent_of_the_estimate() {
+        // 100 MB estimated: the line is 135 MB.
+        assert!(is_low_on_space(100_000_000, 134_999_999));
+        assert!(!is_low_on_space(100_000_000, 135_000_000));
+        assert!(!is_low_on_space(100_000_000, 135_000_001));
+        assert!(is_low_on_space(100_000_000, 0));
+        // Nothing to write is never a warning.
+        assert!(!is_low_on_space(0, 0));
+        assert!(!is_low_on_space(0, 1));
+        // A big job on a big disk.
+        assert!(is_low_on_space(2_000_000_000_000, 2_699_999_999_999));
+        assert!(!is_low_on_space(2_000_000_000_000, 2_700_000_000_000));
+    }
+
+    #[test]
+    fn the_sentence_is_the_catalogues() {
+        assert_eq!(
+            low_space_message(300_000_000, 350_000_000, "/Users/me/Lisbon export"),
+            "This export needs about 300 MB and 350 MB is free in /Users/me/Lisbon export. It may stop part way."
+        );
+        assert_eq!(size_text(2_400_000_000), "2.4 GB");
+        assert_eq!(size_text(1), "1 MB");
+        assert_eq!(size_text(999_499_999), "999 MB");
+        assert_eq!(
+            folder_label(Path::new("/a/Lisbon export/")),
+            "Lisbon export"
+        );
+    }
+
+    #[test]
+    fn free_space_is_read_for_a_folder_that_is_not_made_yet() {
+        let dir = tempfile::tempdir().expect("dir");
+        let here = free_bytes_in(dir.path()).expect("the volume can be read");
+        assert!(here > 0);
+        // The nearest existing parent answers for a folder that is not there.
+        assert!(free_bytes_in(&dir.path().join("a").join("b")).is_some());
+        assert!(!dir.path().join("a").exists(), "nothing was made");
+    }
 }

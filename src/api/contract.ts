@@ -10,8 +10,8 @@
  *    sends no event the webview does not know (`Events`);
  *  - every method of `Api` is a generated command that takes the arguments and answers what the command does (`Commands`).
  *
- * Deliberate differences, each stated where it is excluded: `SettingsPatch` (the core accepts more than `Partial<DevelopSettings>`, so
- * the narrower one is what the screens send), `UpdateState` (the shell never sends it; the updater runs in the webview), the unit
+ * Deliberate differences, each stated where it is excluded: `SettingsPatch` (the generated node patch allows `null` in every field and a
+ * plain number for an Auto-or-value field, so the narrower one is what the screens send), `UpdateState` (the shell never sends it; the updater runs in the webview), the unit
  * commands (`null` on the wire, `void` in `Api`), `looksImport` (an optional `input`), `viewportInfo` (the mock has no viewport) and
  * `copySettings` and `pasteSettings` (they answer patches, which the generated type allows `null` in every field of; `tauriApi` narrows
  * them, see `narrowed` in `api.ts`).
@@ -43,29 +43,42 @@ export type FromCore = AllTrue<{
   developSettings: Assignable<B.DevelopSettings, T.DevelopSettings>;
   autoEstimates: Assignable<B.AutoEstimates, T.AutoEstimates>;
   appleAuto: Assignable<B.AppleAuto, T.AppleAuto>;
-  appleAutoStatus: Assignable<B.AppleAutoStatus, T.AppleAutoStatus>;
+  autoStatus: Assignable<B.AutoStatus, T.AutoStatus>;
   look: Assignable<B.Look, T.Look>;
   looksImportResult: Assignable<B.LooksImportResult, T.LooksImportResult>;
   sourceRecognition: Assignable<B.SourceRecognition, T.SourceRecognition>;
-  displayLut: Assignable<B.DisplayLut, T.DisplayLut>;
   watchStatus: Assignable<B.WatchStatus, T.WatchStatus>;
   pixelSample: Assignable<B.PixelSample, T.PixelSample>;
   histogramData: Assignable<B.HistogramData, T.HistogramData>;
   chromaScatter: Assignable<B.ChromaScatter, T.ChromaScatter>;
+  cropSuggestion: Assignable<B.CropSuggestion, T.CropSuggestion>;
   chromaSample: Assignable<B.ChromaSample, T.ChromaSample>;
+  lensInfo: Assignable<B.LensInfo, T.LensInfo>;
   exportEstimate: Assignable<B.ExportEstimate, T.ExportEstimate>;
   cliLinkResult: Assignable<B.CliLinkResult, T.CliLinkResult>;
   cliLinkStatus: Assignable<B.CliLinkStatus, T.CliLinkStatus>;
   appInfo: Assignable<B.AppInfo, T.AppInfo>;
+  filmCatalogue: Assignable<B.FilmCatalogue, T.FilmCatalogue>;
   viewportInfo: Assignable<B.ViewportInfo, T.ViewportInfo>;
+  viewportBusy: Assignable<B.ViewportBusy, T.ViewportBusy>;
+  objectState: Assignable<B.ObjectState, T.ObjectState>;
+  visionState: Assignable<B.VisionState, T.VisionState>;
+  depthState: Assignable<B.DepthState, T.DepthState>;
+  memoryNotice: Assignable<B.MemoryNotice, T.MemoryNotice>;
+  displayOptions: Assignable<B.DisplayOptions, T.DisplayOptions>;
+  depthFar: Assignable<B.DepthFar, T.DepthFar>;
+  focusPlaneResult: Assignable<B.FocusPlaneResult, T.FocusPlaneResult>;
+  maskFindResult: Assignable<B.MaskFindResult, T.MaskFindResult>;
   appError: Assignable<B.AppError, T.AppError>;
   menuAction: Assignable<B.MenuAction, T.MenuAction>;
   openSummary: Assignable<B.OpenSummary, T.OpenSummary>;
+  openProgress: Assignable<B.OpenProgress, T.OpenProgress>;
+  nodeThumbnailsReady: Assignable<B.NodeThumbnailsReady, T.NodeThumbnailsReady>;
 }>;
 
 /** Arguments: what the screens send has to fit the type the core takes. */
 export type ToCore = AllTrue<{
-  // The Rust patch is wider (nested objects may be partial, `null` clears): the screens send the narrower one.
+  // The Rust patch is wider (`null` in every field, plain numbers for contrast and the like): the screens send the narrower one.
   settingsPatch: Assignable<T.SettingsPatch, B.SettingsPatch>;
   preferencesPatch: Assignable<T.PreferencesPatch, B.PreferencesPatch>;
   lookInput: Assignable<T.LookInput, NonNullable<Parameters<typeof commands.looksImport>[1]>>;
@@ -80,7 +93,6 @@ export type Both = AllTrue<{
   exportJob: Same<T.ExportJob, B.ExportJob>;
   preferences: Same<T.Preferences, B.Preferences>;
   lastUsedFolders: Same<T.LastUsedFolders, B.LastUsedFolders>;
-  displayRendering: Same<T.DisplayRendering, B.DisplayRendering>;
   crop: Same<T.Crop, B.Crop>;
   curves: Same<T.Curves, B.Curves>;
   colorBalance: Same<T.ColorBalance, B.ColorBalance>;
@@ -88,9 +100,18 @@ export type Both = AllTrue<{
   balanceSetting: Same<T.BalanceSetting, B.BalanceSetting>;
   colorWarp: Same<T.ColorWarp, B.ColorWarp>;
   colorWarpPin: Same<T.ColorWarpPin, B.ColorWarpPin>;
+  lensKind: Same<T.LensKind, B.LensKind>;
+  lensSettings: Same<T.LensSettings, B.LensSettings>;
   viewportRect: Same<T.ViewportRect, B.ViewportRect>;
   viewportInput: Same<T.ViewportInput, B.ViewportInput>;
   viewportMode: Same<T.ViewportMode, B.ViewportMode>;
+  maskStyle: Same<T.MaskStyle, B.MaskStyle>;
+  maskKind: Same<T.MaskKind, B.MaskKind>;
+  focusReason: Same<T.FocusReason, B.FocusReason>;
+  maskFindPrompt: Same<T.MaskFindPrompt, B.MaskFindPrompt>;
+  mapFrom: Same<T.MapFrom, B.MapFrom>;
+  chromaTap: Same<T.ChromaTap, B.ChromaTap>;
+  maskView: Same<T.MaskView, B.MaskView>;
   viewportFrame: Same<T.ViewportFrame, B.ViewportFrame>;
   viewportBackendKind: Same<T.ViewportBackendKind, B.ViewportBackendKind>;
   errorScope: Same<T.ErrorScope, B.ErrorScope>;
@@ -99,14 +120,17 @@ export type Both = AllTrue<{
   autoSource: Same<T.AutoSource, B.AutoSource>;
   appleAutoReason: Same<T.AppleAutoReason, B.AppleAutoReason>;
   appleAutoFailure: Same<T.AppleAutoFailure, B.AppleAutoFailure>;
-  appleAutoMode: Same<T.AppleAutoMode, B.AppleAutoMode>;
+  autoProvider: Same<T.AutoProvider, B.AutoProvider>;
+  autoConsent: Same<T.AutoConsent, B.AutoConsent>;
+  providerState: Same<T.ProviderState, B.ProviderState>;
+  providerStatus: Same<T.ProviderStatus, B.ProviderStatus>;
   appleAutoInfo: Same<T.AppleAutoInfo, B.AppleAutoInfo>;
   appleAutoSteps: Same<T.AppleAutoSteps, B.AppleAutoSteps>;
   appleAutoAnswer: Same<T.AppleAutoAnswer, B.AppleAutoAnswer>;
   appleAutoInstructions: Same<T.AppleAutoInstructions, B.AppleAutoInstructions>;
   appleShadowColor: Same<T.AppleShadowColor, B.AppleShadowColor>;
   appleHighlightColor: Same<T.AppleHighlightColor, B.AppleHighlightColor>;
-  appleAutoStatus: Same<T.AppleAutoStatus, B.AppleAutoStatus>;
+  autoStatus: Same<T.AutoStatus, B.AutoStatus>;
   lookInput: Same<T.LookInput, B.LookInput>;
   lookGroup: Same<T.LookGroup, B.LookGroup>;
   lookLibrary: Same<T.LookLibrary, B.LookLibrary>;

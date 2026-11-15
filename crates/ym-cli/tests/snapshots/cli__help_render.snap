@@ -30,11 +30,11 @@ Look and display:
       --intensity <PERCENT>
           How strongly the look applies, in percent (default 100)
 
-      --display <aces2|arri>
-          Display rendering: `aces2`, or `arri` (an imported ARRI display LUT: the one chosen in the app, else the only one imported; or give its id)
-
       --settings <FILE>
-          A JSON file of settings (the `ym:Settings` schema), or `-` for stdin. It covers what these options can't: colour balance (`{ "kind": "auto" }` puts a shadows or highlights wheel back to Auto), curves, crop, orientation, white pick
+          A JSON file of settings, or `-` for stdin: a graph of nodes (the `ym:Settings` of an export's XMP is one). It covers what these options can't: other nodes and their masks, links, colour balance (`{ "kind": "auto" }` puts a shadows or highlights wheel of Main back to Auto), curves, crop, orientation, white pick
+
+      --auto-crop[=<ASPECT>]
+          Crop each photo as the Crop panel's Auto does: its straighten angle and its first frame for an aspect (original, free, 1:1, 4:5 or 16:9; original when none is given), at the photo's orientation. Replaces a crop from --settings
 
 Light:
       --exposure <auto|EV>
@@ -61,9 +61,6 @@ Light:
       --black <auto|N>
           Black point, -100 to 100, or `auto` (the default: 0, or the value Apple Auto chose)
 
-      --white-offset <EV>
-          Stops added to each photo's automatic white lift, -3 to 3. 0 is the automatic amount; an offset that takes the lift to 0 or below switches it off (`--white-offset -3` always does). The lift only acts with the built-in ACES 2 display rendering, and a DNG carries it
-
 Colour:
       --wb <auto|K[,TINT]>
           White balance: `auto`, or a temperature in kelvin (2000 to 11000) with an optional tint (-50 to 50), as `5200` or `5200,4`
@@ -81,6 +78,28 @@ Colour:
 
       --saturation <auto|N>
           Saturation, -100 to 100, or `auto` (the default: 0, or the value Apple Auto chose). More makes colours stronger, less makes them greyer; brightness stays
+
+Lens:
+      --lens <LENS>
+          Give the photo the look of another lens (`ym lenses list`). Flares and Edges take the lens's starting amounts unless --flares or --edges is given, as when the lens is chosen in the app
+
+          Possible values:
+          - default: Clean and modern: even sharpness, faint glow
+          - classic: Warm and gentle: soft glow, amber flares, smooth falloff
+          - vintage: Glows wide open, lower contrast, soft edges, a little swirl
+          - petzval: Very sharp centre, strong swirl, fast falloff
+          - triplet: Soft corners, busy flares, a crisp centre
+          - sonnar:  Smooth and glowing, with gentle edges
+          - detuned: Sharp only in the centre, with smeared flares
+
+      --flares <N>
+          Flares, 0 to 100: glow around bright light, veiling glare, ghosts and starbursts
+
+      --edges <N>
+          Edges, 0 to 100: softer and darker edges, colour fringes and the lens's distortion
+
+      --anamorphic <N>
+          Anamorphic, 0 to 100: an anamorphic attachment in front of the lens, with taller out-of-focus highlights that take the lens's own swirl and cat's-eye shapes, horizontal flare streaks and the anamorphic bend. It works with every lens
 
 Detail:
       --nr <auto|L,C,D>
@@ -106,7 +125,7 @@ RAW:
           Switch the chromatic-aberration correction off
 
       --rolloff <HIGHLIGHTS,LOW-LIGHT>
-          Highlight range and low-light toe, 0 to 1 each, as `1,0.5` (the defaults). Highlights: where the camera's clipping point lands, from where it was recorded (0) to white, the clip of an ALEXA at EI 800 (1)
+          Highlight range and low-light toe, 0 to 1 each, as `0.6,0.5` (the defaults). Highlights: where the camera's clipping point lands, from where it was recorded (0) to white, the clip of an ALEXA at EI 800 (1)
 
       --profile <ID>
           Force a camera profile, for comparisons (for example `sony-ilce-7rm4`)
@@ -128,7 +147,7 @@ Output:
           Bits per channel for TIFF and PNG, 8 or 16 (default 16)
 
       --compression <METHOD>
-          TIFF compression (default lzw)
+          TIFF compression (default zip)
 
           Possible values:
           - none: No compression
@@ -164,24 +183,24 @@ Run:
       --jobs <N>
           Photos read and analysed at the same time. The export itself renders one photo at a time
 
-      --json
-          Print one JSON object per file on stdout, as each file finishes
-
       --require-gpu
           Stop with exit code 4 when there is no usable GPU, instead of using the CPU
 
       --cpu
           Render on the CPU only and open no graphics device. The golden images are made this way. Beats YELLOWMOON_GPU
 
-      --apple-auto <on|off>
-          Apple Auto for this run. On a Mac with Apple Intelligence, Apple's on-device model grades each photo: it sets the automatic exposure, highlights, shadows, black, contrast, warmth, tint and saturation and the colours of the shadows and highlights. Default: the app's setting where Apple Auto is available, off elsewhere
+      --auto-provider <yellowmoon|apple|claude|agy>
+          Who grades each photo's Auto for this run: yellowmoon (Default Auto, the rule), apple (Apple's on-device model, on a Mac with Apple Intelligence), claude (the Claude Code installed on this computer) or agy (the Antigravity installed on this computer). A provider sets the automatic exposure, highlights, shadows, black, contrast, warmth, tint and saturation and the colours of the shadows and highlights. Default: the app's setting, which acts where that provider is available and, for claude and agy, where you agreed to it in Preferences; otherwise Default Auto. Naming claude or agy is your consent for this run: ym then sends a 768 px picture of each photo and the instructions to that service, through the program installed on this computer. Answers from Claude Code and Antigravity can differ from run to run
 
-      --apple-auto-instructions <FILE>
-          A text file with instructions for Apple's model, used for this run instead of those in Preferences (at most 2000 characters; an empty file is the default instructions)
+      --apple-auto <on|off>
+          The old name of --auto-provider: on is apple, off is yellowmoon. Not with --auto-provider
+
+      --auto-instructions <FILE>
+          A text file with instructions for the model, used for this run instead of those in Preferences (at most 2000 characters; an empty file is the default instructions). Also called --apple-auto-instructions
 
 Examples:
   ym render ~/Pictures/2026-10-04 --look neutral --format jpeg --long-edge 3000 --out ~/Exports
-  fd -e ARW . /Volumes/A1 | ym render - --json --format tiff --bits 16 > results.jsonl
+  fd -e ARW . /Volumes/A1 | ym render - --format tiff --bits 16 --out ~/Exports
   ym render DSC04204.ARW --exposure-offset -0.5 --wb 5200,4
 
-Per-photo settings beyond these options go in a JSON file given with --settings (the `ym:Settings` schema of an exported file). Options given alongside it override it. A file with several photos' settings is an object keyed by file name.
+Settings are a graph of nodes. The options set fields of three of them: the Input (--exposure, --exposure-offset, --wb, --light, --lens, --flares, --edges, --anamorphic, --nr, --sharpen, --rolloff, --no-neural, --no-highlight-recovery, --no-lens, --no-ca, --auto-crop), node 1, Main (--contrast, --brightness, --highlights, --shadows, --white, --black, --saturation) and the Output (--look, --intensity, --output-sharpening). Everything else goes in a JSON file given with --settings: other nodes (correctors, mixers, splitters and combiners, and Film nodes whose stocks `ym film list` shows), masks and links, colour balance, curves, crop, orientation, white pick. The file is a graph, for example {"nodes":{"items":[{"id":1,"grade":{"contrast":{"kind":"manual","value":20}}}]}}; the `ym:Settings` of an export's XMP holds a photo's settings in that form. A file in the form of Yellowmoon 0.1 is refused. Options given alongside --settings override it. A file with several photos' settings is an object keyed by file name.

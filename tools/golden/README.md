@@ -77,8 +77,7 @@ of a skip.
 **The manifest.** The entries of tier `synthetic` are written by `python3 -m training.synth.make_scenes --write-manifest
 tools/golden/manifest.json` and leave `expected_hash` and `reference` empty on purpose (a test pins that): this runner
 keeps the hashes in `expected.json` and the pictures under `testdata/golden/refs`. An entry's `settings` is the
-`ym:Settings` document passed to `--settings` (`{}` is everything Auto; a field that is not a setting is an error in
-`ym`, so a typo fails loudly).
+`ym:Settings` document passed to `--settings`, **node-first** from 0.2.0 (`docs/10`, `docs/23` §3): `{}` is the default graph (everything Auto, Input → Main → Output), and an entry that changes something names the nodes it changes, for example `{"nodes":{"items":[{"id":"input","exposure":{"kind":"manual","ev":0.3}}]}}`; a field that is not a setting of the node is an error in `ym`, so a typo fails loudly, and a flat document of Yellowmoon 0.1 is refused. N-02 rewrites what holds the old form: no entry has settings (all 114 are `{}`, which stays valid), so the change is in `truth_settings` (`src/truth.rs`), which builds the node-first document of the Neutral look (the Output's `look`) and the highlight range 0 (the Input's `rolloff`), and in the manifest's own description of `settings`.
 
 ## GPU mode: `golden check --device gpu` and `golden device-check`
 
@@ -111,20 +110,20 @@ proposal): the ΔE00 of the 1/4 downsample (a box filter in linear light, CIEDE2
 99th percentile and a maximum under the gates, and the share of the samples of the full-resolution picture that differ by more than 8 codes of 16 bits
 must stay under its gate. The report (`--report FILE`) has, per file, the device `ym` reported, its notes, the ΔE00 statistics and the count.
 
-| Gate | Proposed (`plan`) | Calibrated (default) | First run on lavapipe, 61 files | Ten-file subset |
-|---|---|---|---|---|
-| median ΔE00 | 0.02 | 2.1e-4 | worst 1.003e-4 | 9.8e-5 |
-| 99th percentile | 0.05 | 2.2e-2 | worst 1.066e-2 | 9.2e-3 |
-| maximum | 0.5 | 3.8 | worst 1.855 (`D6500__ILCE-7SM3__iso400__rggb__12b__packed12`), then 1.176 (`D6500__DSC-RX100M4 craw`) and four files between 0.55 and 0.57; the other 55 under 0.5 | 0.548 |
-| samples more than 8 codes off | 1e-3 | 7.4e-3 | worst 3.66e-3 (largest difference 40741 codes) | 3.34e-3 |
+| Gate | Proposed (`plan`) | Calibrated (default, pipeline 0.5.0) | Lavapipe, 61 files, pipeline 0.5.1 | Ten-file subset, lavapipe, pipeline 0.5.1 | First calibration (pipeline 0.1.x, 2026-10-15) |
+|---|---|---|---|---|---|
+| median ΔE00 | 0.02 | 2.2e-4 | worst 9.40e-5 (`D6500__ILCE-7M3__iso400__rggb__12b__packed12`) | 8.8e-5 | 2.1e-4 (worst 1.003e-4) |
+| 99th percentile | 0.05 | 6.9e-2 | worst 2.709e-2 (`D6500__ILCE-1__iso400__rggb__12b__packed12`) | 2.39e-2 | 2.2e-2 (worst 1.066e-2) |
+| maximum | 0.5 | 6.5 | worst 3.890 (`D6500__ILCE-7RM4__iso12800__rggb__14b__lossless-l`) | 3.890 | 3.8 (worst 1.855) |
+| samples more than 8 codes off | 1e-3 | 4.3e-2 | worst 2.08e-2 (`D6500__ILCE-6400 packed12`) | 1.81e-2 | 7.4e-3 (worst 3.66e-3) |
 
 The first proposal calls its gates "proposed ... calibrated on the first lavapipe run", and the project's rule for a calibrated number is twice the first measured value, so the default is twice
-the worst of the 61 files (Mesa 25.2, LLVM 20.1, commit 4c5939f plus the GPU checks, 2026-10-15). It is **tighter than the proposal for the median and the 99th percentile
+the worst of the 61 files. **Recalibrated for pipeline 0.5.0** (2026-10-21, Mykyta's option (a) of STATUS question 32): R6's single-frame denoise (method A, `docs/algorithms/05`) makes hard decisions (a coefficient against its threshold, the order of block distances); where one lies within rounding of f32 against f64 the device and the CPU take different sides, and a flip moves the 8 blocks of a group, so on the charts' hard patch edges the count and the 99th percentile grow. The device's numbers are identical on lavapipe and on Metal (macOS 14 and 15), and on the owner's photo the device stays far inside the gates (median 1e-4, p99 4e-4, worst 0.044). The first calibration (Mesa 25.2, LLVM 20.1, commit 4c5939f plus the GPU checks, 2026-10-15) is kept in the last column. The first calibration was **tighter than the proposal for the median and the 99th percentile
 and looser for the maximum and the count**: with the proposed gates 50 of the 61 files fail, all of them on the count of samples (6 also on the maximum). What moves is not a stage but the output sharpening's halo
 limiter, which decides on a rank of luma values: the device's f32 colour chain and the CPU's f64 one differ in the last bits, and a pixel at a hard edge of the chart (the charts' patch
 borders) takes the other side of a rank (`docs/algorithms/04` section 10; the sharpening kernel alone matches the CPU to 3e-7). A median of 1e-4 and a 99th percentile of 1e-2 say that
 the rest of the picture is the CPU's to the last code or two. Metal will have its own numbers (its f32 chain differs in other last bits); the Metal CI job prints them, and the gates are
-raised there only with Mykyta's agreement, as for every gate (`AGENTS.md`). `PLAN` stays in the code so that the question is one flag away. Mykyta agreed to the calibrated defaults on 2026-10-15 (`docs/STATUS.md`, question 26).
+raised there only with Mykyta's agreement, as for every gate (`AGENTS.md`). `PLAN` stays in the code so that the question is one flag away. Mykyta agreed to the calibrated defaults on 2026-10-15 (`docs/STATUS.md`, question 26) and to their recalibration for pipeline 0.5.0 on 2026-10-21 (question 32).
 
 **Files.** `tools/golden/gpu-subset.txt` lists the ten files of a push (one id per line, `#` comments; an id that is not in the manifest, or that `--set` leaves out, is an error: a subset never shrinks without a word): the four CFA phases, cRAW,
 lossless L, 12 and 14 bit, camera-processed (Lossless M), the highest ISO, a tungsten light and a second body. Every chart scene carries blown highlights, so each file covers clipped highlights.
@@ -141,13 +140,12 @@ cargo run -p golden --release -- truth [--set synthetic] [--filter TEXT] [--patc
 ```
 
 For every scene of the set (one ARW per sidecar: the plain mosaic is preferred over cRAW and Lossless M/S) the real `ym`
-writes a DNG with default settings, except that the look is Neutral, the highlight range is 0, "as recorded"
-(`rolloff.highlights`), and the white lift is 0 (`white_offset_ev` -3). The default look is Signature since pipeline 0.3.0,
-the highlights get an automatic lift since pipeline 0.3.0 (`docs/02` C12 step 1b), and since pipeline 0.4.0 the default
-range of 1 places the camera's clip at white (`docs/02` C7); the truth is the colour of the scene, not a look, and the DNG
-carries all three. At 0 the range is the identity below the ALEXA's clip, so the `rolloff` probes (the scenes' six-stop
-highlight ramps) measure the colour of bright, unclipped tones with no tone stage in between. An entry's own `look`,
-`rolloff` or `white_offset_ev` is kept.
+writes a DNG with default settings, except that the look is Neutral and the highlight range is 0, "as recorded"
+(`rolloff.highlights`). The default look is Signature since pipeline 0.3.0, and since pipeline 0.4.0 the default
+range places the camera's clip toward white (1 until pipeline 0.8.1, 0.6 since; `docs/02` C7); the truth is the colour of the scene, not a look, and the DNG
+carries both. At 0 the range is the identity below the ALEXA's clip, so the `rolloff` probes (the scenes' six-stop
+highlight ramps) measure the colour of bright, unclipped tones with no tone stage in between. An entry's own `look` or
+`rolloff` is kept.
 The DNG holds the picture after the colour chain up to the look and curve (C1 to C11),
 as linear AWG4: the last place before the display transform where Yellowmoon's colour can be compared with the ALEXA
 estimate in the sidecar without going through a tone curve. Per patch, the interior is averaged in linear light, the picture is scaled by 0.18
@@ -157,7 +155,7 @@ against `truth.probes[].alexa.awg4`. Three numbers per scene:
 
 * `med`, `p95`, `max`: the 190 chart patches, render against the ALEXA-estimate truth;
 * `b.*`: the baseline, Sony camera RGB through the same ARRI matrix with no sensor map (what a profile-less pipeline would give);
-* `d.*`: the render against the truth after the ACES 2 display transform on both sides (the colour as it is seen);
+* `d.*`: the render against the truth after the cine display rendering on both sides (the colour as it is seen);
 * `neutr`: the median of the neutral ramp patches.
 
 Patches whose noise-free value reaches the clip point are left out of the statistics. The scenes, the noise and the light

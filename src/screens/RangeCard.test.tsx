@@ -10,6 +10,7 @@ import { capturingPointer } from "../test/pointer";
 import { installManualRaf, mockRect } from "../test/raf";
 import { openPhotos, openTab, renderApp, sliderName, sliderOf, valueOf } from "../test/harness";
 import type { Harness, UpdateSpy } from "../test/harness";
+import { inputOf, inputPatch } from "../state/settingsGraph";
 
 let h: Harness;
 afterEach(() => h?.unmount());
@@ -49,7 +50,7 @@ describe("the Range card on the RAW tab", () => {
     expect(screen.queryByRole("region", { name: "Roll-off" })).toBeNull();
   });
 
-  it("has Highlights and Low light, 0 to 1, at 1.00 and 0.50 out of the box", async () => {
+  it("has Highlights and Low light, 0 to 1, at 0.60 and 0.50 out of the box (the gentler range of 2026-10-30)", async () => {
     await setup();
     const sliders = range().getAllByRole("slider");
     expect(sliders.map((s: HTMLElement) => sliderName(s))).toEqual(["Highlights", "Low light"]);
@@ -57,7 +58,7 @@ describe("the Range card on the RAW tab", () => {
       const slider = sliderOf(label);
       expect([slider.getAttribute("aria-valuemin"), slider.getAttribute("aria-valuemax")], label).toEqual(["0", "1"]);
     }
-    expect(valueOf("Highlights")).toBe("1.00");
+    expect(valueOf("Highlights")).toBe("0.60");
     expect(valueOf("Low light")).toBe("0.50");
   });
 
@@ -74,21 +75,21 @@ describe("the Range card on the RAW tab", () => {
     expect(screen.getByRole("region", { name: "Range" }).textContent).not.toMatch(/ARRI|ALEXA/i);
   });
 
-  it("a typed value is a rolloff patch that keeps the other slider, and Reset sends them back to 1 and 0.5", async () => {
+  it("a typed value is a rolloff patch that keeps the other slider, and Reset sends them back to 0.6 and 0.5", async () => {
     const spy = await setup();
     await type("Highlights", "0");
-    expect(await lastPatch(spy)).toEqual({ rolloff: { highlights: 0, low_light: 0.5 } });
+    expect(await lastPatch(spy)).toEqual(inputPatch({ rolloff: { highlights: 0, low_light: 0.5 } }));
     await waitFor(() => expect(valueOf("Highlights")).toBe("0.00"));
     spy.mockClear();
     await type("Low light", "0.8");
-    expect(await lastPatch(spy)).toEqual({ rolloff: { highlights: 0, low_light: 0.8 } });
+    expect(await lastPatch(spy)).toEqual(inputPatch({ rolloff: { highlights: 0, low_light: 0.8 } }));
     await waitFor(() => expect(valueOf("Low light")).toBe("0.80"));
-    expect(h.store.currentSettings()?.settings.rolloff).toEqual({ highlights: 0, low_light: 0.8 });
+    expect(inputOf(h.store.currentSettings()!.settings).rolloff).toEqual({ highlights: 0, low_light: 0.8 });
 
     spy.mockClear();
     await h.user.click(range().getByRole("button", { name: "Reset" }));
-    expect(await lastPatch(spy)).toEqual({ rolloff: { highlights: 1, low_light: 0.5 } });
-    await waitFor(() => expect(valueOf("Highlights")).toBe("1.00"));
+    expect(await lastPatch(spy)).toEqual(inputPatch({ rolloff: { highlights: 0.6, low_light: 0.5 } }));
+    await waitFor(() => expect(valueOf("Highlights")).toBe("0.60"));
     expect(valueOf("Low light")).toBe("0.50");
   });
 
@@ -109,48 +110,45 @@ describe("the Range card on the RAW tab", () => {
         raf.flush();
       });
       await waitFor(() => expect(spy).toHaveBeenCalledTimes(1));
-      expect(spy.mock.calls[0]?.[1]).toEqual({ rolloff: { highlights: 0.8, low_light: 0.5 } });
+      expect(spy.mock.calls[0]?.[1]).toEqual(inputPatch({ rolloff: { highlights: 0.8, low_light: 0.5 } }));
       pointer.up(260);
       await waitFor(() => expect(spy).toHaveBeenCalledTimes(2));
-      expect(spy.mock.calls[1]?.[1]).toEqual({ rolloff: { highlights: 0.8, low_light: 0.5 } });
+      expect(spy.mock.calls[1]?.[1]).toEqual(inputPatch({ rolloff: { highlights: 0.8, low_light: 0.5 } }));
       await waitFor(() => expect(valueOf("Highlights")).toBe("0.80"));
       expect(h.store.getState().canUndo).toBe(true);
     } finally {
       raf.restore();
     }
     await h.user.keyboard("{Meta>}z{/Meta}");
-    await waitFor(() => expect(valueOf("Highlights")).toBe("1.00"));
+    await waitFor(() => expect(valueOf("Highlights")).toBe("0.60"));
     expect(h.store.getState().canUndo).toBe(false);
   });
 });
 
-describe("the white lift is back beside the Range card (owner's decision of 2026-10-17)", () => {
-  it("the Light tab has its three cards again: Exposure, White and High dynamic range, with the Offset slider and its AUTO button", async () => {
+describe("the white lift is gone (owner's decision of 2026-10-30)", () => {
+  it("the Light tab has two cards: Exposure and High dynamic range, and no Offset slider", async () => {
     await setup();
     await openTab(h, "Light");
     const regions = screen.getAllByRole("region");
-    expect(regions.map((r) => within(r).getAllByRole("heading", { level: 3 })[0]?.textContent)).toEqual(["Exposure", "White", "High dynamic range"]);
-    const white = within(screen.getByRole("region", { name: "White" }));
-    expect(white.getAllByRole("slider").map((s: HTMLElement) => sliderName(s))).toEqual(["Offset"]);
-    expect(valueOf("Offset")).toBe("0.00");
-    expect(white.getByRole("button", { name: "Auto white" })).toHaveAttribute("aria-pressed", "true");
+    expect(regions.map((r) => within(r).getAllByRole("heading", { level: 3 })[0]?.textContent)).toEqual(["Exposure", "High dynamic range"]);
+    expect(screen.queryByRole("slider", { name: "Offset" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Auto white" })).toBeNull();
   });
 
-  it("the Automatic card has its five rows again: Exposure, White, White balance, Noise and Camera", async () => {
+  it("the Automatic card has four rows: Exposure, White balance, Noise and Camera", async () => {
     await setup();
     await openTab(h, "Look");
     const rows = within(screen.getByRole("region", { name: "Automatic" })).getAllByRole("button", { name: /Open / });
-    expect(rows.map((r) => r.getAttribute("aria-label")?.replace(/ .*$/, ""))).toEqual(["Exposure", "White", "White", "Noise", "Camera"]);
-    expect(rows[1]).toHaveAccessibleName("White +0.80 EV, Auto. Open Light");
-    expect(rows[2]).toHaveAccessibleName(/^White balance /);
+    expect(rows.map((r) => r.getAttribute("aria-label")?.replace(/ .*$/, ""))).toEqual(["Exposure", "White", "Noise", "Camera"]);
+    expect(rows[1]).toHaveAccessibleName(/^White balance /);
   });
 
-  it("the settings carry both: the white lift's offset at 0 and the range at 1 and 0.5", async () => {
+  it("the settings carry the range at 0.6 and 0.5 and nothing of the lift", async () => {
     await setup();
     const rs = h.store.currentSettings();
-    expect(rs?.settings.white_offset_ev).toBe(0);
-    expect(rs?.settings.rolloff).toEqual({ highlights: 1, low_light: 0.5 });
-    expect(rs?.values.white_ev).toBe(0.8);
-    expect(rs?.estimates.white_ev).toBe(0.8);
+    expect(rs?.settings).not.toHaveProperty("white_offset_ev");
+    expect(inputOf(rs!.settings).rolloff).toEqual({ highlights: 0.6, low_light: 0.5 });
+    expect(rs?.values).not.toHaveProperty("white_ev");
+    expect(rs?.estimates).not.toHaveProperty("white_ev");
   });
 });

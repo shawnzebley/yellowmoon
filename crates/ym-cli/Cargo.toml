@@ -19,21 +19,25 @@ ym-raw.workspace = true
 ym-color.workspace = true
 ym-export.workspace = true
 ym-gpu.workspace = true
+# The lens library behind `ym lenses list` (docs/21 section 8); ours.
+ym-lens.workspace = true
+# The stock kinds of `ym film list`.
+ym-film.workspace = true
 ym-looks.workspace = true
 ym-profiles.workspace = true
 # Apple Auto's bridge (docs/19): `ym_apple::system_advisor()`, the advisor `ym` hands to the core. On
 # Apple silicon with the macOS 27 SDK it carries the Swift bridge, and `build.rs` links FoundationModels
 # weakly; everywhere else it is a stub that says why Apple Auto is not available. Our own crate.
 ym-apple.workspace = true
+# The two programs' advisors (docs/22): `ym_agents::system_advisors()`, which starts the person's own
+# `claude` and `agy` as child processes. Our own crate; it opens no network connection (hard rule 7).
+ym-agents.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 serde_json.workspace = true
 png.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
-# Ctrl-C (and SIGTERM): finish the current tile, delete the partial file, exit 130 (docs/10).
-# MIT OR Apache-2.0.
-ctrlc = { version = "3", features = ["termination"] }
 
 [features]
 # TEST-ONLY. Builds `ym` so that the environment variable `YM_FORCE_DEMOSAIC=<method name>` picks the
@@ -44,14 +48,24 @@ ctrlc = { version = "3", features = ["termination"] }
 force-demosaic = ["ym-core/force-demosaic"]
 
 [dev-dependencies]
+# The test doubles of `claude` and `agy` (`ym_agents::testing::fake_cli_path`) for the tests of `--auto-provider`
+# (docs/22 section 15.3).
+ym-agents = { workspace = true, features = ["test-support"] }
 # The test-only demosaic switch, so that the binary the tests start can be told to use another
 # method (the switch reads an environment variable that is never set outside the tests). Only
 # `cargo test` sees this: `cargo build -p ym-cli` and the sidecar build do not.
 ym-core = { workspace = true, features = ["force-demosaic"] }
 # `testgen` writes the synthetic ARW files the tests run on.
 ym-raw = { workspace = true, features = ["testgen"] }
+# A complete synthetic lens folder for the tests of `--lens` and `ym lenses` (`ym_lens::test_support`).
+ym-lens = { workspace = true, features = ["test-support"] }
 assert_cmd.workspace = true
 predicates.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
 insta.workspace = true
+
+# Ctrl-C (and SIGTERM): finish the current tile, delete the partial file, exit 130 (docs/10).
+# MIT OR Apache-2.0. A WebAssembly build (the iPhone web app) has no signals.
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+ctrlc = { version = "3", features = ["termination"] }

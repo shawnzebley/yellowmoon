@@ -9,38 +9,70 @@
  * zoom). It is plain TypeScript with a `subscribe`, so it is tested without React; `context.tsx`
  * makes it available to components.
  *
- * Settings changes go out as patches, one at a time per photo. While one is in flight, newer
- * drag patches fold into a single waiting patch, so a slow core is never flooded and the last
- * value always arrives. The reply of a patch replaces the mirrored settings, unless a newer
- * patch is waiting (its reply will carry everything). Final patches (a released drag, a key, a
- * typed value) are recorded for undo as the difference between the settings before the gesture
- * and the core's reply.
+ * Settings are a graph of nodes (`docs/23`), and changes go out as node patches (`patchOf` in
+ * `settingsGraph.ts`), one at a time per photo: a slider drag sends one node's partial. While one
+ * is in flight, newer drag patches fold into a single waiting patch (`foldPatches`), so a slow core
+ * is never flooded and the last value always arrives. The reply of a patch replaces the mirrored
+ * settings, unless a newer patch is waiting (its reply will carry everything). Final patches (a
+ * released drag, a key, a typed value) are recorded for undo as the difference, per node and for
+ * the links, between the settings before the gesture and the core's reply (`diffSettings`).
  */
+import type { Announced } from "./announce";
+import type { Shortcut } from "./shortcuts";
 import type { Api, Unsubscribe } from "../api";
 import { toAppError } from "../api";
+import { isUnreadableMessage } from "../api/openMessages";
 import type {
   ApplyScope,
+  AutoProvider,
+  AutoStatus,
   AppError,
-  AppleAutoStatus,
   BalanceSetting,
+  BrushStroke,
   ChromaSample,
   ChromaScatter,
   CliLinkStatus,
   ColorBalance,
   ColorBalancePoint,
+  CropAspect,
+  DepthFar,
+  CropSuggestion,
+  Curves,
   DevelopSettings,
-  DisplayLut,
   ExportJob,
   ExportOptions,
   ExportProgress,
+  FilmCatalogue,
+  FocusPlaneResult,
+  GradePatch,
+  GradeValues,
   HistogramData,
+  LensInfo,
   Look,
   LookId,
   LookInput,
   LookLibrary,
+  MainAutoFlags,
+  MainEstimates,
+  MapFrom,
+  MaskFindPrompt,
+  MaskItem,
+  MaskKind,
+  MasksPatch,
+  MaskStyle,
+  MaskView,
   MenuAction,
   MenuState,
+  NodeGrade,
+  NodeId,
+  NodeItem,
+  NodeThumbnailsReady,
+  ObjectState,
+  DepthState,
+  VisionState,
+  OpenProgress,
   OpenSummary,
+  Orientation,
   PasteReport,
   PercentSetting,
   PhotoId,
@@ -51,6 +83,9 @@ import type {
   Preferences,
   PreferencesPatch,
   RenderStats,
+  ResolvedCorrector,
+  ResolvedInput,
+  ResolvedOutput,
   ResolvedSettings,
   SessionChange,
   SessionState,
@@ -58,6 +93,7 @@ import type {
   SourceRecognition,
   ThumbnailReady,
   ViewportBackendKind,
+  ViewportBusy,
   ViewportFrame,
   ViewportInput,
   ViewportMode,
@@ -65,6 +101,11 @@ import type {
 } from "../api/types";
 import { filterArwPaths } from "../components/useWindowDrop";
 import { clampToDisc, movingPin, WARP_COORD_LIMIT, WARP_MAX_PINS } from "../components/warpMath";
+import { BRUSH_FULL, brushPointCount, DEFAULT_BRUSH, MAX_BRUSH_POINTS } from "./brushStrokes";
+import type { BrushSettings } from "./brushStrokes";
+import { COLOR_RANGE_REACH } from "./maskRows";
+import { clickPrompt, DEFAULT_OBJECT_MODE, foundText, FOUND_PILL_MS, NOTHING_FOUND } from "./objectMask";
+import type { ObjectMode } from "./objectMask";
 import { isTauri } from "../env";
 import { defaultExportOptions, defaultScope, sameOptions } from "../export/options";
 import { applyProgress, startRun } from "../export/run";
@@ -73,8 +114,32 @@ import type { ExportRun } from "../export/run";
 import { diffSettings, PhotoHistory } from "./history";
 import type { HistoryEntry } from "./history";
 import { perfCount } from "../perf";
+import { stampTick } from "../perfTimeline";
 import { isReady, mergeSession, photoName, releaseUrl, removedNotice, restoredNotice, withoutPhotos, withRestoredPhotos } from "./photo";
 import { RequestLimiter } from "./requestLimiter";
+import { gestureHeld, onGestureEnd } from "./gestureHold";
+import { share } from "./share";
+import {
+  applyMasks,
+  applyPatch,
+  cardsOf,
+  foldPatches,
+  INPUT_ID,
+  inputOf,
+  gradeOf,
+  isEmptyPatch,
+  MAIN_ID,
+  mainOf,
+  nodeIdOfKey,
+  nodeOf,
+  OUTPUT_ID,
+  outputOf,
+  outputPatch,
+  patchOf,
+} from "./settingsGraph";
+import { watchDisplayOptions } from "../displayOptions";
+import { rememberFocus } from "./focusMemory";
+import type { CorrectorItem, InputItem, OutputItem } from "./settingsGraph";
 import { ViewportInputQueue } from "./viewportInputQueue";
 import type { StreamInput } from "./viewportInputQueue";
 import { fitZoomExact, fitZoomOf, showsWhole, zoomAfter } from "./zoom";
@@ -82,7 +147,7 @@ import { fitZoomExact, fitZoomOf, showsWhole, zoomAfter } from "./zoom";
 /** The screens of the app (`docs/11-ui.md` §Screens that have a window of their own). */
 export type Screen = "start" | "photos" | "import-looks";
 
-/** What Photos shows in the right-hand panel: the six tool tabs, or Export (`docs/11-ui.md` §Export). */
+/** What Photos shows in the right-hand panel: the seven tool tabs, or Export (`docs/11-ui.md` §Export). */
 export type Panel = "tools" | "export";
 
 /** What the notice bar offers next to Dismiss: Undo for a removal (`docs/11` §Removing photos). Only the notice of a removal has one. */
@@ -110,6 +175,20 @@ export const NO_ARW_NOTICE = "No ARW files in what you dropped.";
 
 /** Said when files are added to a session and every one of them is open already. */
 export const ALREADY_OPEN_NOTICE = "These photos are already open.";
+
+/** Whether two mask views are the same one (a node and a style, or none). */
+function sameMaskView(a: MaskView | null, b: MaskView | null): boolean {
+  return a === b || (a !== null && b !== null && a.node === b.node && a.style === b.style && (a.row ?? null) === (b.row ?? null) && (a.depth ?? false) === (b.depth ?? false));
+}
+
+/** How long an open reads before Start and Photos say how far it has got (`openProgress`). */
+export const OPEN_PROGRESS_DELAY_MS = 300;
+
+/** What Start and Photos say after Cancel stopped an open: how many of the files were read and kept (`docs/26` H-10). */
+export function stoppedNotice(opened: number): string {
+  if (opened === 0) return "Stopped. No files were opened.";
+  return `Stopped. ${opened} ${opened === 1 ? "file was" : "files were"} opened.`;
+}
 
 /** What Photos says after files were added to the session: "Added 3 photos. 2 were already open." */
 export function openedNotice(opened: OpenSummary): string {
@@ -146,11 +225,17 @@ export interface CopiedSettings {
    * id would name another photo). Paste Settings to Picked uses it to leave the source's own picked white alone.
    */
   sourceId: PhotoId | null;
-  /** What `copy_settings` answered: everything but the crop, the orientation and the Pick white point. */
+  /** What `copy_settings` answered: the whole graph, but the Input's crop, orientation and Pick white point. */
   patch: SettingsPatch;
 }
 
 /** Everything the screens draw. Replaced, never changed in place. */
+/** Show mask: on or off, and how it looks when it is on. The style starts as Overlay. */
+export interface MaskViewState {
+  on: boolean;
+  style: MaskStyle;
+}
+
 export interface AppState {
   screen: Screen;
   /** Where "Back" goes from a full-window detour such as the import wizard. */
@@ -159,15 +244,44 @@ export interface AppState {
   session: SessionState | null;
   /** Thumbnail URLs by photo id, from `thumbnail_ready`. */
   thumbnails: Readonly<Record<PhotoId, string>>;
+  /**
+   * The pictures of the node view's cards (`docs/23` §5.7), per photo and corrector: the address of the photo after that node and the
+   * Output, from `node_thumbnails_ready`. A node has none until its first arrives (its card shows the photo's thumbnail meanwhile).
+   * Kept for the running app only, like the thumbnails.
+   */
+  nodeThumbnails: Readonly<Record<PhotoId, Readonly<Record<number, string>>>>;
   /** Resolved settings by photo id, for the photos that were shown. */
   settings: Readonly<Record<PhotoId, ResolvedSettings>>;
   /** The look library; null until it has been asked for. */
   looks: readonly Look[] | null;
+  /**
+   * The lenses of the Lens card's list (`lens_list`, `docs/21` §10), asked for once; null until the first answer, empty when the
+   * lens data are missing.
+   */
+  lenses: readonly LensInfo[] | null;
   /** The last `render_stats`: "Neural · 42 ms · Display P3". */
   stats: RenderStats | null;
   /** Showing the photo before the look and display transform. */
   before: boolean;
   zoom: ViewportMode;
+  /**
+   * Show mask (`docs/23` §5.8): whether the node view shows the selected corrector's mask, and in which style. Neither is saved or
+   * per photo; it stays across nodes and photos for the running app. The core draws it; it is sent whenever it, the style or the
+   * selected node changes ({@link Store.setMaskNode}).
+   */
+  maskView: MaskViewState;
+  /**
+   * The mask row whose eye is on (`docs/23` §5.8, §7.6): the index of a row of the node on show, or null. View state like {@link AppState.maskView}: not
+   * saved, not undone, not copied. At most one; it and Show mask are never on together; the style is the View card's.
+   */
+  maskEye: number | null;
+  /**
+   * The Depth row whose **Show depth** is on (`docs/23` §4.8, `docs/11`): the index of a row of the node on show, or null. View state like the eye: not saved, not
+   * undone, not copied, and exclusive with Show mask and the eyes (turning one on turns the others off). The core draws the photo's depth map as grey for it.
+   */
+  showDepth: number | null;
+  /** The mask view the core was last told to draw: what {@link AppState.maskView} comes to for the node on show (the browser build's fixture draws it). */
+  maskShown: MaskView | null;
   /** "Apply to" on the Look card. */
   applyScope: ApplyScope;
   /**
@@ -181,6 +295,11 @@ export interface AppState {
   error: AppError | null;
   /** Open files or Open folder is waiting for the core or the dialog. */
   opening: boolean;
+  /**
+   * How far the core has read the files of the open that is under way, once it has taken `OPEN_PROGRESS_DELAY_MS` (a small open
+   * finishes before anyone could read the line); null otherwise. Start and Photos say "Reading {done} of {total} files…" with Cancel.
+   */
+  openProgress: OpenProgress | null;
   /** The current photo's histogram, when asked for. */
   histogram: HistogramData | null;
   /** The display values at the middle of the photo cell, while the Light tab watches them (`watchHistogram`). */
@@ -192,20 +311,82 @@ export interface AppState {
    * not to the settings (nothing about it is undone or copied); a new photo starts with none, and an index past the end counts as none.
    */
   warpPin: number | null;
+  /**
+   * The selected mask row of the node the node view is on (`docs/23` §7.6): an index into that node's `masks.items`, or null. It belongs to
+   * the window, like `warpPin`: nothing about it is undone or copied, another node or photo starts with none, and an index past the end
+   * counts as none. Its handles show on the photo, whatever tab the panel is on.
+   */
+  maskRow: number | null;
+  /**
+   * The brush the next strokes of a Brush row are drawn with (`docs/23` §7.6): the BRUSH card's Paint · Erase, Size and Hardness. Window
+   * state like `maskRow`: not saved, not undone, and a stroke that is drawn keeps what it was drawn with.
+   */
+  brush: BrushSettings;
+  /**
+   * The Brush tool is on for the selected row (`docs/23` §7.6): a drag on the photo paints. Adding a Brush row, a click on a Brush row and a
+   * click on Paint or Erase turn it on; Esc, another row, another node and another photo turn it off. Whether the cursor and the drawing
+   * surface show also depends on the screen (Crop, Export, Before and a pick hide them: `Photos`).
+   */
+  brushTool: boolean;
+  /** The kinds of mask this machine can make, once asked (`mask_kinds`, `ensureMaskKinds`): what the Add mask menu lists. */
+  maskKinds: readonly MaskKind[] | null;
+  /** The Object card's tool (`docs/23` §7.6): what a plain click on the photo does. A window setting; it is no patch and no undo step. */
+  objectMode: ObjectMode;
+  /**
+   * The Object tool is on for the selected row (`docs/23` §7.6): a click on the photo finds an object, a drag with the Box tool draws a box. Adding an Object
+   * row, a click on one and a click on a tool turn it on; Esc, another row, another node and another photo turn it off.
+   */
+  objectTool: boolean;
+  /**
+   * "Place points" is on for the selected Object row (`docs/28` A-11): the crosshair layer of Pick white is over the photo and Return adds a point at it.
+   * A window setting, no patch and no undo step; it ends with the row, the node and the photo like the Object tool.
+   */
+  objectPlacing: boolean;
+  /** The photos whose SAM encoder is working (`object_state`): their Object rows say "Getting ready…". */
+  objectPreparing: readonly PhotoId[];
+  /** A `mask_find` is under way for this photo: its Object rows say "Finding…". */
+  objectFinding: PhotoId | null;
+  /**
+   * The kinds whose newest Subject or People mask found nothing, by photo (`vision_state`, `docs/23` §7.6): their rows say "Nothing found". The core
+   * sends the list each time its worker ends; a photo it has not sent one for has none.
+   */
+  visionNothing: Readonly<Record<number, readonly MaskKind[]>>;
+  /**
+   * The photos whose depth map failed, with the sentence (`depth_state`, `docs/23` §4.8): their Depth rows say "Can't be made" and the card says why, with Try
+   * again. A photo whose map was made (or is being made again) has none.
+   */
+  depthFailed: Readonly<Record<number, string>>;
+  /** The photos whose file has no focus point (`focus_plane`'s `no_focus_point`): Focus plane is off for them, with the reason. */
+  noFocusPoint: Readonly<Record<number, true>>;
+  /**
+   * What Focus plane last set on a photo, when the camera's point is exactly the frame's centre (which Sony also writes when it does not know): the card says "The
+   * camera may not have recorded where it focused. Check the result." while the row still has this far limit.
+   */
+  focusCentre: Readonly<Record<number, number>>;
+  /** The pill at the top of the photo, "Object found · 0.4 s", for three seconds after a find. */
+  objectPill: { seq: number; text: string } | null;
   /** Undo and redo are available for the current photo. */
   canUndo: boolean;
   canRedo: boolean;
   /** The preferences, once loaded (`docs/01` §Persistence). */
   preferences: Preferences | null;
-  /** Imported display LUTs, once asked for. */
-  displayLuts: readonly DisplayLut[] | null;
   /** Whether the command-line tool is linked onto the PATH, once asked for (Preferences). */
   cliLink: CliLinkStatus | null;
   /**
-   * Whether Apple Auto is available on this computer and acts (`apple_auto_status`, `docs/19`), asked for each time Preferences opens;
-   * null before the first answer. Preferences shows "Auto with Apple Intelligence" only while it is available.
+   * The providers of Auto and which one grades (`auto_status`, `docs/22` section 12.7), asked for each time Preferences opens (the one
+   * read that makes the programs check) and read again from the cache after a change of the choice, the consent or the instructions and
+   * when a provider changes; null before the first answer. Preferences shows "Auto grading" while `visible` or while the saved choice is
+   * a program.
    */
-  appleAuto: AppleAutoStatus | null;
+  auto: AutoStatus | null;
+  /**
+   * The program whose consent dialog is open over Preferences (`docs/22` section 12.3): chosen in the dropdown before the person agreed to
+   * send photos through it. The dropdown keeps showing the previous provider until they say yes. It lives only while Preferences is the
+   * dialog: every other overlay, and none, clears it (`set`).
+   */
+  consentFor: "claude" | "agy" | null;
+  /** The operating system the app runs on (`app_info`: "macos", "windows", "linux"), asked for when Preferences opens; null before the answer. */
+  os: string | null;
   /** Which panel Photos shows. */
   panel: Panel;
   /** The Export panel's options: the remembered defaults, changed by the person (`docs/09` §Options). */
@@ -222,6 +403,12 @@ export interface AppState {
   cubeImport: CubeImport | null;
   /** A short message that is not an error ("Yellowmoon is up to date."), until dismissed. */
   notice: string | null;
+  /**
+   * The sentence of the memory notice (`memory_notice`, `docs/26` H-14): the computer is short of memory and background work is
+   * paused. The core sends it once on the way into the critical level and sends `null` when the level is normal again. Shown after an
+   * error and after a notice, in the same bar.
+   */
+  memoryNotice: string | null;
   /** The button the notice has besides Dismiss: Undo, after photos were removed from the filmstrip. Null for every other notice. */
   noticeAction: NoticeAction | null;
   /**
@@ -233,6 +420,12 @@ export interface AppState {
   viewportFrame: ViewportFrame | null;
   /** An export is queued or running in the core (`export_busy`), also one this window did not start. */
   exportBusy: boolean;
+  /**
+   * The viewport is working on a frame of the photo on screen or on its full-resolution tiles (`busy`), and the raw stages of that
+   * photo run on the CPU (`cpu`), and that the round makes the photo's first blur map (`finding`: the Background rows say "Finding…"), as the
+   * core last said (`viewport_busy`). The photo cell says "Rendering on the CPU" from it.
+   */
+  viewportBusy: ViewportBusy;
   /** The settings Copy settings took, or null before the first copy; it outlives a session and is never saved. */
   copied: CopiedSettings | null;
 }
@@ -244,26 +437,48 @@ export function initialState(): AppState {
     returnTo: "start",
     session: null,
     thumbnails: {},
+    nodeThumbnails: {},
     settings: {},
     looks: null,
+    lenses: null,
     stats: null,
     before: false,
     zoom: { kind: "fit" },
+    maskView: { on: false, style: "overlay" },
+    maskEye: null,
+    showDepth: null,
+    maskShown: null,
     applyScope: "this",
     collapsedLookLibraries: [],
     dropNotice: null,
     error: null,
     opening: false,
+    openProgress: null,
     histogram: null,
     middleReadout: null,
     chromaScatter: null,
     warpPin: null,
+    maskRow: null,
+    brush: DEFAULT_BRUSH,
+    brushTool: false,
+    maskKinds: null,
+    objectMode: DEFAULT_OBJECT_MODE,
+    objectTool: false,
+    objectPlacing: false,
+    objectPreparing: [],
+    objectFinding: null,
+    visionNothing: {},
+    depthFailed: {},
+    noFocusPoint: {},
+    focusCentre: {},
+    objectPill: null,
     canUndo: false,
     canRedo: false,
     preferences: null,
-    displayLuts: null,
     cliLink: null,
-    appleAuto: null,
+    auto: null,
+    consentFor: null,
+    os: null,
     panel: "tools",
     exportOptions: defaultExportOptions(),
     exportScope: "this",
@@ -273,72 +488,167 @@ export function initialState(): AppState {
     cubeImport: null,
     notice: null,
     noticeAction: null,
+    memoryNotice: null,
     viewportBackend: null,
     viewportFrame: null,
     exportBusy: false,
+    viewportBusy: { busy: false, cpu: false, finding: false },
     copied: null,
   };
 }
 
-/** Settings whose resolved value is the stored value, so a patch can be shown at once. */
-const DIRECT_KEYS: ReadonlySet<string> = new Set([
-  "look",
-  "look_intensity",
-  "brightness",
-  "white",
-  "white_offset_ev",
-  "light_source",
-  "color_warp",
-  "output_sharpening",
-  "curve",
-  "decode",
-  "rolloff",
-  "crop",
-  "orientation",
-  "white_pick",
-]);
+/** Fields of the Input whose resolved value is the stored value, so a patch can be shown at once (the others wait for the core's reply). */
+const DIRECT_INPUT: ReadonlySet<string> = new Set(["pos", "light_source", "lens", "rolloff", "decode", "crop", "orientation", "white_pick"]);
+
+/** The same for the Output: all of its fields. */
+const DIRECT_OUTPUT: ReadonlySet<string> = new Set(["pos", "look", "look_intensity", "output_sharpening"]);
+
+/** The same for Main's own fields (its grade and its masks are below). */
+const DIRECT_MAIN: ReadonlySet<string> = new Set(["pos", "name", "bypass", "trim"]);
+
+/** The grade fields of Main whose resolved value is the stored value. */
+const DIRECT_GRADE: ReadonlySet<string> = new Set(["brightness", "white", "color_warp", "curve"]);
 
 /** The settings that are Auto or a value from −100 to 100 (`docs/19` section 5), each resolved against the estimate of the same name. */
+type PercentField = "contrast" | "saturation" | "highlights" | "shadows" | "black";
 const PERCENT_KEYS: ReadonlySet<string> = new Set(["contrast", "saturation", "highlights", "shadows", "black"]);
 
+/** Fields of a node patch that are partial objects: they merge into the field they name, as the core merges them. */
+const PARTS: ReadonlySet<string> = new Set(["lens", "rolloff", "decode", "trim"]);
+
+/** Puts the fields of `patch` that are in `direct` into the node's stored and resolved fields. */
+function directFields(stored: object, resolved: object, patch: object, direct: ReadonlySet<string>): { stored: object; resolved: object } {
+  const s: Record<string, unknown> = { ...stored };
+  const r: Record<string, unknown> = { ...resolved };
+  for (const [key, value] of Object.entries(patch)) {
+    if (value === undefined || !direct.has(key)) continue;
+    const part = PARTS.has(key) && value !== null && typeof value === "object";
+    s[key] = part ? { ...(s[key] as object), ...value } : value;
+    r[key] = part ? { ...(r[key] as object), ...value } : value;
+  }
+  return { stored: s, resolved: r };
+}
+
 /**
- * The mirrored settings with a patch applied to the fields that need no resolving. Contrast, saturation, highlights, shadows, black
- * and the shadows and highlights wheels are Auto or a value (`docs/19` section 5) and need none either: Auto is the photo's Auto value,
- * which the mirror already has (`estimates`).
+ * The mirrored settings with a patch applied to the fields that need no resolving (`docs/23` section 3.7). A node patch is read node by
+ * node: the Input's light preset, lens, range, switches, crop, turn and white pick; Main's brightness, white, colour warp, curve, name,
+ * bypass, trim and masks (a row patch, the node's Invert and the list of rows: the Mask tab shows its edit at once); the Output's look, intensity and sharpening. Contrast, saturation, highlights, shadows, black and the shadows
+ * and highlights wheels of Main are Auto or a value (`docs/19` section 5) and need no resolving either: Auto is the photo's Auto value,
+ * which the mirror already has (`estimates`). What waits for the core's reply: the Input's exposure, white balance, sharpening and noise
+ * reduction (their Auto resolves in the core), and a patch that adds or removes a node or gives links. Another corrector's place, name, bypass, trim and grade are direct, as Main's are (the node view's cards and panel): it has no
+ * Auto, so nothing in its grade waits for the core.
  */
 export function applyDirect(rs: ResolvedSettings, patch: SettingsPatch): ResolvedSettings {
-  const settings = { ...rs.settings } as Record<string, unknown>;
-  const values = { ...rs.values } as Record<string, unknown>;
+  let settings = rs.settings;
+  let values = rs.values;
   let auto = rs.auto;
-  for (const [key, value] of Object.entries(patch)) {
-    if (value !== undefined && PERCENT_KEYS.has(key)) {
-      const field = key as "contrast" | "saturation" | "highlights" | "shadows" | "black";
-      const setting = value as PercentSetting;
-      settings[field] = setting;
-      values[field] = setting.kind === "manual" ? setting.value : rs.estimates[field];
-      auto = { ...auto, [field]: setting.kind === "auto" };
-      continue;
+  const change = (id: NodeId, edit: (item: NodeItem) => NodeItem): void => {
+    settings = { nodes: { ...settings.nodes, items: settings.nodes.items.map((item) => (item.id === id ? edit(item) : item)) } };
+  };
+  for (const [key, node] of Object.entries(patch.nodes ?? {})) {
+    const id = nodeIdOfKey(key);
+    if (id === INPUT_ID) {
+      const { stored, resolved } = directFields(inputOf(settings), values.input, node, DIRECT_INPUT);
+      change(id, () => stored as InputItem);
+      values = { ...values, input: resolved as ResolvedInput };
+      if (node.light_source !== undefined) auto = { ...auto, input: { ...auto.input, light_source: node.light_source === "auto" } };
+    } else if (id === OUTPUT_ID) {
+      const { stored, resolved } = directFields(outputOf(settings), values.output, node, DIRECT_OUTPUT);
+      change(id, () => stored as OutputItem);
+      values = { ...values, output: resolved as ResolvedOutput };
+    } else if (id === MAIN_ID) {
+      const direct = directFields(mainOf(settings), values.main, node, DIRECT_MAIN);
+      const { stored, resolved } = withMasks(direct.stored as CorrectorItem, direct.resolved as ResolvedCorrector, node.masks);
+      const grade = node.grade;
+      const next = grade ? directGrade(stored as CorrectorItem, resolved as ResolvedCorrector, grade, rs.estimates.main, auto.main) : null;
+      change(id, () => (next?.stored ?? stored) as CorrectorItem);
+      values = { ...values, main: (next?.resolved ?? resolved) as ResolvedCorrector };
+      if (next) auto = { ...auto, main: next.auto };
+    } else if (typeof id === "number" && nodeOf(settings, id)?.kind === "corrector") {
+      // Another corrector (the node view's cards and panel): the fields that need no resolving, so that a card dropped where it was
+      // moved, a name typed, a bypass pressed and a slider of its panel show at once. Its grade is plain numbers, with no Auto to
+      // resolve (`docs/23` §3.2: Auto in a corrector other than Main is a manual 0), so it is direct too, and so are its masks (a row
+      // patch is a partial of the row). A node added or removed waits for the core's reply.
+      const have = values.nodes.find((n) => n.id === id);
+      const direct = directFields(nodeOf(settings, id) as CorrectorItem, have ?? {}, node, DIRECT_MAIN);
+      const { stored, resolved } = withMasks(direct.stored as CorrectorItem, direct.resolved as ResolvedCorrector, node.masks);
+      const next = node.grade && have ? directGrade(stored as CorrectorItem, resolved as ResolvedCorrector, withoutAuto(node.grade), NO_ESTIMATES, NO_FLAGS) : null;
+      change(id, () => (next?.stored ?? stored) as CorrectorItem);
+      if (have) values = { ...values, nodes: values.nodes.map((n) => (n.id === id ? ((next?.resolved ?? resolved) as ResolvedCorrector) : n)) };
+    } else if (typeof id === "number" && nodeOf(settings, id)?.kind === "film") {
+      // A Film node (`docs/24`): its fields are plain numbers and ids, so the page folds the patch in at once, as the core will.
+      settings = applyPatch(settings, { nodes: { [key]: node } });
     }
-    if (value !== undefined && key === "color_balance") {
-      const cb = { ...rs.settings.color_balance, ...(value as Partial<ColorBalance>) };
+  }
+  return settings === rs.settings && values === rs.values && auto === rs.auto ? rs : { ...rs, settings, values, auto };
+}
+
+/**
+ * A corrector's stored and resolved masks with a masks patch applied (the node's Invert, the list of rows, row patches): a row patch is a
+ * partial of the row's own fields, so the mirror shows it at once, as it shows a slider (the core's reply, held to the field's range,
+ * replaces it). Nothing changes without a masks part.
+ */
+function withMasks(stored: CorrectorItem, resolved: ResolvedCorrector, masks: MasksPatch | undefined): { stored: object; resolved: object } {
+  if (!masks) return { stored, resolved };
+  return { stored: { ...stored, masks: applyMasks(stored.masks, masks) }, resolved: { ...resolved, masks: applyMasks(resolved.masks, masks) } };
+}
+
+/** What Auto resolves to in a corrector other than Main: nothing, a manual 0 (`docs/23` §3.2). */
+const NO_ESTIMATES: MainEstimates = { contrast: 0, saturation: 0, highlights: 0, shadows: 0, black: 0, balance_shadows: [0, 0], balance_highlights: [0, 0] };
+const NO_FLAGS: MainAutoFlags = { contrast: false, highlights: false, shadows: false, black: false, balance_shadows: false, balance_highlights: false, saturation: false };
+
+/** A grade patch for a corrector other than Main, as the core reads it: every Auto is a manual 0 (and an Auto wheel a manual point at the centre). */
+function withoutAuto(patch: GradePatch): GradePatch {
+  const out: Record<string, unknown> = { ...patch };
+  for (const key of PERCENT_KEYS) if ((out[key] as PercentSetting | undefined)?.kind === "auto") out[key] = { kind: "manual", value: 0 };
+  const balance = patch.color_balance;
+  if (balance) {
+    const wheel = (w: BalanceSetting | undefined): BalanceSetting | undefined => (w?.kind === "auto" ? { kind: "manual", point: [0, 0] } : w);
+    out.color_balance = { ...balance, ...(balance.shadows ? { shadows: wheel(balance.shadows) } : {}), ...(balance.highlights ? { highlights: wheel(balance.highlights) } : {}) };
+  }
+  return out as GradePatch;
+}
+
+/** Main's grade patch applied to its stored and resolved grade, with the Auto flags that follow. */
+function directGrade(
+  stored: CorrectorItem,
+  resolved: ResolvedCorrector,
+  patch: GradePatch,
+  estimates: MainEstimates,
+  flags: MainAutoFlags,
+): { stored: CorrectorItem; resolved: ResolvedCorrector; auto: MainAutoFlags } {
+  const grade: Record<string, unknown> = { ...stored.grade };
+  const values: Record<string, unknown> = { ...resolved.grade };
+  let auto = flags;
+  for (const [key, value] of Object.entries(patch)) {
+    if (value === undefined) continue;
+    if (PERCENT_KEYS.has(key)) {
+      const field = key as PercentField;
+      const setting = value as PercentSetting;
+      grade[field] = setting;
+      values[field] = setting.kind === "manual" ? setting.value : estimates[field];
+      auto = { ...auto, [field]: setting.kind === "auto" };
+    } else if (key === "color_balance") {
+      const cb = { ...stored.grade.color_balance, ...(value as Partial<ColorBalance>) };
       const point = (w: BalanceSetting, est: ColorBalancePoint): ColorBalancePoint => (w.kind === "manual" ? w.point : est);
-      settings.color_balance = cb;
+      grade.color_balance = cb;
       values.color_balance = {
-        shadows: point(cb.shadows, rs.estimates.balance_shadows),
+        shadows: point(cb.shadows, estimates.balance_shadows),
         midtones: cb.midtones,
-        highlights: point(cb.highlights, rs.estimates.balance_highlights),
+        highlights: point(cb.highlights, estimates.balance_highlights),
       };
       auto = { ...auto, balance_shadows: cb.shadows.kind === "auto", balance_highlights: cb.highlights.kind === "auto" };
-      continue;
+    } else if (DIRECT_GRADE.has(key)) {
+      const part = key === "curve" ? { ...stored.grade.curve, ...(value as Partial<Curves>) } : value;
+      grade[key] = part;
+      values[key] = part;
     }
-    if (value === undefined || !DIRECT_KEYS.has(key)) continue;
-    settings[key] = value;
-    values[key] = value;
-    if (key === "light_source") auto = { ...auto, light_source: value === "auto" };
-    // The lift in effect follows the offset at once: the automatic amount plus the offset, never below 0 (the core's rule).
-    if (key === "white_offset_ev") values.white_ev = Math.min(3, Math.max(0, rs.estimates.white_ev + (value as number)));
   }
-  return { ...rs, settings: settings as unknown as DevelopSettings, values: values as unknown as ResolvedSettings["values"], auto };
+  return {
+    stored: { ...stored, grade: grade as unknown as NodeGrade },
+    resolved: { ...resolved, grade: values as unknown as GradeValues },
+    auto,
+  };
 }
 
 interface Queued {
@@ -356,6 +666,9 @@ interface Sender {
 
 /** A frame of the fallback viewport smaller than this, in device pixels on either side, is not a picture of the cell. */
 const MIN_FRAME_PX = 16;
+
+/** Milliseconds the filmstrip waits after its range changed before it tells the shell which photos it shows (`thumbnailsInView`). */
+export const THUMBNAILS_IN_VIEW_DELAY_MS = 120;
 
 /** Milliseconds a replaced look thumbnail's URL is kept, so a tile never shows a broken picture. */
 const URL_GRACE_MS = 3000;
@@ -435,7 +748,19 @@ export class AppStore {
   private readonly lookThumbs = new Map<PhotoId, { key: string; urls: Map<LookId, LookThumb> }>();
   /** Holds the look tiles' requests to {@link LOOK_THUMBNAIL_CONCURRENCY} at a time; what waits is dropped when its photo or settings change. */
   private readonly thumbLimiter = new RequestLimiter<{ photoId: PhotoId; key: string }>(LOOK_THUMBNAIL_CONCURRENCY);
+  /** The Film node's stock tiles (`docs/24` section 4.4): by photo, the Film node and the settings up to it, each stock's picture. In memory only. */
+  private readonly filmTiles = new Map<PhotoId, { key: string; urls: Map<string, LookThumb> }>();
+  /** One stock tile at a time, in the order they are asked for (the list's order): the core makes each at the thumbnails' priority. */
+  private readonly filmTileLimiter = new RequestLimiter<{ photoId: PhotoId; key: string }>(1);
+  /** The Film node's list of stocks and papers, read once. */
+  private filmCatalogueRead: Promise<FilmCatalogue> | null = null;
   private rect: ViewportRect | null = null;
+  /** The corrector the node view has selected and shows (`setMaskNode`); null in the simple view, while Crop or Export shows and on the Input and the Output. */
+  private maskNode: number | null = null;
+  /** The mask view the core was last told about, with the photo it was told on (a new photo starts without one in the core). */
+  private maskSent: { photo: PhotoId | null; view: MaskView | null } | null = { photo: null, view: null };
+  /** `mask_kinds` has been asked for (or answered): the Add mask menu's list is read once. */
+  private maskKindsAsked = false;
   /**
    * Wheel, pinch and drag input for the photo, collected and sent once per animation frame (`queueViewportInput`). The zoom mirror
    * follows once per frame too, when a zoom is closed.
@@ -451,6 +776,8 @@ export class AppStore {
   });
   private histogramBusy = false;
   private histogramAgain = false;
+  /** The node the histogram on show is of (`at`, `docs/01`): undefined is Main's, as the simple view reads it. */
+  private histogramAt: NodeId | undefined = undefined;
   /** Who has the histogram on show (the Light and Curve tabs): while there is one, `render_stats` keeps it fresh. */
   private histogramWatchers = 0;
   /** Of those, who also show the middle readout (the Light tab). */
@@ -460,14 +787,33 @@ export class AppStore {
   private readoutAgain = false;
   private scatterBusy = false;
   private scatterAgain = false;
+  /** The node whose warp the scatter on show is at the input of (`at`): undefined is Main's. */
+  private scatterAt: NodeId | undefined = undefined;
   /** Who shows the colour warp's plane (the Colour tab): while there is one, `render_stats` keeps its scatter fresh. */
   private scatterWatchers = 0;
   private scatterTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Who has the node view on show (`watchNodeThumbnails`): while there is one, the store asks for the node thumbnails of the current photo. */
+  private nodeThumbWatchers = 0;
+  /** Photos whose node thumbnails are about to be asked for (one microtask collects the calls of a burst). */
+  private readonly nodeThumbAsked = new Set<PhotoId>();
   /** Export events that arrived before `export_start` answered, by job. */
   private readonly earlyExport: ExportProgress[] = [];
   private starting = false;
   /** Runs a menu item that needs the webview (`menu_action`); set by `App`, which knows the screens. */
   menuHandler: ((action: MenuAction) => void) | null = null;
+  /**
+   * The menu items that are a single key's action (Nodes, the Photo menu, Apply Look 1 to 9): the Photos screen, which owns what the
+   * keys do, sets it while it is on screen. It runs the key's own handler, with the same guards (not in Crop or the Export panel where
+   * the key is not), and answers whether it did anything; with no Photos screen it is `null`. It does not read the switch of
+   * "Single-key shortcuts": a menu item works with the switch off (`docs/28` A-P11).
+   */
+  shortcutCommand: ((shortcut: Shortcut) => boolean) | null = null;
+
+  /**
+   * Says what a menu item did (`docs/28` A-08): the Photos screen, which owns the live region, sets it while it is on screen; `on` is the
+   * state a toggle went to, or whether Undo and Redo had a step. With no Photos screen it is `null`.
+   */
+  announce: ((action: Announced, on?: boolean) => void) | null = null;
 
   /**
    * `batchMs` is how long event-driven changes may wait to be drawn together (about two frames);
@@ -492,7 +838,10 @@ export class AppStore {
   readonly getState = (): AppState => this.state;
 
   private set(patch: Partial<AppState>): void {
-    this.state = { ...this.state, ...patch };
+    // The consent question (`docs/22` section 12.3) belongs to Preferences: whatever dialog takes its place (About from the native menu, the
+    // close question, the .cube import, or no dialog at all) drops it, so the next ⌘, never opens Preferences with it already showing.
+    const dropsConsent = patch.overlay !== undefined && patch.overlay !== "preferences" && patch.consentFor === undefined;
+    this.state = { ...this.state, ...patch, ...(dropsConsent ? { consentFor: null } : {}) };
     this.notify();
   }
 
@@ -556,23 +905,37 @@ export class AppStore {
     const api = this.api;
     this.stops = [
       api.on("photo_progress", (e) => this.onProgress(e)),
+      api.on("open_progress", (e) => this.onOpenProgress(e)),
       api.on("thumbnail_ready", (e) => this.onThumbnail(e)),
+      api.on("node_thumbnails_ready", (e) => this.onNodeThumbnails(e)),
       api.on("render_stats", (stats) => {
-        this.later((s) => ({ ...s, stats }));
+        this.later((s) => (s.stats && share(s.stats, stats) === s.stats ? s : { ...s, stats }));
         this.scheduleHistogram();
         this.scheduleChromaScatter();
       }),
       api.on("looks_changed", () => {
         void this.refreshLooks();
-        void this.refreshDisplayLuts();
         void this.refreshPreferences();
       }),
+      // A provider was found, signed in or out, or a check ended. The cached read asks no program to check anything (`docs/22` section
+      // 12.6), so it is safe at any time; only Preferences opening makes them check (`refreshAuto`, `agy`'s sign-in check contacts its
+      // service, D7).
+      api.on("auto_status_changed", () => void this.refreshAutoCached()),
       api.on("error", (error) => this.set({ error })),
       api.on("export_progress", (e) => this.onExportProgress(e)),
       api.on("menu_action", (e) => this.menuHandler?.(e.action)),
       api.on("viewport_frame", (frame) => this.onFrame(frame)),
       api.on("settings_changed", (e) => void this.onSettingsChanged(e.photo_id)),
       api.on("export_busy", (e) => this.set({ exportBusy: e.busy })),
+      api.on("viewport_busy", (e) => this.onViewportBusy(e)),
+      api.on("object_state", (e) => this.onObjectState(e)),
+      api.on("vision_state", (e) => this.onVisionState(e)),
+      api.on("depth_state", (e) => this.onDepthState(e)),
+      // The core says it once per stay at the critical level; Dismiss hides it until the core says it again.
+      api.on("memory_notice", (e) => this.set({ memoryNotice: e.message })),
+      // The system's Reduce Transparency, Reduce Motion and Increase Contrast become attributes of the root (`docs/28` A-P12).
+      watchDisplayOptions(api),
+      onGestureEnd(() => this.afterGesture()),
     ];
     void this.load();
     return () => this.disconnect();
@@ -587,9 +950,9 @@ export class AppStore {
   async load(): Promise<void> {
     await Promise.all([
       this.refreshLooks(),
+      this.refreshLenses(),
       this.refreshSession(),
       this.refreshPreferences(),
-      this.refreshDisplayLuts(),
       this.refreshViewportInfo(),
       this.refreshExportBusy(),
     ]);
@@ -640,6 +1003,19 @@ export class AppStore {
     }
   }
 
+  /**
+   * Asks for the lenses of the Lens card's list, once per run (`docs/21` §10). A core that has no lens data answers with none; one that
+   * fails to answer leaves the card with none too, and the error bar says what went wrong.
+   */
+  async refreshLenses(): Promise<void> {
+    try {
+      this.set({ lenses: await this.api.lensList() });
+    } catch (error) {
+      this.set({ lenses: [] });
+      this.fail(error);
+    }
+  }
+
   /** How many commands have failed so far; a caller compares it before and after a step to know that the step failed. */
   private failures = 0;
 
@@ -661,6 +1037,12 @@ export class AppStore {
   // --- Events -------------------------------------------------------------------------------
 
   private onProgress(e: PhotoProgress): void {
+    // Apple Auto's answer is not a development stage the status shows: the photo is ready before it (`docs/19` section 6).
+    if (e.stage === "apple") {
+      const pending = !e.done;
+      this.later((s) => this.withApplePending(s, e.id, pending));
+      return;
+    }
     let status: PhotoStatus | null = null;
     if (e.error) status = { kind: "skipped", reason: e.error };
     else if (e.stage === "thumbnail" && e.done) status = { kind: "ready" };
@@ -673,14 +1055,29 @@ export class AppStore {
   /** The state with one photo's status changed; remembered when the photo isn't in the session yet. */
   private withStatus(s: AppState, id: PhotoId, status: PhotoStatus): AppState {
     const session = s.session;
-    if (!session || !session.photos.some((p) => p.id === id)) {
+    const index = session ? session.photos.findIndex((p) => p.id === id) : -1;
+    if (!session || index < 0) {
       this.pendingStatus.set(id, status);
       return s;
     }
-    const photos = session.photos.map((p) => (p.id === id ? { ...p, status } : p));
+    // Copy on write: one copy of the array and a new object for the one photo that changed; the other 1,999 keep their identity, so the
+    // lists that draw them compare equal and do not draw them again.
+    const photos = session.photos.slice();
+    photos[index] = { ...photos[index]!, status };
     if (status.kind === "ready" && photos[session.current_index ?? -1]?.id === id) {
       queueMicrotask(() => void this.ensureSettings(id));
     }
+    return { ...s, session: { ...session, photos } };
+  }
+
+  /** The state with one photo's `apple_pending` changed. A photo not in the session yet is left alone: its summary will say. */
+  private withApplePending(s: AppState, id: PhotoId, pending: boolean): AppState {
+    const session = s.session;
+    const index = session ? session.photos.findIndex((p) => p.id === id) : -1;
+    const photo = session?.photos[index];
+    if (!session || !photo || photo.apple_pending === pending) return s;
+    const photos = session.photos.slice();
+    photos[index] = { ...photo, apple_pending: pending };
     return { ...s, session: { ...session, photos } };
   }
 
@@ -692,6 +1089,94 @@ export class AppStore {
       if (old) releaseUrl(old);
       return { ...s, thumbnails: { ...s.thumbnails, [e.id]: e.url } };
     });
+  }
+
+  /** The pictures of some of a photo's nodes (only the ones that changed): kept per photo and node, the old address of a node let go. */
+  private onNodeThumbnails(e: NodeThumbnailsReady): void {
+    this.later((s) => {
+      // A photo that is not in the session (it was removed while its pictures were made) has no node view; its pictures are let go.
+      if (!s.session?.photos.some((p) => p.id === e.photo_id)) {
+        for (const t of e.thumbnails) releaseUrl(t.url);
+        return s;
+      }
+      const had = s.nodeThumbnails[e.photo_id] ?? {};
+      const next: Record<number, string> = { ...had };
+      let changed = false;
+      for (const t of e.thumbnails) {
+        const old = next[t.node];
+        if (old === t.url) continue;
+        // The shell's addresses are not ours to free; the mock's `blob:` ones are.
+        if (old) releaseUrl(old);
+        next[t.node] = t.url;
+        changed = true;
+      }
+      return changed ? { ...s, nodeThumbnails: { ...s.nodeThumbnails, [e.photo_id]: next } } : s;
+    });
+  }
+
+  /**
+   * The node view is on show (the Photos screen calls this while the graph is up and calls the function it returns when it goes). While
+   * somebody watches, the store asks the core for the current photo's node thumbnails (`node_thumbnails`): at once, when the photo on
+   * screen changes, and whenever a change to its settings has landed (a released drag, a key, a typed value, a node added or removed,
+   * an undo, a paste, the core's own news), never during a drag. Nothing is asked for while nobody watches.
+   */
+  watchNodeThumbnails(): () => void {
+    this.nodeThumbWatchers += 1;
+    this.wantNodeThumbnails(this.currentId());
+    let watching = true;
+    return () => {
+      if (!watching) return;
+      watching = false;
+      this.nodeThumbWatchers -= 1;
+    };
+  }
+
+  /**
+   * A photo's settings changed or the photo was just shown: asks for its node thumbnails if the node view is on, the photo is the one
+   * on screen, no drag is on and no patch is on its way (the reply of the last one comes here again). A burst of calls is one
+   * request. The pictures of nodes the photo no longer has are let go first.
+   */
+  private wantNodeThumbnails(id: PhotoId | null): void {
+    if (id === null || this.nodeThumbWatchers === 0 || this.nodeThumbAsked.has(id)) return;
+    this.nodeThumbAsked.add(id);
+    queueMicrotask(() => {
+      this.nodeThumbAsked.delete(id);
+      if (this.nodeThumbWatchers === 0 || id !== this.currentId()) return;
+      if (this.gestures.has(id) || this.isSending(id)) return;
+      const rs = this.state.settings[id];
+      if (!rs) return;
+      this.forgetGoneNodeThumbnails(id, rs.settings);
+      void this.api.nodeThumbnails(id).catch(() => {
+        // The cards keep the pictures they have; the next change asks again.
+      });
+    });
+  }
+
+  /** Lets go of the pictures of the nodes a photo no longer has (a node that is added again later gets its own). */
+  private forgetGoneNodeThumbnails(id: PhotoId, settings: DevelopSettings): void {
+    const kept = this.state.nodeThumbnails[id];
+    if (!kept) return;
+    const present = new Set(cardsOf(settings).map((n) => n.id as number));
+    const gone = Object.keys(kept)
+      .map(Number)
+      .filter((node) => !present.has(node));
+    if (gone.length === 0) return;
+    const next: Record<number, string> = { ...kept };
+    for (const node of gone) {
+      releaseUrl(next[node] as string);
+      delete next[node];
+    }
+    this.set({ nodeThumbnails: { ...this.state.nodeThumbnails, [id]: next } });
+  }
+
+  /** Lets go of the node thumbnails of these photos (the shell's addresses are not ours to free; the mock's `blob:` ones are). */
+  private releaseNodeThumbnails(ids: Iterable<PhotoId>): Record<PhotoId, Readonly<Record<number, string>>> {
+    const next = { ...this.state.nodeThumbnails };
+    for (const id of ids) {
+      for (const url of Object.values(next[id] ?? {})) releaseUrl(url);
+      delete next[id];
+    }
+    return next;
   }
 
   /**
@@ -711,10 +1196,94 @@ export class AppStore {
     }
   }
 
+  /** The photos the filmstrip draws, waiting to be sent: one ask goes out per pause in the scrolling. */
+  private inView: PhotoId[] | null = null;
+  private inViewTimer: ReturnType<typeof setTimeout> | null = null;
+
+  /**
+   * The filmstrip draws these photos (`docs/26` H-11). The shell keeps the thumbnails under a byte budget and lets go of the ones used
+   * least recently, so a photo that was scrolled out of sight may have none when it comes back. The ask goes out once the scrolling
+   * pauses; the shell counts the photos as used and makes the missing thumbnails again (`thumbnail_ready` brings them).
+   */
+  thumbnailsInView(ids: readonly PhotoId[]): void {
+    this.inView = ids.slice();
+    if (this.inViewTimer !== null) return;
+    this.inViewTimer = setTimeout(() => {
+      this.inViewTimer = null;
+      const wanted = this.inView;
+      this.inView = null;
+      if (wanted && wanted.length > 0) void this.askThumbnailsInView(wanted);
+    }, THUMBNAILS_IN_VIEW_DELAY_MS);
+  }
+
+  private async askThumbnailsInView(ids: PhotoId[]): Promise<void> {
+    const sent = this.state.thumbnails;
+    try {
+      const held = new Map((await this.api.thumbnailsInView(ids)).map((t) => [t.id, t.url]));
+      this.later((s) => {
+        let next: Record<PhotoId, string> | null = null;
+        for (const id of ids) {
+          const was = sent[id];
+          const now = s.thumbnails[id];
+          // An address an event brought while the ask was out is newer than the answer, and stays.
+          if (now !== was) continue;
+          const url = held.get(id);
+          if (url === now) continue;
+          next ??= { ...s.thumbnails };
+          // The shell let go of this photo's thumbnail: the old address would answer 404, so the strip shows no picture until the new
+          // one is announced.
+          if (url === undefined) delete next[id];
+          else next[id] = url;
+        }
+        return next === null ? s : { ...s, thumbnails: next };
+      });
+    } catch {
+      // The strip keeps what it has; the next pause in the scrolling asks again.
+    }
+  }
+
   /**
    * A frame of the fallback viewport, or (an empty address) the news that the picture is gone. Drawn at once, never batched. The shell
    * can draw a frame before the webview has said where the cell is (it uses a 1 × 1 cell then); a frame that small is no picture.
    */
+  /** `viewport_busy`: kept as the core said it (a repeat changes nothing). */
+  private onViewportBusy(e: ViewportBusy): void {
+    const now = this.state.viewportBusy;
+    if (now.busy === e.busy && now.cpu === e.cpu && now.finding === e.finding) return;
+    this.set({ viewportBusy: { busy: e.busy, cpu: e.cpu, finding: e.finding } });
+  }
+
+  /** `object_state`: SAM's encoder started or stopped working for a photo. When it stops the core draws the photo again, and the nodes' thumbnails follow. */
+  private onObjectState(e: ObjectState): void {
+    const was = this.state.objectPreparing.includes(e.photo_id);
+    if (was === e.preparing) return;
+    this.set({ objectPreparing: e.preparing ? [...this.state.objectPreparing, e.photo_id] : this.state.objectPreparing.filter((id) => id !== e.photo_id) });
+    if (!e.preparing) this.wantNodeThumbnails(e.photo_id);
+  }
+
+  /** `vision_state`: the Subject and People worker ended its work for a photo. The rows whose request found nothing say so; the core draws the photo again and the nodes' thumbnails follow. */
+  private onVisionState(e: VisionState): void {
+    const was = this.state.visionNothing[e.photo_id] ?? [];
+    const same = was.length === e.nothing_found.length && was.every((k, i) => k === e.nothing_found[i]);
+    if (!same) this.set({ visionNothing: { ...this.state.visionNothing, [e.photo_id]: e.nothing_found } });
+    this.wantNodeThumbnails(e.photo_id);
+  }
+
+  /**
+   * `depth_state`: the depth worker ended its work for a photo. `failed` is the sentence of the failure, or null when the map is ready. The core draws the photo
+   * again, and the nodes' thumbnails follow.
+   */
+  private onDepthState(e: DepthState): void {
+    const was = this.state.depthFailed[e.photo_id] ?? null;
+    if (was !== e.failed) {
+      const next = { ...this.state.depthFailed };
+      if (e.failed === null) delete next[e.photo_id];
+      else next[e.photo_id] = e.failed;
+      this.set({ depthFailed: next });
+    }
+    this.wantNodeThumbnails(e.photo_id);
+  }
+
   private onFrame(frame: ViewportFrame): void {
     // Frames can arrive out of order (the shell numbers a frame before it encodes it, and the news that the picture is gone is sent from
     // another thread): an older one never replaces a newer one, and never brings back a picture that was taken away.
@@ -767,13 +1336,13 @@ export class AppStore {
     try {
       const session = await this.api.openPaths(toOpen);
       this.adoptOpened(session);
-      if (addingToPhotos && session.opened) this.showNotice(openedNotice(session.opened));
+      this.sayOpened(session, addingToPhotos);
     } catch (error) {
       const failure = toAppError(error);
-      if (failure.scope === "open" && failure.message === NO_ARW_NOTICE) this.sayNoArw(addingToPhotos);
+      if (failure.scope === "open" && (failure.message === NO_ARW_NOTICE || isUnreadableMessage(failure.message))) this.sayDropProblem(failure.message, addingToPhotos);
       else this.fail(failure);
     } finally {
-      this.set({ opening: false });
+      this.endOpening();
     }
   }
 
@@ -785,13 +1354,54 @@ export class AppStore {
       const session = await this.api.openDialog(kind);
       if (session) {
         this.adoptOpened(session);
-        if (addingToPhotos && session.opened) this.showNotice(openedNotice(session.opened));
+        this.sayOpened(session, addingToPhotos);
       }
     } catch (error) {
-      this.fail(error);
+      const failure = toAppError(error);
+      if (failure.scope === "open" && isUnreadableMessage(failure.message)) this.sayDropProblem(failure.message, addingToPhotos);
+      else this.fail(failure);
     } finally {
-      this.set({ opening: false });
+      this.endOpening();
     }
+  }
+
+  /** The core has read `e.done` of `e.total` files of the open under way. Shown once the open has taken a moment. */
+  private onOpenProgress(e: OpenProgress): void {
+    if (!this.state.opening) return;
+    this.openProgressLatest = e;
+    if (this.state.openProgress !== null) {
+      this.set({ openProgress: e });
+      return;
+    }
+    this.openProgressTimer ??= setTimeout(() => {
+      this.openProgressTimer = null;
+      if (this.state.opening && this.openProgressLatest !== null) this.set({ openProgress: this.openProgressLatest });
+    }, OPEN_PROGRESS_DELAY_MS);
+  }
+
+  /** An open ended, however it ended: the line "Reading … files…" goes. */
+  private endOpening(): void {
+    if (this.openProgressTimer !== null) clearTimeout(this.openProgressTimer);
+    this.openProgressTimer = null;
+    this.openProgressLatest = null;
+    this.set({ opening: false, openProgress: null });
+  }
+
+  /** Stops the open that is reading files (the Cancel button). The files read so far stay; the open then ends with `opened.cancelled`. */
+  async cancelOpen(): Promise<void> {
+    try {
+      await this.api.cancelOpen();
+    } catch (error) {
+      this.fail(error);
+    }
+  }
+
+  /** Says what an open did, where the person is looking: "Stopped. 40 files were opened." after Cancel, "Added 3 photos." on Photos. */
+  private sayOpened(session: SessionState, onPhotos: boolean): void {
+    const opened = session.opened;
+    if (!opened) return;
+    if (opened.cancelled) this.sayDropProblem(stoppedNotice(opened.added), onPhotos);
+    else if (onPhotos) this.showNotice(openedNotice(opened));
   }
 
   /**
@@ -819,8 +1429,13 @@ export class AppStore {
 
   /** "No ARW files in what you dropped.": in the drop zone on Start, in the notice bar where there is no drop zone. */
   private sayNoArw(onPhotos: boolean): void {
-    if (onPhotos) this.set({ dropNotice: null, notice: NO_ARW_NOTICE, noticeAction: null });
-    else this.set({ dropNotice: NO_ARW_NOTICE });
+    this.sayDropProblem(NO_ARW_NOTICE, onPhotos);
+  }
+
+  /** What was wrong with a drop or a dialog's choice ("No ARW files…", "Yellowmoon can't read the folder …"), where the person is looking. */
+  private sayDropProblem(message: string, onPhotos: boolean): void {
+    if (onPhotos) this.set({ dropNotice: null, notice: message, noticeAction: null });
+    else this.set({ dropNotice: message });
   }
 
   /** Goes to the Photos screen, on the first photo that is ready when the current one isn't. */
@@ -856,6 +1471,8 @@ export class AppStore {
    */
   private endSessionView(): void {
     for (const url of Object.values(this.state.thumbnails)) releaseUrl(url);
+    for (const urls of Object.values(this.state.nodeThumbnails)) for (const url of Object.values(urls)) releaseUrl(url);
+    this.nodeThumbAsked.clear();
     this.releaseLookThumbs();
     this.pendingStatus.clear();
     this.histories.clear();
@@ -867,14 +1484,16 @@ export class AppStore {
     this.state = {
       ...initialState(),
       looks: this.state.looks,
+      lenses: this.state.lenses,
       applyScope: this.state.applyScope,
+      maskView: this.state.maskView,
       collapsedLookLibraries: this.state.collapsedLookLibraries,
       stats: null,
       // What belongs to the app rather than the session stays: the preferences, the export in flight, the dialogs.
       preferences: this.state.preferences,
-      displayLuts: this.state.displayLuts,
       cliLink: this.state.cliLink,
-      appleAuto: this.state.appleAuto,
+      auto: this.state.auto,
+      os: this.state.os,
       exportOptions: this.state.exportOptions,
       // A run still writing files outlives the session; a finished one has been seen.
       exportRun: this.state.exportRun?.phase === "running" ? this.state.exportRun : null,
@@ -882,14 +1501,17 @@ export class AppStore {
       cubeImport: this.state.cubeImport,
       notice: this.state.notice,
       noticeAction: this.state.noticeAction,
+      // The computer's memory is not the session's.
+      memoryNotice: this.state.memoryNotice,
       viewportBackend: this.state.viewportBackend,
       exportBusy: this.state.exportBusy,
       // What was copied is for pasting in another folder too; the id of its photo belongs to the closed session.
       copied: this.state.copied && { ...this.state.copied, sourceId: null },
     };
     this.notify();
-    // A fresh session starts at Fit with the camera view off.
-    void this.api.viewportSetMode({ kind: "fit" }).catch(() => {});
+    // A fresh session starts at Fit with the camera view off and no mask view (the page asks again for the one the node view has).
+    this.maskSent = { photo: null, view: null };
+    void this.api.viewportSetMode({ kind: "fit" }, null).catch(() => {});
     void this.api.setBefore(false).catch(() => {});
   }
 
@@ -916,20 +1538,34 @@ export class AppStore {
     // Wheel and drag input that has not been sent was meant for the photo that is left, and so were the tiles not yet asked for.
     this.viewportQueue.clear();
     this.thumbLimiter.supersede((t) => t.photoId !== id);
+    this.filmTileLimiter.supersede((t) => t.photoId !== id);
     this.set({
       session: { ...session, current_index: index },
       histogram: null,
       middleReadout: null,
       chromaScatter: null,
       warpPin: null,
+      maskRow: null,
+      maskEye: null,
+      showDepth: null,
+      brushTool: false,
+      objectTool: false,
+      objectPlacing: false,
+      objectPill: null,
       zoom: { kind: "fit" },
       before: false,
       stats,
     });
     this.syncHistoryFlags();
-    if (isReady(session.photos[index] as PhotoSummary)) void this.ensureSettings(id);
+    if (isReady(session.photos[index] as PhotoSummary)) {
+      void this.ensureSettings(id);
+      this.wantNodeThumbnails(id);
+    }
     try {
       await this.api.setCurrent(id);
+      // The core has dropped the last photo's mask view with the photo; whatever raced it is not known, so tell it again.
+      this.maskSent = { photo: id, view: null };
+      this.syncMaskView();
     } catch (error) {
       this.fail(error);
     }
@@ -1052,6 +1688,7 @@ export class AppStore {
     }
     const settings = { ...this.state.settings };
     for (const id of gone) delete settings[id];
+    const nodeThumbnails = this.releaseNodeThumbnails(gone);
     this.removal = { histories, depth: this.undoDepth() };
 
     // The photo on screen stays unless it left; then it is the shell's choice, the next photo or the previous one.
@@ -1065,10 +1702,13 @@ export class AppStore {
       this.set(notice);
       return;
     }
-    this.set({ session: next, thumbnails, settings, ...notice, ...(stays ? {} : this.currentChanged()) });
+    this.set({ session: next, thumbnails, nodeThumbnails, settings, ...notice, ...(stays ? {} : this.currentChanged()) });
     this.syncHistoryFlags();
     const shown = next.photos[next.current_index ?? 0];
-    if (!stays && shown && isReady(shown)) void this.ensureSettings(shown.id);
+    if (!stays && shown && isReady(shown)) {
+      void this.ensureSettings(shown.id);
+      this.wantNodeThumbnails(shown.id);
+    }
   }
 
   /** Delete or Backspace: removes the photo on screen. */
@@ -1140,11 +1780,19 @@ export class AppStore {
   private currentChanged(): Partial<AppState> {
     this.viewportQueue.clear();
     this.thumbLimiter.supersede(() => true);
+    this.filmTileLimiter.supersede(() => true);
     return {
       histogram: null,
       middleReadout: null,
       chromaScatter: null,
       warpPin: null,
+      maskRow: null,
+      maskEye: null,
+      showDepth: null,
+      brushTool: false,
+      objectTool: false,
+      objectPlacing: false,
+      objectPill: null,
       zoom: { kind: "fit" },
       before: false,
       stats: this.state.stats && { ...this.state.stats, zoom_percent: null, fit_percent: null },
@@ -1154,7 +1802,13 @@ export class AppStore {
   /** The Look tab's tiles of photos that left are let go (the shell's addresses are not ours to free; the mock's `blob:` ones are). */
   private forgetLookThumbsOf(ids: ReadonlySet<PhotoId>): void {
     this.thumbLimiter.supersede((t) => ids.has(t.photoId));
+    this.filmTileLimiter.supersede((t) => ids.has(t.photoId));
     for (const id of ids) {
+      const tiles = this.filmTiles.get(id);
+      if (tiles) {
+        for (const thumb of tiles.urls.values()) void thumb.promise.then(releaseUrl, () => {});
+        this.filmTiles.delete(id);
+      }
       const entry = this.lookThumbs.get(id);
       if (!entry) continue;
       for (const thumb of entry.urls.values()) void thumb.promise.then(releaseUrl, () => {});
@@ -1210,14 +1864,6 @@ export class AppStore {
     }
   }
 
-  async refreshDisplayLuts(): Promise<void> {
-    try {
-      this.set({ displayLuts: await this.api.looksDisplayLuts() });
-    } catch (error) {
-      this.fail(error);
-    }
-  }
-
   /**
    * Changes a preference. The screen shows the change at once; the core's answer replaces it, and a refusal
    * puts the old values back and shows the reason.
@@ -1228,9 +1874,12 @@ export class AppStore {
     try {
       const preferences = await this.api.preferencesSet(patch);
       this.set({ preferences });
-      // Apple Auto acts, or stops, with its preference, and asks every photo again with new instructions; the photos' own news comes
-      // as `settings_changed`.
-      if (patch.apple_auto !== undefined || patch.apple_auto_instructions !== undefined) void this.refreshAppleAuto();
+      // The provider acts, or stops, with the choice and the consent, and every photo is asked again with new instructions; the photos' own
+      // news comes as `settings_changed`. The cached read: typing instructions saves a preference every few seconds, and none of those
+      // may make a program check its sign-in (`docs/22` D7).
+      if (patch.auto_provider !== undefined || patch.auto_consent !== undefined || patch.apple_auto_instructions !== undefined) {
+        void this.refreshAutoCached();
+      }
     } catch (error) {
       if (before) this.set({ preferences: before });
       this.fail(error);
@@ -1238,15 +1887,64 @@ export class AppStore {
   }
 
   /**
-   * Asks whether Apple Auto is available on this computer (the core reads it again: Apple Intelligence may have been switched on, or its
-   * model finished downloading) and whether it acts.
+   * Asks which providers this computer has and which one grades, and makes the core check every one of them again (Apple Intelligence may
+   * have been switched on, a program installed or signed in; `agy`'s sign-in check contacts its service). Only Preferences opening calls
+   * it (`docs/22` section 3.3 and D7); everything else reads {@link AppStore.refreshAutoCached}. The core never waits for a program, so
+   * this answers at once with what it knows; `auto_status_changed` says when that moved.
    */
-  async refreshAppleAuto(): Promise<void> {
+  async refreshAuto(): Promise<void> {
     try {
-      this.set({ appleAuto: await this.api.appleAutoStatus() });
+      this.set({ auto: await this.api.autoStatus() });
     } catch (error) {
       this.fail(error);
     }
+  }
+
+  /**
+   * The same status as each provider last said it, and no program is asked to check anything (`auto_status_cached`, `docs/22` section
+   * 12.6): what the store reads after a change of the choice, the consent or the instructions and on `auto_status_changed`.
+   */
+  async refreshAutoCached(): Promise<void> {
+    try {
+      this.set({ auto: await this.api.autoStatusCached() });
+    } catch (error) {
+      this.fail(error);
+    }
+  }
+
+  /** Asks which operating system the app runs on, for the sentences that differ on Windows. */
+  async refreshOs(): Promise<void> {
+    try {
+      this.set({ os: (await this.api.appInfo()).os });
+    } catch (error) {
+      this.fail(error);
+    }
+  }
+
+  /**
+   * The dropdown's choice of a provider (`docs/22` section 12.1). Default Auto, Apple Intelligence and a program the person
+   * already agreed to are saved at once; a program they have not agreed to opens the consent dialog and changes nothing until they say yes
+   * ({@link AppStore.answerConsent}).
+   */
+  async chooseProvider(provider: AutoProvider): Promise<void> {
+    if ((provider === "claude" || provider === "agy") && this.state.preferences?.auto_consent[provider] !== true) {
+      this.set({ consentFor: provider });
+      return;
+    }
+    await this.setPreferences({ auto_provider: provider });
+  }
+
+  /**
+   * The consent dialog's answer: yes saves the choice and the consent in one patch (so a program is never saved without its consent) and
+   * closes the dialog; no closes it and keeps the previous choice.
+   */
+  async answerConsent(agree: boolean): Promise<void> {
+    const provider = this.state.consentFor;
+    if (provider === null) return;
+    this.set({ consentFor: null });
+    if (!agree) return;
+    const saved = this.state.preferences?.auto_consent ?? { claude: false, agy: false };
+    await this.setPreferences({ auto_provider: provider, auto_consent: { ...saved, [provider]: true } });
   }
 
   async refreshCliLink(): Promise<void> {
@@ -1272,14 +1970,14 @@ export class AppStore {
     this.set({ overlay });
     if (overlay === "preferences") {
       void this.refreshCliLink();
-      void this.refreshDisplayLuts();
-      void this.refreshAppleAuto();
+      void this.refreshAuto();
+      void this.refreshOs();
     }
   }
 
   closeOverlay(): void {
-    if (this.state.overlay === "import-cube") this.set({ overlay: null, cubeImport: null });
-    else this.set({ overlay: null });
+    // Closing any dialog drops the consent question too (`set`).
+    this.set(this.state.overlay === "import-cube" ? { overlay: null, cubeImport: null } : { overlay: null });
   }
 
   /** A short message that is not an error. */
@@ -1289,6 +1987,11 @@ export class AppStore {
 
   dismissNotice(): void {
     this.set({ notice: null, noticeAction: null });
+  }
+
+  /** Hides the memory notice. The core says it again only after the level has been normal. */
+  dismissMemoryNotice(): void {
+    this.set({ memoryNotice: null });
   }
 
   /** ⌘W: closes the session, after asking when an export is running (`docs/11` §Keyboard shortcuts). */
@@ -1311,7 +2014,7 @@ export class AppStore {
   // --- Looks import: a loose .cube ----------------------------------------------------------------
 
   /**
-   * Looks › Import .cube…: asks for files, finds out what each is, and opens the dialog that asks what a LUT expects as
+   * Looks › Import LUTs and look files…: asks for files, finds out what each is, and opens the dialog that asks what a LUT expects as
    * input (`docs/08` §Any other .cube); ARRI Look Files (`.alf4`, `.alf4c`, `.aml`) say what they expect and are not asked.
    * A cancelled chooser changes nothing.
    */
@@ -1383,6 +2086,8 @@ export class AppStore {
   openExport(): void {
     if (!this.state.session) return;
     if (this.state.panel === "export") return;
+    // The panel takes the focus and gives it back to this control when it closes (`docs/11` §Export, `focusMemory.ts`).
+    rememberFocus("export");
     const fresh = this.state.exportRun === null;
     this.set({
       panel: "export",
@@ -1500,7 +2205,9 @@ export class AppStore {
 
   async setBefore(before: boolean): Promise<void> {
     if (before === this.state.before) return;
-    this.set({ before });
+    // The Before view has no mask (`docs/23` §5.8): a row's eye ends there.
+    this.set(before && (this.state.maskEye !== null || this.state.showDepth !== null) ? { before, maskEye: null, showDepth: null } : { before });
+    if (before) this.syncMaskView();
     try {
       await this.api.setBefore(before);
     } catch (error) {
@@ -1511,6 +2218,96 @@ export class AppStore {
 
   toggleBefore(): Promise<void> {
     return this.setBefore(!this.state.before);
+  }
+
+  /**
+   * Show mask (`docs/23` §5.8): turns the view on or off, or chooses its style (a style chosen turns it on when `on` is not given). The core
+   * draws the mask, so this tells it ({@link Store.syncMaskView}); the choice outlives nodes and photos.
+   */
+  setMaskView(change: Partial<MaskViewState>): void {
+    const next = { ...this.state.maskView, ...change };
+    const eye = this.state.maskEye;
+    // With a row's eye on the style is the eye's: choosing one changes how that row shows and leaves Show mask off.
+    if (eye !== null && change.on === undefined) {
+      if (next.style === this.state.maskView.style) return;
+      this.set({ maskView: next });
+      this.syncMaskView();
+      return;
+    }
+    if (change.style !== undefined && change.on === undefined) next.on = true;
+    if (next.on === this.state.maskView.on && next.style === this.state.maskView.style && eye === null && (!next.on || this.state.showDepth === null)) return;
+    // Show mask on ends the eye: one mask at a time.
+    this.set(next.on && (eye !== null || this.state.showDepth !== null) ? { maskView: next, maskEye: null, showDepth: null } : { maskView: next });
+    this.syncMaskView();
+  }
+
+  /** M and the toolbar toggle: the view on or off, with the style it last had. With a row's eye on it turns the eye off and Show mask on. */
+  toggleMaskView(): void {
+    this.setMaskView({ on: this.state.maskEye !== null ? true : !this.state.maskView.on });
+  }
+
+  /**
+   * A mask row's eye (`docs/23` §5.8, §7.6): shows that row's own mask on the photo, in the style of the View card, or ends it (`null`). One row at a
+   * time: turning one on turns the others off, and Show mask off. It is view state, not settings: no patch, no undo step. Ignored while there is no
+   * corrector on show. It ends with the node (another node, the Input or the Output, the simple view, full screen, Crop, Export), with the photo, in the
+   * Before view, in a pick and on Esc; the page ends it when the node's rows change place.
+   */
+  setMaskEye(row: number | null): void {
+    if (row !== null && this.maskNode === null) return;
+    // Whatever ends the eye ends Show depth with it (they are one view at a time), and an eye on ends Show depth.
+    if (row === this.state.maskEye && (row !== null || this.state.showDepth === null)) return;
+    this.set(row === null ? { maskEye: null, showDepth: null } : { maskEye: row, showDepth: null, maskView: { ...this.state.maskView, on: false } });
+    this.syncMaskView();
+  }
+
+  /**
+   * Show depth (`docs/23` §4.8): shows the photo's depth map as grey, white for near, for the Depth row `row` of the node on show, or ends it (`null`). View
+   * state like the eye, no patch and no undo step, and exclusive with it and with Show mask. It ends where the eye does (another node, the photo, Before, a
+   * pick, Esc) and when the Depth card goes away. Ignored while there is no corrector on show.
+   */
+  setShowDepth(row: number | null): void {
+    if (row !== null && this.maskNode === null) return;
+    if (row === this.state.showDepth) return;
+    this.set(row === null ? { showDepth: null } : { showDepth: row, maskEye: null, maskView: { ...this.state.maskView, on: false } });
+    this.syncMaskView();
+  }
+
+  /**
+   * The corrector the node view shows the mask of: the selected node when it is a corrector and the node view is up (not in the simple view,
+   * not while Crop or Export shows, not on the Input or the Output), else null. The view's on and style are kept meanwhile, and apply
+   * again when there is a node. The core is told whenever this, the view or the style changes, and again for a new photo.
+   */
+  setMaskNode(node: number | null): void {
+    // A row's eye is for one node: another node, or none, ends it.
+    if (node !== this.maskNode && (this.state.maskEye !== null || this.state.showDepth !== null)) this.set({ maskEye: null, showDepth: null });
+    this.maskNode = node;
+    this.syncMaskView();
+  }
+
+  /**
+   * Sends the mask view the core should have now, when it is not the one the core has. The core starts a photo without one, so a photo
+   * that is not the one it was last told about counts as having none; after a failed command what it has is not known.
+   */
+  private syncMaskView(): void {
+    const { on, style } = this.state.maskView;
+    const eye = this.state.maskEye;
+    const photo = this.currentId();
+    const node = this.maskNode;
+    let wanted: MaskView | null = null;
+    if (node !== null && photo !== null) {
+      if (this.state.showDepth !== null) wanted = { node, style: "mask_only", row: this.state.showDepth, depth: true };
+      else if (eye !== null) wanted = { node, style, row: eye };
+      else if (on) wanted = { node, style };
+    }
+    if (!sameMaskView(this.state.maskShown, wanted)) this.set({ maskShown: wanted });
+    const sent = this.maskSent;
+    const has = sent === null ? undefined : sent.photo === photo ? sent.view : null;
+    if (has !== undefined && sameMaskView(has, wanted)) return;
+    this.maskSent = { photo, view: wanted };
+    void this.api.viewportSetMode(this.state.zoom, wanted).catch((error: unknown) => {
+      this.maskSent = null;
+      this.fail(error);
+    });
   }
 
   async setZoom(mode: ViewportMode): Promise<void> {
@@ -1565,6 +2362,24 @@ export class AppStore {
     }
   }
 
+  /**
+   * Home on the zoomed photo: the view goes back to the middle of the picture at the zoom it has (`docs/28` A-10). The core has no input for
+   * it, and it takes Fit and any zoom to be about the middle of the cell (`ViewportState::set_mode`), so this sets Fit and then the zoom again
+   * with the commands that already exist. The zoom mirror does not move. At Fit there is nothing to do.
+   */
+  async recentreView(): Promise<void> {
+    if (this.viewportQueue.busy) await this.viewportQueue.flush();
+    if (this.showsWholePhoto()) return;
+    const zoom = this.state.zoom;
+    const view = this.state.maskShown;
+    try {
+      await this.api.viewportSetMode({ kind: "fit" }, view);
+      await this.api.viewportSetMode(zoom, view);
+    } catch (error) {
+      this.fail(error);
+    }
+  }
+
   /** The zoom that fits the whole picture in the cell, in percent of the photo's pixels; null before the cell has reported. */
   fitPercent(): number | null {
     const exact = this.fitPercentExact();
@@ -1578,7 +2393,7 @@ export class AppStore {
    */
   fitPercentExact(): number | null {
     const photo = this.currentPhoto();
-    const estimate = this.rect && photo ? fitZoomExact(this.rect, photo, this.currentSettings()?.values ?? null) : null;
+    const estimate = this.rect && photo ? fitZoomExact(this.rect, photo, this.currentSettings()?.values.input ?? null) : null;
     return fitZoomOf(this.state.stats, estimate);
   }
 
@@ -1647,12 +2462,25 @@ export class AppStore {
   }
 
   /**
+   * Auto crop (`docs/20-auto-crop.md` §1, §3): the core's proposal for a photo at the crop draft's aspect and orientation, or null when
+   * it can't make one. The Crop panel says so in its own note, so a failure does not go to the error bar.
+   */
+  async suggestCrop(photoId: PhotoId, aspect: CropAspect, orientation: Orientation): Promise<CropSuggestion | null> {
+    try {
+      return await this.api.suggestCrop(photoId, aspect, orientation);
+    } catch {
+      return null;
+    }
+  }
+
+  /**
    * Pick colour (Colour › Colour warp, `docs/11`): asks the core for the chroma under a click on the photo cell (CSS pixels from its
    * corner, as Pick white) at the warp's input, and adds a moving pin there with its target on its source, selected, so the next drag
    * on the plane moves it. One undo step. A click on the paper around the photo adds nothing, and nor does one at sixteen pins (the
-   * selection goes, so the card says why).
+   * selection goes, so the card says why). In the node view `node` is the corrector whose Colour tab is shown: the chroma is read at the
+   * input of its warp (`sample_chroma`'s `at`) and the pin goes into its pins.
    */
-  async pickColor(x: number, y: number): Promise<void> {
+  async pickColor(x: number, y: number, node: number = MAIN_ID): Promise<void> {
     const id = this.currentId();
     if (id === null) return;
     // Wheel and drag input still on its way lands first: the click names a spot of the picture as that input left it.
@@ -1661,26 +2489,308 @@ export class AppStore {
     await this.whenIdle(id);
     let sample: ChromaSample | null;
     try {
-      sample = await this.api.sampleChroma(x, y);
+      sample = node === MAIN_ID ? await this.api.sampleChroma(x, y) : await this.api.sampleChroma(x, y, node);
     } catch (error) {
       this.fail(error);
       return;
     }
     const rs = this.state.settings[id];
     if (!sample || !rs || this.currentId() !== id) return;
-    const pins = rs.settings.color_warp.pins;
+    const pins = gradeOf(rs.settings, node).color_warp.pins;
     if (pins.length >= WARP_MAX_PINS) {
       this.selectWarpPin(null);
       return;
     }
     const next = [...pins, movingPin(clampToDisc([sample.a, sample.b], WARP_COORD_LIMIT))];
     this.selectWarpPin(next.length - 1);
-    await this.update({ color_warp: { pins: next } }, true);
+    await this.update(patchOf(node, { grade: { color_warp: { pins: next } } }), true);
   }
 
   /** Selects a pin of the colour warp (an index into the current photo's pins), or none. */
   selectWarpPin(index: number | null): void {
     if (index !== this.state.warpPin) this.set({ warpPin: index });
+  }
+
+  /**
+   * Pick colour of a Colour range row (Mask tab, `docs/23` §7.6): asks the core for the chroma under a click on the photo cell (CSS pixels
+   * from its corner, as Pick white) **at the node's input** (`sample_chroma`'s `at` and `tap: "node_input"`: the picture the node reads, before
+   * its own trim and grade, which is what a Colour range selects on) and sets the row's centre to it, held to the plane (at most 0.5 from the
+   * middle). One undo step. A click on the paper around the photo changes nothing, and nor does a row that is no longer a Colour
+   * range (taken away, or moved, while the reading was on its way).
+   */
+  async pickRange(x: number, y: number, node: number, row: number): Promise<void> {
+    const id = this.currentId();
+    if (id === null) return;
+    if (this.viewportQueue.busy) await this.viewportQueue.flush();
+    await this.whenIdle(id);
+    let sample: ChromaSample | null;
+    try {
+      sample = await this.api.sampleChroma(x, y, node, "node_input");
+    } catch (error) {
+      this.fail(error);
+      return;
+    }
+    if (!sample || this.currentId() !== id) return;
+    const item = this.state.settings[id] ? nodeOf(this.state.settings[id].settings, node) : undefined;
+    const target = item?.kind === "corrector" || item?.kind === "film" ? item.masks.items[row] : undefined;
+    if (target?.kind !== "color_range") return;
+    const center = clampToDisc([sample.a, sample.b], COLOR_RANGE_REACH);
+    await this.update(patchOf(node, { masks: { edit: { [String(row)]: { center } } } }), true);
+  }
+
+  /**
+   * Selects a row of the selected node's masks (an index into its `masks.items`), or none. A row change ends the Brush tool of the row that
+   * was selected, and so does selecting a row again: the caller that wants the tool turns it on afterwards ({@link Store.setBrushTool}).
+   */
+  selectMaskRow(index: number | null): void {
+    if (index !== this.state.maskRow || this.state.brushTool || this.state.objectTool || this.state.objectPlacing) this.set({ maskRow: index, brushTool: false, objectTool: false, objectPlacing: false });
+  }
+
+  /** Turns the Object tool of the selected row on or off (`docs/23` §7.6). */
+  setObjectTool(on: boolean): void {
+    if (on !== this.state.objectTool) this.set({ objectTool: on });
+  }
+
+  /** Starts or ends "Place points" of the selected Object row (`docs/28` A-11): the keyboard's way to add the points a click adds. */
+  setObjectPlacing(on: boolean): void {
+    if (on !== this.state.objectPlacing) this.set({ objectPlacing: on });
+  }
+
+  /** Chooses what a plain click does on the Object card: Add point, Remove point or Box. Nothing is sent. */
+  setObjectMode(mode: ObjectMode): void {
+    if (mode !== this.state.objectMode) this.set({ objectMode: mode });
+  }
+
+  /**
+   * Pick depth (`docs/23` §4.8, §7.6): a click at `(x, y)` of the cell (CSS pixels from its corner) sets `far` of the Depth row `row` of `node` a little behind the
+   * depth under it. The click is mapped to the photo frame (`viewport_map_points`; a click on the paper around the photo does nothing), the core answers the limit
+   * (`sample_depth`, waiting for the depth map if it is still being made) and the number is written as a `masks.edit` row patch: one undo step. A
+   * refusal goes to the error bar; no map to read (it failed) changes nothing. Nothing is written for a row that is not a Depth row any more.
+   */
+  async pickDepth(x: number, y: number, node: number, row: number): Promise<void> {
+    const id = this.currentId();
+    if (id === null) return;
+    if (this.viewportQueue.busy) await this.viewportQueue.flush();
+    await this.whenIdle(id);
+    const mapped = await this.mapPoints([[x, y]], "cell");
+    const at = mapped?.[0];
+    if (!at) return;
+    let picked: DepthFar | null;
+    try {
+      picked = await this.api.sampleDepth(id, at[0], at[1]);
+    } catch (error) {
+      this.fail(error);
+      return;
+    }
+    if (!picked || this.currentId() !== id || this.depthRowAt(id, node, row) === undefined) return;
+    await this.update(patchOf(node, { masks: { edit: { [String(row)]: { far: picked.far } } } }), true, id);
+  }
+
+  /** The Depth row `row` of `node` of a photo, as the page has it. */
+  private depthRowAt(id: PhotoId, node: number, row: number): Extract<MaskItem, { kind: "depth" }> | undefined {
+    const rs = this.state.settings[id];
+    const item = rs ? nodeOf(rs.settings, node) : undefined;
+    const target = item?.kind === "corrector" || item?.kind === "film" ? item.masks.items[row] : undefined;
+    return target?.kind === "depth" ? target : undefined;
+  }
+
+  /**
+   * Focus plane (`docs/23` §4.8, §7.6): sets `far` of the Depth row `row` of `node` a little behind the plane the camera focused on (`focus_plane`), as one
+   * row patch and one undo step. A photo with no focus point is remembered (`noFocusPoint`: the button goes off, the card says why) and nothing is written. When
+   * the camera's point is exactly the frame's centre the limit is made and the card says to check it (`focusCentre`). A depth map that could not be made changes
+   * nothing: its failure is the row's own (`depth_state`).
+   */
+  async focusPlane(node: number, row: number): Promise<void> {
+    const id = this.currentId();
+    if (id === null) return;
+    let answer: FocusPlaneResult;
+    try {
+      answer = await this.api.focusPlane(id);
+    } catch (error) {
+      this.fail(error);
+      return;
+    }
+    if (answer.reason === "no_focus_point") {
+      this.set({ noFocusPoint: { ...this.state.noFocusPoint, [id]: true } });
+      return;
+    }
+    if (answer.far === null || this.currentId() !== id || this.depthRowAt(id, node, row) === undefined) return;
+    const { far } = answer;
+    await this.update(patchOf(node, { masks: { edit: { [String(row)]: { far } } } }), true, id);
+    const next = { ...this.state.focusCentre };
+    if (answer.exact_centre) next[id] = far;
+    else delete next[id];
+    this.set({ focusCentre: next });
+  }
+
+  /** Asks once whether the photo has a focus point, so that the card can say so before Focus plane is pressed (the core answers at once for a file with none). */
+  ensureFocusPoint(photo: PhotoId): void {
+    if (this.state.noFocusPoint[photo] || this.focusAsked.has(photo)) return;
+    this.focusAsked.add(photo);
+    void this.api.focusPlane(photo).then(
+      (answer) => {
+        if (answer.reason === "no_focus_point") this.set({ noFocusPoint: { ...this.state.noFocusPoint, [photo]: true } });
+      },
+      () => this.focusAsked.delete(photo),
+    );
+  }
+  private readonly focusAsked = new Set<PhotoId>();
+
+  /**
+   * "Try again" (`docs/23` §4.8): starts a photo's depth map again after it failed. The failure is forgotten at once (the row says "Finding…" while the core works
+   * and the card is the normal one); if it fails again `depth_state` brings the sentence back.
+   */
+  async retryDepth(photo: PhotoId): Promise<void> {
+    if (this.state.depthFailed[photo] === undefined) return;
+    const next = { ...this.state.depthFailed };
+    delete next[photo];
+    this.set({ depthFailed: next });
+    try {
+      await this.api.retryDepth(photo);
+    } catch (error) {
+      this.fail(error);
+    }
+  }
+
+  /** One find at a time: a click while another is being answered waits, and reads the row as that one left it. */
+  private finds: Promise<unknown> = Promise.resolve();
+  private pillSeq = 0;
+  private pillTimer: ReturnType<typeof setTimeout> | null = null;
+  /** The newest `open_progress`, and the timer that shows it once the open has taken a moment (`onOpenProgress`). */
+  private openProgressLatest: OpenProgress | null = null;
+  private openProgressTimer: ReturnType<typeof setTimeout> | null = null;
+
+  /**
+   * Finds an object (`mask_find`, `docs/23` §4.4 and §9): asks the core for the Object row `row` of `node` with the person's click or box added. A **found**
+   * answer carries what the row's `points` and `box` become and is sent as **one** `masks.edit` row patch (one undo step), and the pill "Object found ·
+   * 0.4 s" shows for three seconds. **Nothing found** adds no point and changes nothing: the error bar says "Nothing found there. Click another part of the
+   * object, or draw a box." A refusal of the core (no Object model, 256 points) goes to the error bar with its own sentence. The row says "Finding…" while
+   * the core works. Resolves with whether a mask was found.
+   */
+  findObject(node: number, row: number, prompt: MaskFindPrompt, photoId: PhotoId | null = this.currentId()): Promise<boolean> {
+    if (photoId === null) return Promise.resolve(false);
+    const id = photoId;
+    const run = async (): Promise<boolean> => {
+      const rs = this.state.settings[id];
+      const item = rs ? nodeOf(rs.settings, node) : undefined;
+      const target = item?.kind === "corrector" || item?.kind === "film" ? item.masks.items[row] : undefined;
+      if (target?.kind !== "object") return false;
+      this.set({ objectFinding: id });
+      try {
+        const found = await this.api.maskFind(id, node, row, prompt);
+        if (found.kind === "nothing") {
+          this.set({ error: { scope: "mask", message: NOTHING_FOUND } });
+          return false;
+        }
+        await this.update(patchOf(node, { masks: { edit: { [String(row)]: { points: found.points, box: found.box } } } }), true, id);
+        this.showPill(foundText(found.took_ms));
+        return true;
+      } catch (error) {
+        this.fail(error);
+        return false;
+      } finally {
+        if (this.state.objectFinding === id) this.set({ objectFinding: null });
+      }
+    };
+    const next = this.finds.then(run, run);
+    this.finds = next;
+    return next;
+  }
+
+  /**
+   * A click of the Object tool (`docs/23` §4.4), and the keyboard's Return of "Place points" (`docs/28` A-11): `at` is a place in the cell in CSS
+   * pixels. The core maps it to the photo frame (`viewport_map_points`, null on the paper: nothing is asked), {@link clickPrompt} gives the point's sign
+   * for the tool and ⌥, and {@link Store.findObject} asks. The one road of both, so the same place gives the same `points`. Resolves with whether a mask was found.
+   */
+  async clickObject(node: number, row: number, tool: ObjectMode, alt: boolean, at: [number, number], photoId: PhotoId | null = this.currentId()): Promise<boolean> {
+    const mapped = await this.mapPoints([at], "cell");
+    const place = mapped?.[0];
+    const prompt = place ? clickPrompt(tool, alt, place[0], place[1]) : null;
+    return prompt ? this.findObject(node, row, prompt, photoId) : false;
+  }
+
+  /**
+   * Takes the last point out of an Object row (`docs/28` A-11, Backspace of "Place points"): one `masks.edit` row patch of `points`, one undo step. The box
+   * stays. Resolves with how many points the row has now, or null when there was none to take (or the row is not an Object row).
+   */
+  async removeLastObjectPoint(node: number, row: number, photoId: PhotoId | null = this.currentId()): Promise<number | null> {
+    if (photoId === null) return null;
+    const rs = this.state.settings[photoId];
+    const item = rs ? nodeOf(rs.settings, node) : undefined;
+    const target = item?.kind === "corrector" || item?.kind === "film" ? item.masks.items[row] : undefined;
+    if (target?.kind !== "object" || target.points.length === 0) return null;
+    const points = target.points.slice(0, -1);
+    await this.update(patchOf(node, { masks: { edit: { [String(row)]: { points } } } }), true, photoId);
+    return points.length;
+  }
+
+  /** Shows the pill "Object found · 0.4 s" for {@link FOUND_PILL_MS}; a newer one replaces it. */
+  private showPill(text: string): void {
+    if (this.pillTimer !== null) clearTimeout(this.pillTimer);
+    this.pillSeq += 1;
+    const seq = this.pillSeq;
+    this.set({ objectPill: { seq, text } });
+    this.pillTimer = setTimeout(() => {
+      this.pillTimer = null;
+      if (this.state.objectPill?.seq === seq) this.set({ objectPill: null });
+    }, FOUND_PILL_MS);
+  }
+
+  /** Turns the Brush tool of the selected row on or off (`docs/23` §7.6). */
+  setBrushTool(on: boolean): void {
+    if (on !== this.state.brushTool) this.set({ brushTool: on });
+  }
+
+  /** Sets the brush the next strokes are drawn with (size, hardness, paint or erase). The strokes already drawn keep theirs. */
+  setBrush(change: Partial<BrushSettings>): void {
+    const next = { ...this.state.brush, ...change };
+    if (next.size !== this.state.brush.size || next.hardness !== this.state.brush.hardness || next.erase !== this.state.brush.erase) this.set({ brush: next });
+  }
+
+  /**
+   * Appends a stroke to a Brush row (`docs/23` §3.7): one `masks.edit` row patch with `strokes_append`, sent when the pointer is released. One
+   * undo step, whose inverse is `strokes_keep` with the old count (`diffSettings`). A row that is not a Brush row any more (taken away or
+   * moved while the stroke was being mapped) takes nothing. A stroke that would take the row over 100,000 points is refused with the core's
+   * sentence in the error bar, before anything is sent, and changes nothing. Resolves with whether the stroke was sent.
+   */
+  async addStroke(node: number, row: number, stroke: BrushStroke, photoId: PhotoId | null = this.currentId()): Promise<boolean> {
+    if (photoId === null) return false;
+    const rs = this.state.settings[photoId];
+    const item = rs ? nodeOf(rs.settings, node) : undefined;
+    const target = item?.kind === "corrector" || item?.kind === "film" ? item.masks.items[row] : undefined;
+    if (target?.kind !== "brush" || stroke.points.length === 0) return false;
+    if (brushPointCount(target) + stroke.points.length > MAX_BRUSH_POINTS) {
+      this.fail({ scope: "render", message: BRUSH_FULL });
+      return false;
+    }
+    await this.update(patchOf(node, { masks: { edit: { [String(row)]: { strokes_append: [stroke] } } } }), true, photoId);
+    return true;
+  }
+
+  /** Asks which kinds of mask this machine can make, once (`mask_kinds`): the Add mask menu lists exactly these. A failure leaves the menu without items. */
+  ensureMaskKinds(): void {
+    if (this.state.maskKinds !== null || this.maskKindsAsked) return;
+    this.maskKindsAsked = true;
+    void this.api.maskKinds().then(
+      (kinds) => this.set({ maskKinds: kinds }),
+      (error: unknown) => {
+        this.maskKindsAsked = false;
+        this.fail(error);
+      },
+    );
+  }
+
+  /**
+   * Maps points between the photo frame and the cell (`viewport_map_points`, `docs/23` §9): the handles and outlines the page draws over the
+   * photo. The page never converts: the core knows the straightening, the turn, the crop, the lens's bend and the view's zoom and pan. `null`
+   * when the core could not answer (the handles are then left as they were, with no error: the next frame asks again).
+   */
+  async mapPoints(points: Array<[number, number]>, from: MapFrom): Promise<Array<[number, number] | null> | null> {
+    try {
+      return await this.api.viewportMapPoints(points, from);
+    } catch {
+      return null;
+    }
   }
 
   // --- Settings -----------------------------------------------------------------------------
@@ -1709,7 +2819,10 @@ export class AppStore {
       try {
         const rs = await this.api.getSettings(id);
         if (epoch !== this.bulkEpoch) continue;
-        if (!this.state.settings[id]) this.set({ settings: { ...this.state.settings, [id]: rs } });
+        if (!this.state.settings[id]) {
+          this.set({ settings: { ...this.state.settings, [id]: rs } });
+          this.wantNodeThumbnails(id);
+        }
         return;
       } catch (error) {
         this.fail(error);
@@ -1775,9 +2888,16 @@ export class AppStore {
     this.writes.set(id, (this.writes.get(id) ?? 0) + 1);
   }
 
-  private setSettings(id: PhotoId, rs: ResolvedSettings): void {
+  private setSettings(id: PhotoId, next: ResolvedSettings): void {
     this.wrote(id);
-    this.set({ settings: { ...this.state.settings, [id]: rs } });
+    // The reply to a patch usually says what the page already shows (it folded the patch in at once): then nothing is stored and nobody
+    // redraws. What did change comes in as a copy that shares every part that did not (`share`), so a control that reads one field
+    // sees the same field (U-02).
+    const had = this.state.settings[id];
+    const rs = had ? share(had, next) : next;
+    if (rs !== had) this.set({ settings: { ...this.state.settings, [id]: rs } });
+    // The node thumbnails follow every change that has landed: this asks, and the ask waits while a drag or a patch is still out.
+    this.wantNodeThumbnails(id);
   }
 
   /**
@@ -1822,7 +2942,7 @@ export class AppStore {
       const last = sender.queue[sender.queue.length - 1];
       if (last && last.record === null) {
         // The waiting patch belongs to a drag that hasn't ended: fold this one into it.
-        last.patch = { ...last.patch, ...patch };
+        last.patch = foldPatches(last.patch, patch);
         last.record = record;
         last.done.push(resolve);
       } else {
@@ -1837,6 +2957,8 @@ export class AppStore {
     sender.busy = true;
     try {
       for (let item = sender.queue.shift(); item; item = sender.queue.shift()) {
+        // For the timeline of a slider tick (`src/perfTimeline.ts`): a function that does nothing unless the shell was started with YM_PERF.
+        const tick = stampTick(item.record !== null);
         try {
           const reply = await this.api.updateSettings(id, item.patch);
           if (item.record) {
@@ -1845,7 +2967,9 @@ export class AppStore {
           }
           // A newer patch is waiting: its reply will carry everything, so this one is skipped.
           if (sender.queue.length === 0 && this.state.settings[id]) this.setSettings(id, reply);
+          tick.replied();
         } catch (error) {
+          tick.replied(false);
           for (const waiting of sender.queue.splice(0)) for (const done of waiting.done) done();
           this.fail(error);
           await this.resyncSettings(id);
@@ -1895,8 +3019,8 @@ export class AppStore {
   // --- Copy and paste settings --------------------------------------------------------------
 
   /**
-   * Copy settings (⇧⌘C): keeps the current photo's settings for pasting: everything but the crop, the orientation and the Pick white
-   * point, Auto kept as Auto, a white balance that came from a picked white as the manual Kelvin and tint it resolved to. The core
+   * Copy settings (⇧⌘C): keeps the current photo's settings for pasting: the whole graph (every node and every link) but the Input's
+   * crop, orientation and Pick white point, Auto kept as Auto, a white balance that came from a picked white as the manual Kelvin and tint it resolved to. The core
    * makes the patch (`copy_settings`), after the patches still on their way to it have landed. Nothing is saved or put on the system
    * clipboard. Does nothing for a photo that is not developed.
    */
@@ -1965,13 +3089,13 @@ export class AppStore {
         }, 0);
       }
     }
-    const changed = report.pasted.filter((p) => Object.keys(p.before).length > 0 || Object.keys(p.after).length > 0);
+    const changed = report.pasted.filter((p) => !isEmptyPatch(p.before) || !isEmptyPatch(p.after));
     for (const step of changed) {
       this.historyOf(step.id).push({ before: step.before, after: step.after });
       // A crop or a slider drag that was open on the photo when the paste landed records its own step when it ends, from the settings it
       // began with. Those must include the paste, or the step would carry it too and one Undo would take back both.
       const gesture = this.gestures.get(step.id);
-      if (gesture) gesture.base = { ...gesture.base, ...step.after };
+      if (gesture) gesture.base = applyPatch(gesture.base, step.after);
     }
     // What the mirror knew about the other photos is out of date. The photo on screen now (it may not be the one that was when the paste
     // began) and the one that was are read again at once, so neither is left without settings.
@@ -1999,12 +3123,13 @@ export class AppStore {
    */
   private async pickedWhiteSource(copied: CopiedSettings): Promise<PhotoId | null> {
     const id = copied.sourceId;
-    if (id === null || copied.patch.white_balance?.kind !== "manual") return null;
+    if (id === null || copied.patch.nodes?.[INPUT_ID]?.white_balance?.kind !== "manual") return null;
     const photo = this.state.session?.photos.find((p) => p.id === id);
     if (!photo || !isReady(photo)) return null;
     await this.ensureSettings(id);
     const settings = this.state.settings[id]?.settings;
-    const pickedWhite = settings !== undefined && settings.white_pick !== null && settings.light_source === "auto" && settings.white_balance.kind === "auto";
+    const input = settings && inputOf(settings);
+    const pickedWhite = input !== undefined && input.white_pick !== null && input.light_source === "auto" && input.white_balance.kind === "auto";
     return pickedWhite ? id : null;
   }
 
@@ -2024,8 +3149,8 @@ export class AppStore {
     const rs = this.state.settings[photoId];
     const look = this.state.looks?.find((l) => l.id === lookId);
     if (!rs || !look || look.missing) return;
-    const level = intensity ?? rs.values.look_intensity;
-    await this.changeLook(photoId, this.state.applyScope, { look: lookId, look_intensity: level }, true, lookId, level);
+    const level = intensity ?? rs.values.output.look_intensity;
+    await this.changeLook(photoId, this.state.applyScope, outputPatch({ look: lookId, look_intensity: level }), true, lookId, level);
   }
 
   /**
@@ -2036,7 +3161,7 @@ export class AppStore {
     if (photoId === null) return;
     const rs = this.state.settings[photoId];
     if (!rs) return;
-    await this.changeLook(photoId, this.state.applyScope, { look_intensity: level }, final, rs.values.look, level);
+    await this.changeLook(photoId, this.state.applyScope, outputPatch({ look_intensity: level }), final, rs.values.output.look, level);
   }
 
   /** The patch of one photo's look, then (at the end of a gesture) the copy to the photos of the scope. */
@@ -2177,8 +3302,73 @@ export class AppStore {
     }, URL_GRACE_MS);
   }
 
+  /**
+   * The list of stocks and papers of the Film node (`film_catalogue`), read once. A failure is not kept: the next ask reads again, so
+   * the picker that said "Yellowmoon's film data is missing" recovers when the data is back.
+   */
+  filmCatalogue(): Promise<FilmCatalogue> {
+    if (!this.filmCatalogueRead) {
+      const read = this.api.filmCatalogue();
+      this.filmCatalogueRead = read;
+      read.catch(() => {
+        if (this.filmCatalogueRead === read) this.filmCatalogueRead = null;
+      });
+    }
+    return this.filmCatalogueRead;
+  }
+
+  /**
+   * The photo through one stock in Film node `node`, as an image URL, for a tile of the stock picker (`docs/24` section 4.4). `key`
+   * stands for everything about the photo up to and including the node except its stock: the tiles are made again when it changes.
+   * Kept per photo for the session, in memory; a request that failed is not kept. One request is out at a time, in the order they
+   * are asked for; what waits is dropped when the photo's settings change or the person moves to another photo
+   * (`Superseded`, as for {@link lookThumbnail}).
+   */
+  filmTile(photoId: PhotoId, node: number, stock: string, key: string): Promise<string> {
+    const picture = `${node} ${key}`;
+    let entry = this.filmTiles.get(photoId);
+    if (!entry || entry.key !== picture) {
+      if (entry) {
+        this.releaseLater([...entry.urls.values()]);
+        this.filmTileLimiter.supersede((t) => t.photoId === photoId && t.key !== picture);
+      }
+      entry = { key: picture, urls: new Map() };
+      this.filmTiles.set(photoId, entry);
+    }
+    const cache = entry.urls;
+    let tile = cache.get(stock);
+    if (!tile) {
+      const request = this.filmTileLimiter.run({ photoId, key: picture }, () => this.api.filmTile(photoId, node, stock));
+      const made: LookThumb = { promise: request, url: null };
+      tile = made;
+      cache.set(stock, made);
+      made.promise.then(
+        (url) => {
+          made.url = url;
+        },
+        () => {
+          if (cache.get(stock) === made) cache.delete(stock);
+        },
+      );
+    }
+    return tile.promise;
+  }
+
+  /** Drops the address of a stock tile whose picture did not load (the shell keeps a bounded amount of tiles); the next {@link filmTile} asks again. */
+  forgetFilmTile(photoId: PhotoId, node: number, stock: string, key: string, url: string): void {
+    const entry = this.filmTiles.get(photoId);
+    if (entry?.key !== `${node} ${key}`) return;
+    const tile = entry.urls.get(stock);
+    if (tile?.url !== url) return;
+    entry.urls.delete(stock);
+    this.releaseLater([tile]);
+  }
+
   private releaseLookThumbs(): void {
     this.thumbLimiter.supersede(() => true);
+    this.filmTileLimiter.supersede(() => true);
+    for (const entry of this.filmTiles.values()) for (const tile of entry.urls.values()) void tile.promise.then(releaseUrl, () => {});
+    this.filmTiles.clear();
     for (const entry of this.lookThumbs.values()) for (const thumb of entry.urls.values()) void thumb.promise.then(releaseUrl, () => {});
     this.lookThumbs.clear();
   }
@@ -2199,8 +3389,12 @@ export class AppStore {
         this.histogramAgain = false;
         const asked = this.currentId();
         if (asked === null) break;
-        const data = await this.api.histogram(asked);
-        if (this.currentId() === asked) this.set({ histogram: data });
+        // The simple view names no node (Main's); the node view names the selected one (`docs/01`).
+        const at = this.histogramAt;
+        const data = await (at === undefined ? this.api.histogram(asked) : this.api.histogram(asked, at));
+        // An answer for a node the panel has left is not shown; the request for the new one is already waiting.
+        if (this.histogramAt !== at) this.histogramAgain = true;
+        else if (this.currentId() === asked) this.set({ histogram: data });
       } while (this.histogramAgain);
     } catch {
       // The plot stays as it was; the next render asks again.
@@ -2213,11 +3407,14 @@ export class AppStore {
    * The histogram (and, with `readout`, the display values at the middle of the cell) is on show: the Light and Curve tabs call this
    * while they are mounted and call the function it returns when they go. It asks once at once, then after the frames the viewport
    * reports (`render_stats`), at most every {@link HISTOGRAM_THROTTLE_MS}: every request is a job in the one queue of the core that
-   * also draws the viewport, so asking per frame made each frame wait for the plot. Nothing is asked for while nobody watches.
+   * also draws the viewport, so asking per frame made each frame wait for the plot. Nothing is asked for while nobody watches. `at` is
+   * the node whose signal it is (`docs/01`: a corrector's curve input, or `"input"`); left out, Main's. A tab that changes node calls
+   * the function this returns and watches again, which asks at once for the new node.
    */
-  watchHistogram(options: { readout?: boolean } = {}): () => void {
+  watchHistogram(options: { readout?: boolean; at?: NodeId } = {}): () => void {
     const readout = options.readout === true;
     this.histogramWatchers += 1;
+    this.histogramAt = options.at;
     if (readout) this.readoutWatchers += 1;
     void this.requestHistogram();
     if (readout) void this.refreshMiddleReadout();
@@ -2236,10 +3433,10 @@ export class AppStore {
 
   /** A frame was drawn: asks for the histogram once the throttle allows, if anybody watches it. */
   private scheduleHistogram(): void {
-    if (this.histogramWatchers === 0 || this.histogramTimer !== null) return;
+    if (this.histogramWatchers === 0 || this.histogramTimer !== null || gestureHeld()) return;
     this.histogramTimer = setTimeout(() => {
       this.histogramTimer = null;
-      if (this.histogramWatchers === 0) return;
+      if (this.histogramWatchers === 0 || gestureHeld()) return;
       void this.requestHistogram();
       if (this.readoutWatchers > 0) void this.refreshMiddleReadout();
     }, HISTOGRAM_THROTTLE_MS);
@@ -2283,8 +3480,10 @@ export class AppStore {
         this.scatterAgain = false;
         const asked = this.currentId();
         if (asked === null) break;
-        const data = await this.api.chromaScatter(asked);
-        if (this.currentId() === asked) this.set({ chromaScatter: data });
+        const at = this.scatterAt;
+        const data = await (at === undefined ? this.api.chromaScatter(asked) : this.api.chromaScatter(asked, at));
+        if (this.scatterAt !== at) this.scatterAgain = true;
+        else if (this.currentId() === asked) this.set({ chromaScatter: data });
       } while (this.scatterAgain);
     } catch {
       // The dots stay as they were; the next render asks again.
@@ -2296,10 +3495,12 @@ export class AppStore {
   /**
    * The colour warp's plane is on show (the Colour tab calls this while it is mounted and calls the function it returns when it goes):
    * the photo's colours are asked for at once, then after the frames the viewport reports, at most every {@link HISTOGRAM_THROTTLE_MS},
-   * as the histogram is (`watchHistogram`). Nothing is asked for while nobody watches.
+   * as the histogram is (`watchHistogram`). Nothing is asked for while nobody watches. `at` is the node whose warp it is (`docs/01`);
+   * left out, Main's.
    */
-  watchChromaScatter(): () => void {
+  watchChromaScatter(options: { at?: NodeId } = {}): () => void {
     this.scatterWatchers += 1;
+    this.scatterAt = options.at;
     void this.requestChromaScatter();
     let watching = true;
     return () => {
@@ -2315,11 +3516,18 @@ export class AppStore {
 
   /** A frame was drawn: asks for the scatter once the throttle allows, if anybody watches it. */
   private scheduleChromaScatter(): void {
-    if (this.scatterWatchers === 0 || this.scatterTimer !== null) return;
+    if (this.scatterWatchers === 0 || this.scatterTimer !== null || gestureHeld()) return;
     this.scatterTimer = setTimeout(() => {
       this.scatterTimer = null;
-      if (this.scatterWatchers > 0) void this.requestChromaScatter();
+      if (this.scatterWatchers > 0 && !gestureHeld()) void this.requestChromaScatter();
     }, HISTOGRAM_THROTTLE_MS);
+  }
+
+  /** The last gesture (a drag of a knob, a wheel, a pin) ended: the extras that were held back are asked for once. */
+  private afterGesture(): void {
+    if (this.histogramWatchers > 0) void this.requestHistogram();
+    if (this.readoutWatchers > 0) void this.refreshMiddleReadout();
+    if (this.scatterWatchers > 0) void this.requestChromaScatter();
   }
 
   // --- Undo and redo ------------------------------------------------------------------------

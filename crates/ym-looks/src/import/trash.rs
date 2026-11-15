@@ -32,10 +32,21 @@ pub fn move_to_trash(path: &Path) -> Result<(), TrashError> {
     if std::fs::symlink_metadata(path).is_err() {
         return Err(TrashError::Missing(path.to_path_buf()));
     }
-    ::trash::delete(path).map_err(|e| TrashError::Failed {
-        path: path.to_path_buf(),
-        reason: e.to_string(),
-    })
+    #[cfg(not(target_family = "wasm"))]
+    {
+        ::trash::delete(path).map_err(|e| TrashError::Failed {
+            path: path.to_path_buf(),
+            reason: e.to_string(),
+        })
+    }
+    // A WebAssembly build (the iPhone web app) has no system Trash.
+    #[cfg(target_family = "wasm")]
+    {
+        Err(TrashError::Failed {
+            path: path.to_path_buf(),
+            reason: "this build has no system Trash".to_owned(),
+        })
+    }
 }
 
 #[cfg(test)]
