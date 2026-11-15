@@ -371,9 +371,16 @@ impl RawMetadata {
 /// Fails with [`RawError::NotArw`] for files that are not Sony ARW (including SRF, SR2 and
 /// non-TIFF files), [`RawError::Arq`] for pixel-shift ARQ, [`RawError::Corrupt`] for truncated or
 /// malformed files and [`RawError::Io`] when the file cannot be read.
+///
+/// With `YELLOWMOON_DRAFT` set to 2 or 4 the sizes are those of the smaller draft image that
+/// [`crate::decode::decode`] then returns ([`crate::draft`]).
 pub fn probe(path: impl AsRef<Path>) -> Result<RawMetadata, RawError> {
     let source = FileSource::open(path.as_ref())?;
-    probe_source(&source)
+    let meta = probe_source(&source)?;
+    match crate::draft::factor() {
+        1 => Ok(meta),
+        f => Ok(crate::draft::draft_metadata(meta, f)),
+    }
 }
 
 /// Reads the metadata of an ARW held in memory.

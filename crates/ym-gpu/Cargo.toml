@@ -67,3 +67,8 @@ harness = false
 [[bench]]
 name = "cpu_demosaic"
 harness = false
+
+# A WebAssembly build (the iPhone web app) runs on one thread with the CPU path; wgpu's web types are not
+# Send there unless this feature says one thread is all there is (MIT OR Apache-2.0, wgpu itself).
+[target.'cfg(target_family = "wasm")'.dependencies]
+wgpu = { workspace = true, features = ["fragile-send-sync-non-atomic-wasm"] }

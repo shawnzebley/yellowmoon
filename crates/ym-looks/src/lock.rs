@@ -15,7 +15,9 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use fs4::{FileExt, TryLockError};
+#[cfg(not(target_family = "wasm"))]
+use fs4::FileExt;
+use fs4::TryLockError;
 
 /// Name of the lock file inside the `looks` folder.
 pub const LOCK_FILE: &str = ".lock";
@@ -81,7 +83,7 @@ impl LibraryLock {
         let (file, path) = Self::open(looks_dir)?;
         let start = Instant::now();
         loop {
-            match FileExt::try_lock(&file) {
+            match try_lock(&file) {
                 Ok(()) => return Ok(Self { file, path }),
                 Err(TryLockError::WouldBlock) => {
                     let waited = start.elapsed();
@@ -102,7 +104,7 @@ impl LibraryLock {
     /// [`LockError::Io`] when the lock file cannot be created or locked.
     pub fn try_acquire(looks_dir: &Path) -> Result<Option<Self>, LockError> {
         let (file, path) = Self::open(looks_dir)?;
-        match FileExt::try_lock(&file) {
+        match try_lock(&file) {
             Ok(()) => Ok(Some(Self { file, path })),
             Err(TryLockError::WouldBlock) => Ok(None),
             Err(TryLockError::Error(source)) => Err(LockError::Io { path, source }),
@@ -119,8 +121,32 @@ impl LibraryLock {
 impl Drop for LibraryLock {
     fn drop(&mut self) {
         // Closing the file releases the lock anyway; unlocking first makes the release prompt.
-        let _ = FileExt::unlock(&self.file);
+        unlock(&self.file);
     }
+}
+
+/// Tries the cross-process lock. A WebAssembly build (the iPhone web app) runs as one process with no
+/// file locks, so the lock is always free there.
+fn try_lock(file: &File) -> Result<(), TryLockError> {
+    #[cfg(not(target_family = "wasm"))]
+    {
+        FileExt::try_lock(file)
+    }
+    #[cfg(target_family = "wasm")]
+    {
+        let _ = file;
+        Ok(())
+    }
+}
+
+/// Lets go of the lock (see [`try_lock`]).
+fn unlock(file: &File) {
+    #[cfg(not(target_family = "wasm"))]
+    {
+        let _ = FileExt::unlock(file);
+    }
+    #[cfg(target_family = "wasm")]
+    let _ = file;
 }
 
 #[cfg(test)]

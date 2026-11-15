@@ -108,8 +108,15 @@ pub struct DecodeOptions {
 ///
 /// Errors from the probe (`NotArw`, `Arq`, `Corrupt`, `Io`) are returned as they are; ARW 6.0 and
 /// layouts this crate cannot classify are [`RawError::Unsupported`].
+///
+/// With `YELLOWMOON_DRAFT` set to 2 or 4 the image comes back that many times smaller along each
+/// edge, for quick previews ([`crate::draft`]).
 pub fn decode(path: impl AsRef<Path>) -> Result<RawImage, RawError> {
-    decode_with(path, &DecodeOptions::default())
+    let raw = decode_with(path, &DecodeOptions::default())?;
+    match crate::draft::factor() {
+        1 => Ok(raw),
+        f => Ok(crate::draft::draft_image(raw, f)),
+    }
 }
 
 /// Like [`decode`], with explicit options.

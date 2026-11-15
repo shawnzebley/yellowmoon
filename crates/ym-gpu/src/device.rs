@@ -1061,7 +1061,7 @@ fn write_atomically(path: &Path, data: &[u8]) -> std::io::Result<()> {
     // through the same temporary file.
     let tmp = path.with_extension(format!(
         "tmp{}-{}",
-        std::process::id(),
+        process_id(),
         WRITES.fetch_add(1, Ordering::Relaxed)
     ));
     let result = std::fs::write(&tmp, data).and_then(|()| std::fs::rename(&tmp, path));
@@ -1272,6 +1272,19 @@ impl Gpu {
 /// Whether the environment demands a GPU (`YM_REQUIRE_GPU=1`, the `gpu-lavapipe` CI job).
 pub fn gpu_required_by_env() -> bool {
     std::env::var("YM_REQUIRE_GPU").is_ok_and(|v| !v.is_empty() && v != "0")
+}
+
+/// The process id for unique temporary names. WASI (the iPhone web app's build) has no process ids;
+/// one process runs there, so any constant is unique.
+fn process_id() -> u32 {
+    #[cfg(not(target_os = "wasi"))]
+    {
+        std::process::id()
+    }
+    #[cfg(target_os = "wasi")]
+    {
+        1
+    }
 }
 
 #[cfg(test)]

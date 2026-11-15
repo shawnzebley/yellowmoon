@@ -359,7 +359,7 @@ pub fn stage_write(dest: &Path, bytes: &[u8]) -> io::Result<PathBuf> {
         .unwrap_or_default();
     let temp = dir.join(format!(
         ".{name}.tmp-{}-{}",
-        std::process::id(),
+        process_id(),
         TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
     ));
     let result = (|| {
@@ -478,6 +478,19 @@ pub fn atomic_write(dest: &Path, bytes: &[u8]) -> io::Result<()> {
         sync_dir(dir);
     }
     Ok(())
+}
+
+/// The process id for unique temporary names. WASI (the iPhone web app's build) has no process ids;
+/// one process runs there, so any constant is unique.
+fn process_id() -> u32 {
+    #[cfg(not(target_os = "wasi"))]
+    {
+        std::process::id()
+    }
+    #[cfg(target_os = "wasi")]
+    {
+        1
+    }
 }
 
 #[cfg(test)]

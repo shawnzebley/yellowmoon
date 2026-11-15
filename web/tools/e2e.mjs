@@ -1,0 +1,28 @@
+import { chromium } from 'playwright-core';
+const [url, raw, out] = process.argv.slice(2);
+const b = await chromium.launch({ executablePath: process.env.CHROME || '/usr/bin/google-chrome', args: ['--no-sandbox'] });
+const ctx = await b.newContext({ viewport: { width: 430, height: 932 }, deviceScaleFactor: 1, acceptDownloads: true });
+const p = await ctx.newPage();
+p.on('pageerror', (e) => console.log('[pageerror]', e.message));
+p.on('console', (m) => { const t = m.text(); if (!t.startsWith('[ym]') || /error|panick/i.test(t)) console.log('[page]', t.slice(0, 300)); });
+const st = () => p.textContent('#status');
+await p.goto(url);
+await p.waitForFunction(() => document.querySelector('#status').textContent === 'Ready', null, { timeout: 120000 });
+console.log('isolated:', await p.evaluate(() => crossOriginIsolated));
+await p.setInputFiles('#file', raw);
+await p.waitForFunction(() => /Preview in|didn't|enough memory/.test(document.querySelector('#status').textContent), null, { timeout: 300000 });
+console.log('1:', await st());
+await p.screenshot({ path: out + '/shot-1.png' });
+// change: neutral look + exposure + tungsten + lens
+await p.click('#look [data-v=neutral]');
+await p.waitForTimeout(300);
+await p.$eval('#exposure', (e) => { e.value = '0.7'; e.dispatchEvent(new Event('input')); e.dispatchEvent(new Event('change')); });
+await p.click('#lens [data-v=vintage]');
+await p.waitForFunction(() => /Preview in/.test(document.querySelector('#status').textContent) && document.querySelector('#busy').hidden, null, { timeout: 300000 });
+console.log('2:', await st());
+await p.screenshot({ path: out + '/shot-2.png', fullPage: false });
+const dl = p.waitForEvent('download', { timeout: 600000 });
+await p.click('#export');
+const d = await dl; await d.saveAs(out + '/' + d.suggestedFilename());
+console.log('3:', await st(), d.suggestedFilename());
+await b.close();

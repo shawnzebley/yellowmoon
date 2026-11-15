@@ -11,6 +11,7 @@
 #![warn(missing_docs)]
 
 pub mod decode;
+pub mod draft;
 pub mod error;
 pub mod exif;
 pub mod layout;

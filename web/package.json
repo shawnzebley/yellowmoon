@@ -1,0 +1,13 @@
+{
+  "name": "yellowmoon-web",
+  "private": true,
+  "type": "module",
+  "description": "Yellowmoon for iPhone: the ym CLI as WebAssembly in the browser. Only the end-to-end check has dependencies.",
+  "scripts": {
+    "build": "./build.sh",
+    "e2e": "node tools/e2e.mjs"
+  },
+  "devDependencies": {
+    "playwright-core": "^1.56.0"
+  }
+}

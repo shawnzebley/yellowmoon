@@ -38,9 +38,6 @@ serde_json.workspace = true
 png.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
-# Ctrl-C (and SIGTERM): finish the current tile, delete the partial file, exit 130 (docs/10).
-# MIT OR Apache-2.0.
-ctrlc = { version = "3", features = ["termination"] }
 
 [features]
 # TEST-ONLY. Builds `ym` so that the environment variable `YM_FORCE_DEMOSAIC=<method name>` picks the
@@ -67,3 +64,8 @@ predicates.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
 insta.workspace = true
+
+# Ctrl-C (and SIGTERM): finish the current tile, delete the partial file, exit 130 (docs/10).
+# MIT OR Apache-2.0. A WebAssembly build (the iPhone web app) has no signals.
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+ctrlc = { version = "3", features = ["termination"] }

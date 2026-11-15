@@ -300,6 +300,16 @@ fn read_exact_at(file: &File, mut buf: &mut [u8], mut offset: u64) -> io::Result
     Ok(())
 }
 
+/// WASI (the iPhone web app's build) runs on one thread, so a seek and a read on the shared handle
+/// cannot interleave with another reader.
+#[cfg(target_os = "wasi")]
+fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<()> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = file;
+    f.seek(SeekFrom::Start(offset))?;
+    f.read_exact(buf)
+}
+
 /// One 12-byte directory entry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Entry {

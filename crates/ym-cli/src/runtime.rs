@@ -3,6 +3,10 @@
 //! providers' advisors (Apple's `ym_apple::system_advisor`, the app's too, `docs/19`, and the two
 //! programs' `ym_agents::system_advisors`, `docs/22`).
 
+// The WebAssembly build (the iPhone web app) has no signals and starts no programs, so the Ctrl-C
+// and agent parts below go unused there.
+#![cfg_attr(target_family = "wasm", allow(unused))]
+
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock, mpsc};
 use std::time::Duration;
@@ -85,6 +89,10 @@ fn auto_programs_stopping() -> bool {
 /// always ends the process at once. Before any of that the handler stops the Auto programs and
 /// waits for them ([`stop_auto_programs`]): a program is not stopped by its parent's death on Unix.
 pub fn install_interrupt_handler() {
+    // A WebAssembly build (the iPhone web app) has no signals to catch.
+    #[cfg(target_family = "wasm")]
+    return;
+    #[cfg(not(target_family = "wasm"))]
     let result = ctrlc::set_handler(|| {
         // Before anything that can wake the command up (stopping the programs cancels the probe a
         // command waits for): `main` must see that a signal is being handled.
@@ -98,6 +106,7 @@ pub fn install_interrupt_handler() {
         }
         HANDLING.store(false, Ordering::SeqCst);
     });
+    #[cfg(not(target_family = "wasm"))]
     if let Err(error) = result {
         tracing::warn!(%error, "could not install the Ctrl-C handler");
     }
@@ -164,6 +173,8 @@ pub const AUTO_SETTLE: Duration = Duration::from_secs(30);
 pub fn system_provider_advisors() -> ProviderAdvisors {
     let mut advisors =
         ProviderAdvisors::default().with(AutoProvider::Apple, ym_apple::system_advisor());
+    // A WebAssembly build (the iPhone web app) starts no other programs, so it has no agent advisors.
+    #[cfg(not(target_family = "wasm"))]
     for (provider, advisor) in ym_agents::system_advisors(StartProbe::Never) {
         advisors = advisors.with(provider, advisor);
     }

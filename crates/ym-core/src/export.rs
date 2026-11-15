@@ -1853,10 +1853,18 @@ pub fn folder_label(dir: &Path) -> String {
 /// left out, never invented).
 #[must_use]
 pub fn free_bytes_in(dir: &Path) -> Option<u64> {
-    dir.ancestors()
+    let existing = dir
+        .ancestors()
         .filter(|a| !a.as_os_str().is_empty())
-        .find(|a| a.exists())
-        .and_then(|a| fs4::available_space(a).ok())
+        .find(|a| a.exists());
+    // A WebAssembly build (the iPhone web app) writes to memory, which has no volume to read.
+    #[cfg(target_family = "wasm")]
+    {
+        let _ = existing;
+        None
+    }
+    #[cfg(not(target_family = "wasm"))]
+    existing.and_then(|a| fs4::available_space(a).ok())
 }
 
 /// The destination folder an export of `photo` would use, worked out without touching the disk:

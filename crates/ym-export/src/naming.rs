@@ -193,7 +193,7 @@ static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 fn temp_name() -> String {
     format!(
         ".yellowmoon-{}-{}.tmp",
-        std::process::id(),
+        process_id(),
         TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
     )
 }
@@ -588,6 +588,19 @@ where
     // The fault hook of the tests (nothing in a normal build): the file is complete, the disk "fills" now.
     crate::fault::check_write(pending.size()).map_err(|e| ExportError::io(dir, e))?;
     pending.commit(stem, ext, if_exists, source)
+}
+
+/// The process id for unique temporary names. WASI (the iPhone web app's build) has no process ids;
+/// one process runs there, so any constant is unique.
+fn process_id() -> u32 {
+    #[cfg(not(target_os = "wasi"))]
+    {
+        std::process::id()
+    }
+    #[cfg(target_os = "wasi")]
+    {
+        1
+    }
 }
 
 #[cfg(test)]
