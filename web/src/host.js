@@ -277,12 +277,17 @@ onmessage = async (ev) => {
     postMessage({ t: 'file', id: m.id, data, names: n && n.dir ? children(norm(m.path)) : null }, data ? [data.buffer] : []);
   } else if (m.t === 'run') {
     if (run || !limits) { postMessage({ t: 'exit', id: m.id, code: -1, ms: 0, busy: !!run }); return; }
-    // A fresh memory each run: wasm memory cannot shrink, and each `ym` run starts from nothing.
-    memory = null;
-    // iOS may refuse to reserve the full 4 GiB; a smaller maximum is still a valid import.
-    for (const max of [limits.max, 49152, 32768, 24576, 16384]) {
-      if (max > limits.max) continue;
-      try { memory = new WebAssembly.Memory({ initial: limits.min, maximum: max, shared: true }); run_maxPages = max; break; } catch { /* try smaller */ }
+    // Reuse one memory across runs. Each new WebAssembly.Memory reserves its full maximum, and iOS
+    // frees the old reservations late, so a fresh one per run soon fails with "not enough memory"
+    // even with nothing else open. Zeroing it resets the module's statics, its init flag and heap.
+    if (memory) new Uint8Array(memory.buffer).fill(0);
+    else {
+      // iOS may refuse to reserve the full 4 GiB; try smaller maximums down to 256 MiB, which
+      // still fits a draft preview. Exports that need more fail inside ym with its own message.
+      for (const max of [limits.max, 49152, 32768, 24576, 16384, 12288, 8192, 6144, 4096]) {
+        if (max > limits.max || max < limits.min) continue;
+        try { memory = new WebAssembly.Memory({ initial: limits.min, maximum: max, shared: true }); run_maxPages = max; break; } catch { /* try smaller */ }
+      }
     }
     if (!memory) { postMessage({ t: 'exit', id: m.id, code: -3, ms: 0 }); return; }
     run = { id: m.id, args: m.args, env: m.env, workers: new Set(), start: performance.now(), done: false };
