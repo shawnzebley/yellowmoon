@@ -56,6 +56,7 @@ async function boot() {
   const ready = new Promise((res) => waiters.set('ready', res));
   host.postMessage({ t: 'init', wasm, files: unpack(pack) }, [wasm]);
   await ready;
+  $('file').disabled = false; $('open-btn').removeAttribute('aria-disabled');
   status('Ready');
 }
 
@@ -108,6 +109,7 @@ function explain(r) {
 
 async function preview() {
   if (!photo) return;
+  if (exported) clearExported();
   if (running === 'export') { pending = true; return; }
   if (running === 'preview') { pending = true; host.postMessage({ t: 'cancel' }); return; }
   running = 'preview'; pending = false; $('busy').hidden = false; status('Rendering preview…');
@@ -138,13 +140,11 @@ async function exportPhoto() {
   if (!r.data) { status(explain(r) || 'Export stopped.'); return; }
   const type = fmt === 'jpeg' ? 'image/jpeg' : 'image/tiff';
   const file = new File([r.data], r.name.replace(/^photo/, photo.base), { type });
-  status(`Exported in ${(r.ms / 1000).toFixed(0)} s`);
-  if (navigator.canShare?.({ files: [file] })) {
-    try { await navigator.share({ files: [file] }); } catch { /* the person closed the sheet */ }
-  } else {
-    const a = document.createElement('a'); a.href = URL.createObjectURL(file); a.download = file.name; a.click();
-    setTimeout(() => URL.revokeObjectURL(a.href), 60000);
-  }
+  // A full-size render outlasts the Export tap's user activation, and iOS refuses a share without
+  // one. So the file waits behind a Save button that shares from its own tap.
+  exported = file;
+  $('export').hidden = true; $('save').hidden = false;
+  status(`Exported in ${(r.ms / 1000).toFixed(0)} s. Tap Save to keep it.`);
   if (pending) { pending = false; preview(); }
 }
 
@@ -181,6 +181,20 @@ $('reset').addEventListener('click', () => {
   preview();
 });
 $('export').addEventListener('click', exportPhoto);
+let exported = null;
+function clearExported() { exported = null; $('save').hidden = true; $('export').hidden = false; }
+$('save').addEventListener('click', async () => {
+  if (!exported) return;
+  const file = exported;
+  if (navigator.canShare?.({ files: [file] })) {
+    try { await navigator.share({ files: [file] }); clearExported(); status('Saved'); }
+    catch (e) { if (e?.name !== 'AbortError') status(`Couldn't open the share sheet: ${e?.message || e}`); }
+  } else {
+    const a = document.createElement('a'); a.href = URL.createObjectURL(file); a.download = file.name; a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 60000);
+    clearExported(); status('Saved');
+  }
+});
 $('file').addEventListener('change', async () => {
   const f = $('file').files[0]; if (!f) return;
   if (!/\.arw$/i.test(f.name)) { status('That isn\'t an ARW file. Pick the raw from the Files app.'); return; }

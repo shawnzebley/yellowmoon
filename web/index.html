@@ -105,9 +105,10 @@
   </main>
 
   <nav>
-    <label class="btn" id="open-btn">Open<input type="file" id="file" accept=".arw,.ARW,image/x-sony-arw" hidden></label>
+    <label class="btn" id="open-btn" aria-disabled="true">Open<input type="file" id="file" accept=".arw,.ARW,image/x-sony-arw" hidden disabled></label>
     <button class="btn" id="reset" disabled>Reset</button>
     <button class="btn primary" id="export" disabled>Export</button>
+    <button class="btn primary" id="save" hidden>Save</button>
   </nav>
 
   <script type="module" src="app.js"></script>

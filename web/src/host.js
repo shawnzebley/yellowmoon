@@ -276,7 +276,7 @@ onmessage = async (ev) => {
     const data = n && !n.dir ? n.data.slice(0, n.size) : null;
     postMessage({ t: 'file', id: m.id, data, names: n && n.dir ? children(norm(m.path)) : null }, data ? [data.buffer] : []);
   } else if (m.t === 'run') {
-    if (run) { postMessage({ t: 'exit', id: m.id, code: -1, ms: 0, busy: true }); return; }
+    if (run || !limits) { postMessage({ t: 'exit', id: m.id, code: -1, ms: 0, busy: !!run }); return; }
     // A fresh memory each run: wasm memory cannot shrink, and each `ym` run starts from nothing.
     memory = null;
     // iOS may refuse to reserve the full 4 GiB; a smaller maximum is still a valid import.

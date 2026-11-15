@@ -300,11 +300,17 @@ fn read_exact_at(file: &File, mut buf: &mut [u8], mut offset: u64) -> io::Result
     Ok(())
 }
 
-/// WASI (the iPhone web app's build) runs on one thread, so a seek and a read on the shared handle
-/// cannot interleave with another reader.
+/// WASI (the iPhone web app's build) has no stable positioned read, so this seeks and reads. The web
+/// build runs several decoder threads (tiled Lossless L/M/S read tiles in parallel), so one lock
+/// keeps each seek and its read together.
 #[cfg(target_os = "wasi")]
 fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<()> {
     use std::io::{Read, Seek, SeekFrom};
+    static SEEK_READ: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // A poisoned lock only means another reader panicked; the guard holds no data.
+    let _guard = SEEK_READ
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut f = file;
     f.seek(SeekFrom::Start(offset))?;
     f.read_exact(buf)
