@@ -10,6 +10,13 @@ The current state of Yellowmoon: release, milestone, what is built, gate results
 - **What it is:** a free, open-source macOS raw processor for Sony ARW files. It renders each photo the way an ARRI ALEXA (ALEV III sensor) would, through spectral sensor emulation, a LogC4 / ACES 2 colour pipeline and small learned models, with very few controls. Rust crates under `crates/` hold all image processing; a Tauri + React app and the `ym` CLI are the two front ends.
 - **Workflow:** work is on `main`; a version bump on `main` publishes a release (`docs/12-distribution.md`).
 
+## iPhone preview (Windows fork)
+
+Added a native iOS 17 preview for on-device Sony RAW develop, look and exposure
+adjustments, and JPEG sharing. The simulator CI compiles the Rust bridge and
+SwiftUI app. Physical iPhone import, export, memory and speed are release
+checks still to be run. [Build guide](../mobile/ios/README.md).
+
 ## Windows fork upstream sync (2026-11-15)
 
 Merged upstream `119db7f7` (711 commits since the October sync, including v0.2.3).

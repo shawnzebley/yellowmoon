@@ -11397,6 +11397,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "ym-mobile"
+version = "0.2.3"
+dependencies = [
+ "tempfile",
+ "ym-core",
+ "ym-export",
+ "ym-looks",
+ "ym-raw",
+]
+
+[[package]]
 name = "ym-noise"
 version = "0.2.3"
 dependencies = [

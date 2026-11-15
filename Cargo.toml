@@ -11,6 +11,7 @@ members = [
     "crates/ym-gpu",
     "crates/ym-noise",
     "crates/ym-ml",
+    "crates/ym-mobile",
     "crates/ym-lens",
     "crates/ym-looks",
     "crates/ym-export",
