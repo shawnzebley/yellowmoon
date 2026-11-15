@@ -43,7 +43,10 @@ targets:
           - "-framework"
           - CoreFoundation
           - "-framework"
-          - Security
+          - CoreGraphics
+          - "-framework"
+          - Foundation
+          - "-lobjc"
           - "-liconv"
 schemes:
   Yellowmoon:
