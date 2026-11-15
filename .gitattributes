@@ -1,0 +1,4 @@
+# Data files are checked byte for byte against their SHA256SUMS (tools/licences/generate.py and the
+# loaders). Git on Windows would turn LF into CRLF in the text ones (JSON profiles, LICENSE files) and
+# break the hashes, so nothing under data/ gets line-ending conversion.
+data/** -text
