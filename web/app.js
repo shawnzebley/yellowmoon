@@ -63,18 +63,32 @@ async function boot() {
 // ---- settings → `ym render` options --------------------------------------------------------------
 const chip = (group) => $(group).querySelector('[aria-checked=true]').dataset.v;
 const num = (id) => Number($(id).value);
-function options() {
+// `fast` is the quick first pass of a preview: no noise reduction and no output sharpening, which
+// together are most of a preview's time. The full pass follows it straight away.
+function options(fast = false) {
   const o = ['--look', chip('look')];
   if (num('intensity') !== 100) o.push('--intensity', String(num('intensity')));
   if (num('exposure') !== 0) o.push('--exposure-offset', num('exposure').toFixed(1));
+  if (num('brightness') !== 0) o.push('--brightness', String(num('brightness')));
   for (const k of ['contrast', 'highlights', 'shadows', 'white', 'black', 'saturation']) if (num(k) !== 0) o.push(`--${k}`, String(num(k)));
   const light = chip('light');
   if (light === 'custom') o.push('--wb', `${num('kelvin')},${num('tint')}`);
   else if (light !== 'auto') o.push('--light', light);
   const lens = chip('lens');
   if (lens) o.push('--lens', lens, '--flares', String(num('flares')), '--edges', String(num('edges')), '--anamorphic', String(num('anamorphic')));
+  if (fast) o.push('--nr', '0,0,0');
+  else if (chip('nr') === 'manual') o.push('--nr', `${num('nr-l')},${num('nr-c')},${num('nr-d')}`);
+  if (chip('sharpen') === 'manual') o.push('--sharpen', `${num('sh-amount')},${num('sh-radius').toFixed(1)}`);
+  if (num('roll-hi') !== 0.6 || num('roll-lo') !== 0.5) o.push('--rolloff', `${num('roll-hi').toFixed(2)},${num('roll-lo').toFixed(2)}`);
+  if (!$('hl-recovery').checked) o.push('--no-highlight-recovery');
+  if (!$('lens-corr').checked) o.push('--no-lens');
+  if (!$('ca-corr').checked) o.push('--no-ca');
+  const crop = chip('crop');
+  if (crop) o.push(`--auto-crop=${crop}`);
   return o;
 }
+// Groups and inputs that only change the exported file, not the preview.
+const EXPORT_ONLY = new Set(['format', 'size', 'space', 'bits', 'quality']);
 
 // ---- running ym ---------------------------------------------------------------------------------
 let photo = null; // {name, path}
@@ -88,10 +102,11 @@ const env = (draft) => ({
   ...(draft ? { YELLOWMOON_DRAFT: String(draft) } : {}),
 });
 
-async function runYm(args, draft) {
+async function runYm(args, draft, maxPages = 0) {
   host.postMessage({ t: 'rm', prefix: '/out/' });
+  logLines.length = 0; // an error message quotes this run's output, not an earlier one's
   const t0 = performance.now();
-  const ex = await request({ t: 'run', args: ['ym', 'render', '--cpu', ...args, photo.path, '--out', '/out', '--overwrite'], env: env(draft) });
+  const ex = await request({ t: 'run', maxPages, args: ['ym', 'render', '--cpu', ...args, photo.path, '--out', '/out', '--overwrite'], env: env(draft) });
   if (ex.code !== 0) return { error: ex.code, ms: ex.ms, maxPages: ex.maxPages };
   const dir = await request({ t: 'get', path: '/out' });
   const name = (dir.names || [])[0];
@@ -107,22 +122,44 @@ function explain(r) {
   return last ? `It didn't work: ${last}` : `It didn't work (code ${r.error}).`;
 }
 
+// Memory a preview may grow to, in 64 KiB pages: 768 MiB. A 33 MP draft preview peaks near 260 MiB.
+// Exports ask for the most the phone will give (a 33 MP full-size export peaks near 1.3 GiB).
+const PREVIEW_PAGES = 12288;
+
+// The preview is sized to the screen area it is shown in, not the whole screen: fewer pixels to
+// resize, sharpen and encode on every change.
+function previewEdge() {
+  const dpr = devicePixelRatio || 2;
+  const css = Math.max($('stage').clientWidth || screen.width, innerHeight * 0.52);
+  return Math.min(2048, Math.max(640, Math.round(css * dpr)));
+}
+
 async function preview() {
   if (!photo) return;
   if (exported) clearExported();
   if (running === 'export') { pending = true; return; }
   if (running === 'preview') { pending = true; host.postMessage({ t: 'cancel' }); return; }
-  running = 'preview'; pending = false; $('busy').hidden = false; status('Rendering preview…');
-  const edge = Math.min(2048, Math.round(Math.max(screen.width, screen.height) * (devicePixelRatio || 2)));
-  const r = await runYm([...options(), '--format', 'jpeg', '--quality', '85', '--long-edge', String(edge), '--output-sharpening', '60', '--name', 'preview'], 4);
+  running = 'preview'; pending = false; $('busy').hidden = false;
+  const outSharp = String(Math.round(num('out-sharpen') * 0.6));
+  const base = ['--format', 'jpeg', '--quality', '85', '--long-edge', String(previewEdge()), '--name', 'preview'];
+  // Pass 1: quick look. Pass 2: the full preview, unless something changed meanwhile.
+  let r = null; let quick = 0;
+  for (const fast of [true, false]) {
+    status(fast ? 'Rendering preview…' : 'Refining…');
+    r = await runYm([...options(fast), ...base, '--output-sharpening', fast ? '0' : outSharp], 4, PREVIEW_PAGES);
+    if (r.data) show(r.data);
+    if (fast) quick = r.ms;
+    if (!r.data || pending) break;
+  }
   running = null;
-  if (r.data) {
-    if (previewUrl) URL.revokeObjectURL(previewUrl);
-    previewUrl = URL.createObjectURL(new Blob([r.data], { type: 'image/jpeg' }));
-    $('preview').src = previewUrl; $('preview').hidden = false; $('empty').hidden = true;
-    status(`Preview in ${(r.ms / 1000).toFixed(1)} s`);
-  } else { const why = explain(r); if (why) status(why); }
+  if (r.data && !pending) status(`Preview in ${(quick / 1000).toFixed(1)} s, final in ${((quick + r.ms) / 1000).toFixed(1)} s`);
+  else if (!r.data) { const why = explain(r); if (why) status(why); }
   if (pending) { pending = false; preview(); } else $('busy').hidden = true;
+}
+function show(data) {
+  if (previewUrl) URL.revokeObjectURL(previewUrl);
+  previewUrl = URL.createObjectURL(new Blob([data], { type: 'image/jpeg' }));
+  $('preview').src = previewUrl; $('preview').hidden = false; $('empty').hidden = true;
 }
 
 async function exportPhoto() {
@@ -131,14 +168,15 @@ async function exportPhoto() {
   running = 'export'; $('busy').hidden = false; $('export').disabled = true;
   const fmt = chip('format'); const size = chip('size');
   status('Exporting at full quality. This takes a minute or two…');
-  const opts = [...options(), '--format', fmt];
-  if (fmt === 'jpeg') opts.push('--quality', '95'); else opts.push('--bits', '16');
-  if (size) opts.push('--long-edge', size);
+  const opts = [...options(), '--format', fmt, '--output-sharpening', String(num('out-sharpen'))];
+  if (fmt === 'jpeg') opts.push('--quality', String(num('quality')));
+  if (fmt === 'tiff' || fmt === 'png') opts.push('--bits', chip('bits'));
+  if (fmt !== 'dng') { opts.push('--colour-space', chip('space')); if (size) opts.push('--long-edge', size); }
   opts.push('--name', '{name}_{look}');
   const r = await runYm(opts, 0);
   running = null; $('busy').hidden = true; $('export').disabled = false;
   if (!r.data) { status(explain(r) || 'Export stopped.'); return; }
-  const type = fmt === 'jpeg' ? 'image/jpeg' : 'image/tiff';
+  const type = { jpeg: 'image/jpeg', tiff: 'image/tiff', png: 'image/png', dng: 'image/x-adobe-dng' }[fmt];
   const file = new File([r.data], r.name.replace(/^photo/, photo.base), { type });
   // A full-size render outlasts the Export tap's user activation, and iOS refuses a share without
   // one. So the file waits behind a Save button that shares from its own tap.
@@ -159,9 +197,9 @@ function showValue(input) {
 for (const input of document.querySelectorAll('input[type=range]')) {
   defaults.set(input.id, input.value); showValue(input);
   input.addEventListener('input', () => showValue(input));
-  input.addEventListener('change', () => preview());
+  input.addEventListener('change', () => { if (!EXPORT_ONLY.has(input.id)) preview(); });
   // Double-tap a slider's label to put it back.
-  input.parentElement.addEventListener('dblclick', (e) => { if (e.target !== input) { input.value = defaults.get(input.id); showValue(input); preview(); } });
+  input.parentElement.addEventListener('dblclick', (e) => { if (e.target !== input) { input.value = defaults.get(input.id); showValue(input); if (!EXPORT_ONLY.has(input.id)) preview(); } });
 }
 for (const group of document.querySelectorAll('.chips')) {
   group.addEventListener('click', (e) => {
@@ -169,17 +207,26 @@ for (const group of document.querySelectorAll('.chips')) {
     for (const x of group.children) x.setAttribute('aria-checked', String(x === b));
     if (group.id === 'light') $('wb-custom').hidden = b.dataset.v !== 'custom';
     if (group.id === 'lens') $('lens-amounts').hidden = !b.dataset.v;
-    if (group.id !== 'format' && group.id !== 'size') preview();
+    if (group.id === 'nr') $('nr-amounts').hidden = b.dataset.v !== 'manual';
+    if (group.id === 'sharpen') $('sharpen-amounts').hidden = b.dataset.v !== 'manual';
+    if (group.id === 'format') {
+      $('quality-row').hidden = b.dataset.v !== 'jpeg';
+      $('bits').hidden = b.dataset.v !== 'tiff' && b.dataset.v !== 'png';
+      $('space').hidden = $('size').hidden = b.dataset.v === 'dng';
+    }
+    if (!EXPORT_ONLY.has(group.id)) preview();
   });
 }
 $('reset').addEventListener('click', () => {
   for (const [id, v] of defaults) { $(id).value = v; showValue($(id)); }
-  for (const group of document.querySelectorAll('.chips')) if (group.id !== 'format' && group.id !== 'size') {
+  for (const t of document.querySelectorAll('input[type=checkbox]')) t.checked = true;
+  for (const group of document.querySelectorAll('.chips')) if (!EXPORT_ONLY.has(group.id)) {
     [...group.children].forEach((x, i) => x.setAttribute('aria-checked', String(i === 0)));
   }
-  $('wb-custom').hidden = true; $('lens-amounts').hidden = true;
+  $('wb-custom').hidden = true; $('lens-amounts').hidden = true; $('nr-amounts').hidden = true; $('sharpen-amounts').hidden = true;
   preview();
 });
+for (const t of document.querySelectorAll('input[type=checkbox]')) t.addEventListener('change', () => preview());
 $('export').addEventListener('click', exportPhoto);
 let exported = null;
 function clearExported() { exported = null; $('save').hidden = true; $('export').hidden = false; }

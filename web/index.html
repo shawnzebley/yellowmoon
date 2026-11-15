@@ -43,6 +43,7 @@
       <div class="group">
         <h2>Light</h2>
         <label class="row">Exposure <output></output><input type="range" id="exposure" min="-3" max="3" step="0.1" value="0" data-unit=" EV"></label>
+        <label class="row">Brightness <output></output><input type="range" id="brightness" min="-100" max="100" value="0"></label>
         <label class="row">Contrast <output></output><input type="range" id="contrast" min="-100" max="100" value="0"></label>
         <label class="row">Highlights <output></output><input type="range" id="highlights" min="-100" max="100" value="0"></label>
         <label class="row">Shadows <output></output><input type="range" id="shadows" min="-100" max="100" value="0"></label>
@@ -88,16 +89,70 @@
       </div>
 
       <div class="group">
+        <h2>Detail</h2>
+        <div class="chips" id="nr" role="radiogroup" aria-label="Noise reduction">
+          <button data-v="auto" aria-checked="true" role="radio">Noise: Auto</button>
+          <button data-v="manual" aria-checked="false" role="radio">Manual</button>
+        </div>
+        <div id="nr-amounts" hidden>
+          <label class="row">Luminance noise <output></output><input type="range" id="nr-l" min="0" max="100" value="30"></label>
+          <label class="row">Colour noise <output></output><input type="range" id="nr-c" min="0" max="100" value="50"></label>
+          <label class="row">Keep detail <output></output><input type="range" id="nr-d" min="0" max="100" value="50"></label>
+        </div>
+        <div class="chips" id="sharpen" role="radiogroup" aria-label="Sharpening">
+          <button data-v="auto" aria-checked="true" role="radio">Sharpening: Auto</button>
+          <button data-v="manual" aria-checked="false" role="radio">Manual</button>
+        </div>
+        <div id="sharpen-amounts" hidden>
+          <label class="row">Amount <output></output><input type="range" id="sh-amount" min="0" max="300" value="100"></label>
+          <label class="row">Radius <output></output><input type="range" id="sh-radius" min="0.3" max="2.5" step="0.1" value="0.8" data-unit=" px"></label>
+        </div>
+        <label class="row">Output sharpening <output></output><input type="range" id="out-sharpen" min="0" max="200" value="100" data-unit="%"></label>
+      </div>
+
+      <div class="group">
+        <h2>Raw</h2>
+        <label class="row">Highlight range <output></output><input type="range" id="roll-hi" min="0" max="1" step="0.05" value="0.6"></label>
+        <label class="row">Low-light toe <output></output><input type="range" id="roll-lo" min="0" max="1" step="0.05" value="0.5"></label>
+        <label class="toggle">Highlight recovery <input type="checkbox" id="hl-recovery" checked></label>
+        <label class="toggle">Lens corrections <input type="checkbox" id="lens-corr" checked></label>
+        <label class="toggle">Colour fringe correction <input type="checkbox" id="ca-corr" checked></label>
+      </div>
+
+      <div class="group">
+        <h2>Crop</h2>
+        <div class="chips" id="crop" role="radiogroup" aria-label="Auto crop">
+          <button data-v="" aria-checked="true" role="radio">None</button>
+          <button data-v="original" aria-checked="false" role="radio">Straighten</button>
+          <button data-v="1:1" aria-checked="false" role="radio">1:1</button>
+          <button data-v="4:5" aria-checked="false" role="radio">4:5</button>
+          <button data-v="16:9" aria-checked="false" role="radio">16:9</button>
+        </div>
+      </div>
+
+      <div class="group">
         <h2>Export</h2>
         <div class="chips" id="format" role="radiogroup" aria-label="Format">
           <button data-v="jpeg" aria-checked="true" role="radio">JPEG</button>
-          <button data-v="tiff" aria-checked="false" role="radio">TIFF 16-bit</button>
+          <button data-v="tiff" aria-checked="false" role="radio">TIFF</button>
+          <button data-v="png" aria-checked="false" role="radio">PNG</button>
+          <button data-v="dng" aria-checked="false" role="radio">DNG</button>
         </div>
         <div class="chips" id="size" role="radiogroup" aria-label="Size">
           <button data-v="" aria-checked="true" role="radio">Full size</button>
           <button data-v="4096" aria-checked="false" role="radio">4096 px</button>
           <button data-v="2048" aria-checked="false" role="radio">2048 px</button>
         </div>
+        <div class="chips" id="space" role="radiogroup" aria-label="Colour space">
+          <button data-v="srgb" aria-checked="true" role="radio">sRGB</button>
+          <button data-v="p3" aria-checked="false" role="radio">Display P3</button>
+          <button data-v="rec2020" aria-checked="false" role="radio">Rec.2020</button>
+        </div>
+        <div class="chips" id="bits" role="radiogroup" aria-label="Bits" hidden>
+          <button data-v="16" aria-checked="true" role="radio">16-bit</button>
+          <button data-v="8" aria-checked="false" role="radio">8-bit</button>
+        </div>
+        <label class="row" id="quality-row">JPEG quality <output></output><input type="range" id="quality" min="50" max="100" value="95"></label>
       </div>
 
       <p class="foot">Everything runs on this phone. Nothing is uploaded.</p>
