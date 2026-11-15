@@ -14,7 +14,60 @@ expression: shape(&v)
     "reason": "null",
     "table": "number"
   },
+  "auto": {
+    "consent": {
+      "agy": "bool",
+      "claude": "bool"
+    },
+    "effective": "string",
+    "instructions": "string",
+    "instructions_sha256": "string",
+    "preference": "string",
+    "providers": {
+      "agy": {
+        "api": "null",
+        "auth": "null",
+        "image": "string",
+        "model": "string",
+        "path": "null",
+        "prompt": "number",
+        "reason": "string",
+        "schema": "number",
+        "state": "string",
+        "tool_version": "null"
+      },
+      "apple": {
+        "model": "string",
+        "os": "string",
+        "prompt": "number",
+        "reason": "null",
+        "state": "string"
+      },
+      "claude": {
+        "api": "null",
+        "auth": "null",
+        "image": "string",
+        "model": "string",
+        "path": "null",
+        "prompt": "number",
+        "reason": "string",
+        "schema": "number",
+        "state": "string",
+        "tool_version": "null"
+      },
+      "yellowmoon": {
+        "reason": "null",
+        "state": "string"
+      }
+    },
+    "table": "number"
+  },
   "data_folder": "string",
+  "film": {
+    "data_version": "string",
+    "problem": "null",
+    "profiles": "number"
+  },
   "gpu": {
     "available": "bool",
     "reason": "string"
@@ -42,17 +95,37 @@ expression: shape(&v)
   "includes": "string",
   "looks": {
     "built_in": "number",
-    "display_luts": "number",
     "imported": "number",
     "missing": "number"
   },
   "looks_folder": "string",
+  "masks": {
+    "kinds": [
+      "string"
+    ],
+    "unavailable": {
+      "depth": "string",
+      "object": "string",
+      "people": "string",
+      "subject": "string"
+    }
+  },
   "memory_budget": {
     "cpu_bytes": "number",
     "gpu_bytes": "number",
+    "metal_devices": [],
+    "metal_factor": "number",
+    "metal_limit_bytes": "null",
+    "metal_limit_reason": "string",
+    "ram_override_bytes": "null",
     "shared_memory": "bool"
   },
-  "model_weights": [],
+  "model_weights": [
+    {
+      "file": "string",
+      "sha256": "string"
+    }
+  ],
   "pipeline_version": "string",
   "preferences": {
     "exists": "bool",

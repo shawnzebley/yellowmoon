@@ -25,7 +25,7 @@ use std::sync::mpsc::RecvTimeoutError;
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
-use ym_core::app::gpu::{GpuOpener, GpuPolicy, GpuSlot};
+use ym_core::app::gpu::{GpuPolicy, GpuSlot};
 use ym_core::export_queue::{ExportEvent, ExportJob};
 use ym_core::pipeline::{
     FrameOptions, PhotoSource, RenderReport, RenderedFrame, StageTimings, ViewportMode,
@@ -180,7 +180,7 @@ impl Phase<'_> {
 /// A [`Failure`] when the file cannot be developed, `require` finds no device, or an export fails.
 pub fn run(path: &Path, repeat: u32) -> Result<Value, Failure> {
     let choice = GpuPolicy::from_environment(None);
-    let slot: GpuSlot = GpuOpener::new(choice.policy, MemoryBudget::detect())
+    let slot: GpuSlot = ym_apple::gpu_opener(choice.policy, MemoryBudget::detect())
         .with_timestamps(true)
         .open();
     if let Some(reason) = slot.failure() {
@@ -197,8 +197,8 @@ pub fn run(path: &Path, repeat: u32) -> Result<Value, Failure> {
     let rt = Runtime::open(&CoreSettings {
         jobs: Some(1),
         forced_profile: None,
-        apple_auto: None,
-        apple_auto_instructions: None,
+        auto: None,
+        auto_instructions: None,
     })?;
     rt.core.attach_gpu(&slot);
     let gpu = slot.gpu().cloned();
@@ -308,12 +308,13 @@ pub fn run(path: &Path, repeat: u32) -> Result<Value, Failure> {
         let st = ViewportState::new(ViewportRect::cell(1440.0, 960.0, 1.0));
         let base = frame(&src, &st)?;
         let mut s = src.settings.clone();
-        let contrast = s.contrast.resolve(0.0);
-        s.contrast = ym_core::settings::PercentSetting::manual_value(if contrast > 50.0 {
-            5.0
-        } else {
-            contrast + 20.0
-        });
+        let contrast = s.main_grade().contrast.resolve(0.0);
+        s.main_grade_mut().contrast =
+            ym_core::settings::PercentSetting::manual_value(if contrast > 50.0 {
+                5.0
+            } else {
+                contrast + 20.0
+            });
         let edited = frame(&src.with_settings(s), &st)?;
         let mut v = phase.frame(
             "colour-only edit, 1440 x 960 cell",
@@ -348,7 +349,7 @@ pub fn run(path: &Path, repeat: u32) -> Result<Value, Failure> {
             ExportOptions {
                 format: FormatKind::Tiff,
                 bit_depth: BitDepth::Sixteen,
-                tiff_compression: TiffCompression::Lzw,
+                tiff_compression: TiffCompression::Zip,
                 ..ExportOptions::default()
             },
             gpu_ref,

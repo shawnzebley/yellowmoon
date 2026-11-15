@@ -16,7 +16,7 @@
 //! | Decode | black, white, clip mask | [`raw::FrameData`] (the area copy) | the photo |
 //! | Raw | R1, R3 to R9 | an `RgbImage` per scale, or the tiles at 100 % | `decode.*`, noise reduction, sharpening, the gains `g0`, the noise model |
 //! | Colour | C1 to C8 | [`color::ColorPlan`] (fused matrix, tone) | light, white balance, pick, exposure, `rolloff` (the highlight range and the toe) |
-//! | Grade | C9 to C13 (C9b, the colour warp, included) | [`color::GradePlan`] (the prepared `ColorChain`) | everything else (the colour warp's pins as the chain prepares them, the white lift of C12 included: the automatic amount of the photo's estimates and `white_offset_ev`, [`color::white_lift`]), and the colour key |
+//! | Grade | C9 to C13 (C9b, the colour warp, included) | [`color::GradePlan`] (the prepared `ColorChain`) | everything else (the colour warp's pins as the chain prepares them), and the colour key |
 //! | Geometry | crop, straighten, orientation | nothing: applied when sampling | `crop`, `orientation` |
 //! | Output | output sharpening of the finished picture, then C13 | the display-linear frame of a view ([`frame`] module documentation) | `output_sharpening` (and every group above) |
 //!
@@ -46,24 +46,48 @@ use serde::{Deserialize, Serialize};
 use ym_export::ColorSpace;
 
 pub mod color;
+pub mod depth;
 pub mod frame;
 pub mod geometry;
 pub mod graph;
+pub mod object;
 pub mod raw;
+pub mod resident;
+pub mod schedule;
 pub mod thumbs;
 pub mod viewport;
+pub mod vision;
 
-pub use color::{DisplayChoice, LookProblem, LookProvider, NeutralOnly, PhotoSource, ResolvedLook};
+pub use color::{
+    LookProblem, LookProvider, NeutralOnly, PhotoSource, ResolvedLook, has_depth_row,
+    has_object_row, unmakeable_mask, unmakeable_mask_with, uses_depth,
+};
+pub use depth::{DEPTH_FORMAT_VERSION, DepthModel, DepthPhase, FakeDepth, FocusPlane, FocusReason};
+pub use frame::level::{
+    FILL_BAND_PX, LEVEL_DEBOUNCE, LEVEL_MAX_ZOOM, LEVELS_PER_PHOTO, LevelStatus,
+};
 pub use frame::{
-    ChromaSample, DeviceFrame, FitFrame, FrameOptions, FrameOutput, FullImage, FullRequest,
-    FullTarget, PixelSample, PixelWindow, RenderedFrame, ViewportFrame,
+    ChromaSample, ChromaTap, DeviceFrame, FitFrame, FrameOptions, FrameOutput, FullImage,
+    FullRequest, FullTarget, PixelSample, PixelWindow, RenderedFrame, ViewportFrame,
 };
+pub use graph::DepthKey;
 pub use graph::{
-    ComputeDevice, PhotoGraph, RawPrefetch, RenderOptions, RenderReport, Renderer, StageCounters,
-    StageRuns, StageTimings,
+    ComputeDevice, GpuReopener, PhotoGraph, RawPrefetch, RenderOptions, RenderReport, Renderer,
+    StageCounters, StageRuns, StageTimings, ViewLimits,
 };
-pub use thumbs::{AdvisorPictures, ChromaScatter, HistogramData, PhotoThumbnails};
-pub use viewport::{ViewportInput, ViewportMode, ViewportRect, ViewportState};
+pub use object::{
+    MaskFound, NOTHING_FOUND_SENTENCE, NothingFound, ObjectModel, ObjectPhase, ObjectPlanes,
+    ObjectPrompt,
+};
+pub use resident::{Clock, MODEL_IDLE, ModelSlot, Unload, Unloadable, monotonic_clock};
+pub use thumbs::{
+    AdvisorPictures, ChromaScatter, HistogramData, NODE_THUMBNAIL_PX, NodeThumbnail,
+    PhotoThumbnails, settings_ending_at,
+};
+pub use viewport::{
+    MapFrom, MaskStyle, MaskView, ViewportInput, ViewportMode, ViewportRect, ViewportState,
+};
+pub use vision::VisionPhase;
 
 /// Why a render failed. The text is for the person using the app: what went wrong and what to do.
 #[derive(Debug, Clone, thiserror::Error)]
@@ -77,9 +101,13 @@ pub enum RenderError {
     /// The colour settings cannot make a chain (a refused Pick white, a bad curve).
     #[error("{0}")]
     Color(String),
-    /// A look or display LUT cannot be used.
+    /// A look cannot be used.
     #[error("{0}")]
     Look(String),
+    /// A mask of the photo is of a kind this computer cannot make (`docs/23` section 3.10): the photo is not
+    /// rendered without it.
+    #[error("{0}")]
+    Mask(String),
     /// The render would not fit in the memory budget.
     #[error(
         "There is not enough memory to render this photo at full size. Close other apps or export a smaller size."
@@ -144,6 +172,42 @@ pub struct RenderStats {
     /// from. Only a viewport frame has one.
     #[serde(default)]
     pub fit_percent: Option<f64>,
+    /// What the lens's bokeh reshaping did for the photo (`docs/21` section 10), once its planes
+    /// exist. `None` without a lens.
+    #[serde(default)]
+    pub lens: Option<LensStats>,
+}
+
+/// Why a photo's bokeh was left as it is (`RenderStats::lens`): the words of the Lens card's note.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LensReshapeReason {
+    /// The sliders did not ask for it.
+    NotAsked,
+    /// The photo has little out-of-focus background ("This photo has little out-of-focus
+    /// background, so its bokeh changes little.").
+    LittleBlur,
+}
+
+/// What the lens did with the photo's bokeh (`render_stats`, `docs/21` section 10).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LensStats {
+    /// True when the bokeh was reshaped.
+    pub reshaped: bool,
+    /// Why it was not, when it was not.
+    pub reason: Option<LensReshapeReason>,
+}
+
+impl From<ym_lens::ReshapeReport> for LensStats {
+    fn from(r: ym_lens::ReshapeReport) -> Self {
+        Self {
+            reshaped: r.reshaped,
+            reason: r.reason.map(|reason| match reason {
+                ym_lens::ReshapeReason::NotAsked => LensReshapeReason::NotAsked,
+                ym_lens::ReshapeReason::LittleBlur => LensReshapeReason::LittleBlur,
+            }),
+        }
+    }
 }
 
 /// How far a viewport frame is zoomed: device pixels per pixel of the final image (after the lens

@@ -2,6 +2,7 @@ import type { ButtonHTMLAttributes, ReactNode } from "react";
 import { Badge } from "@/components/glass/badge";
 import { Toggle } from "@/components/glass/toggle";
 import { cx } from "./cx";
+import { BUTTON_HANDLERS, memoStable } from "./stable";
 
 /**
  * Tag variants (`docs/11-ui.md` §Components).
@@ -114,13 +115,19 @@ export interface AutoToggleProps extends Omit<ButtonHTMLAttributes<HTMLButtonEle
   isAuto: boolean;
   /** Called when the button is pressed while the card is not automatic: back to Auto. */
   onAuto: () => void;
+  /**
+   * Called when the button is pressed while it is on. Given, the button switches both ways (Crop's Auto crop, `docs/20-auto-crop.md`
+   * §1); left out, pressing it while automatic does nothing.
+   */
+  onOff?: () => void;
 }
 
 /**
  * The AUTO button in a card header (Exposure, White balance, Noise reduction): glasscn's `Toggle` as it comes (its own pressed style). On while the card
- * is automatic; once something was changed it is off, and pressing it restores Auto. Pressing it while automatic does nothing.
+ * is automatic; once something was changed it is off, and pressing it restores Auto. Pressing it while automatic does nothing, unless
+ * `onOff` is given (the Crop panel's Auto, which switches both ways).
  */
-export function AutoToggle({ isAuto, onAuto, className, ...rest }: AutoToggleProps) {
+function AutoToggleImpl({ isAuto, onAuto, onOff, className, ...rest }: AutoToggleProps) {
   return (
     <Toggle
       {...rest}
@@ -130,9 +137,13 @@ export function AutoToggle({ isAuto, onAuto, className, ...rest }: AutoTogglePro
       className={cx("h-control-xs min-w-0 px-2.5 text-xs font-semibold", className)}
       onPressedChange={() => {
         if (!isAuto) onAuto();
+        else onOff?.();
       }}
     >
       Auto
     </Toggle>
   );
 }
+
+/** Drawn again only when its data changes, not for new `onAuto` and `onOff` functions (U-02). */
+export const AutoToggle = memoStable<AutoToggleProps>(AutoToggleImpl, BUTTON_HANDLERS);

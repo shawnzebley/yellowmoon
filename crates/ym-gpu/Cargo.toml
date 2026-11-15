@@ -14,6 +14,9 @@ ym-color.workspace = true
 # `NoiseDn::from_model` converts the noise model of the sigma map (`cpu::noise`). ym-noise
 # does not depend on this crate.
 ym-noise.workspace = true
+# The lens's plans (`ym_lens::device`): the numbers and tables the lens kernels take, and the CPU references
+# the parity tests compare them with (`docs/21` section 5).
+ym-lens.workspace = true
 thiserror.workspace = true
 rayon.workspace = true
 wgpu.workspace = true
@@ -21,6 +24,8 @@ pollster.workspace = true
 bytemuck.workspace = true
 half.workspace = true
 tracing.workspace = true
+# Only the stderr logger of `debug_log` (`YM_GPU_LOG`); wgpu and wgpu-hal already use it. MIT OR Apache-2.0.
+log = { version = "0.4", features = ["std"] }
 # Full-precision `erf` for the pixel-integrated Gaussian kernels of output sharpening
 # (`cpu::output_sharpen`, spec 04 section 2.3: "any libm erf, or the libm crate"). MIT, a port of
 # the FreeBSD msun routines; already in the shipped tree through naga (wgpu), so no new licence.
@@ -35,8 +40,17 @@ ml = []
 # Fault injection for the fallback tests (`GpuFault`, `YM_GPU_FAULT`): out of budget, a bad shader, a lost
 # device, a cancel and a failing tile at a chosen job. Compiled out of every normal build.
 fault-injection = []
+# TEST-ONLY. `tail::set_picture_probe` hands a test the rendered picture of an export (display-linear, before output
+# sharpening and C13), band by band, as the colour pass wrote it, so that the picture's error against the CPU can be
+# measured (F-08d, `docs/24-film.md` section 3.9c). Compiled out of every normal build.
+tail-probe = []
 
 [dev-dependencies]
+# The synthetic lens folders of the tests of the lens kernels (`ym_lens::test_support`).
+ym-lens = { workspace = true, features = ["test-support"] }
+# The Film node's CPU reference, the twin the parity tests of `kernels::film` compare with. A dev-dependency only:
+# `ym-gpu` takes plain data (`kernels::film::FilmColourData`, `FilmPlan`) and no `ym-film` type in its API.
+ym-film.workspace = true
 png.workspace = true
 tiff.workspace = true
 serde_json.workspace = true

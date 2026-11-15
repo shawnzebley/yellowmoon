@@ -24,6 +24,15 @@ on:
   pull_request:
     paths: ["crates/**", "src-tauri/**", "src/**", "tools/golden/**", "data/**", "Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "package.json", "package-lock.json", ".github/workflows/mac-gpu.yml"]
   workflow_dispatch:
+    inputs:
+      filter:
+        description: "cargo test name filter for a diagnostic run; empty runs the full workflow"
+        type: string
+        default: ""
+      tests:
+        description: "cargo test package and test target arguments for the diagnostic run"
+        type: string
+        default: "-p ym-gpu --test gpu_raster_masks"
 
 permissions:
   contents: read
@@ -37,6 +46,9 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
+  # ym_gpu installs a stderr logger for wgpu and wgpu-hal records when a device opens: every test step shows their
+  # warnings and errors (the reason behind a "Device is lost").
+  YM_GPU_LOG: warn
 
 defaults:
   run:
@@ -56,7 +68,8 @@ jobs:
     # The run of 4c5939f took 50 minutes with a warm dependency cache (ym-gpu 16, ym-core 28); the steps added after it (the 50 and
     # 70 MP tests, the encode split, the synthetic set and the golden subset, one 50 MP photo twice, the bench) are another
     # 30 to 45 by estimate, and the first run of a new cache key is cold. The numbers of the first runs go to docs/13.
-    timeout-minutes: 150
+    # Run 42157540711 (macos-15) hit 150: ym-gpu 38 min, faults/ML 3, ym-core 98, parity_gpu 6; the 50 and 70 MP step was cancelled and the rest skipped.
+    timeout-minutes: 240
     env:
       WGPU_BACKEND: metal
       # A release build finds data/ only inside an app bundle (docs/01, "Finding data/"); point it at the repository's.
@@ -76,23 +89,63 @@ jobs:
         run: system_profiler SPDisplaysDataType SPHardwareDataType | tee system-${{ matrix.runner }}.txt
       - name: The adapter as ym sees it (ym doctor)
         run: cargo run -p ym-cli --release -- doctor --json | tee doctor-${{ matrix.runner }}.json
+      # H-17 (docs/26, finding P5-2): the budget of the GPU follows Metal's working-set limit. The report must carry the
+      # limit (the Metal bridge of ym-apple found the device wgpu opened by its name), it must be above 0, and on Apple
+      # silicon it must be above RAM / 4 (the unified-memory rule's share; a smaller limit would mean the rule overshoots).
+      # The GPU budget is at most 0.75 of the limit. This step has no `if`, so a diagnostic dispatch (one with a filter)
+      # runs it too, before the diagnostic step: the full run is unchanged.
+      - name: The Metal limit in the report (ym doctor, H-17)
+        env:
+          DOCTOR_JSON: doctor-${{ matrix.runner }}.json
+        run: |
+          ram=$(sysctl -n hw.memsize)
+          arch=$(uname -m)
+          python3 - "$DOCTOR_JSON" "$ram" "$arch" <<'PY'
+          import json, sys
+          path, ram, arch = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+          report = json.load(open(path))
+          budget = report["memory_budget"]
+          print("adapter:", report["gpu"].get("name"), "| Metal devices:", json.dumps(budget["metal_devices"]))
+          assert "metal_limit_bytes" in budget, "the report has no metal_limit_bytes"
+          limit = budget["metal_limit_bytes"]
+          assert limit is not None and limit > 0, f"no Metal limit: {budget['metal_limit_reason']}"
+          if arch == "arm64":
+              assert limit > ram // 4, f"the Metal limit {limit} is not above RAM/4 = {ram // 4}"
+          gpu = budget["gpu_bytes"]
+          assert gpu <= limit * budget["metal_factor"] + 1, f"the GPU budget {gpu} is above {budget['metal_factor']} of the limit {limit}"
+          print(f"Metal limit {limit} bytes ({limit / 2**30:.2f} GiB), RAM {ram / 2**30:.2f} GiB, GPU budget {gpu / 2**30:.2f} GiB: ok")
+          PY
+      # A dispatch with a filter runs only this step (and the log upload): wgpu debug logging and Metal's debug layer on
+      # the tests named by the `tests` and `filter` inputs. The inputs go through env, not into the shell line.
+      - name: Diagnostic run (dispatch with a filter)
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.filter != '' }}
+        env:
+          YM_REQUIRE_GPU: "1"
+          YM_GPU_LOG: debug
+          MTL_DEBUG_LAYER: "1"
+          RUST_BACKTRACE: "1"
+          DIAG_TESTS: ${{ inputs.tests }}
+          DIAG_FILTER: ${{ inputs.filter }}
+        # shell is bash -eo pipefail (defaults.run), so a failing cargo test fails the step through `tee`.
+        run: cargo test $DIAG_TESTS --release -- --test-threads=1 --nocapture "$DIAG_FILTER" 2>&1 | tee diag-${{ matrix.runner }}.log
       # YM_REQUIRE_GPU turns "no adapter, skipped" into a failure, so a runner without Metal cannot pass silently.
       - name: Every GPU kernel against its CPU reference on Metal (ym-gpu)
+        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.filter != '') }}
         env:
           YM_REQUIRE_GPU: "1"
         run: cargo test -p ym-gpu --release --no-fail-fast -- --test-threads=2 2>&1 | tee ym-gpu-${{ matrix.runner }}.log
       - name: Device faults and the ML device recipe on Metal (ym-gpu, features fault-injection and ml)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && !(github.event_name == 'workflow_dispatch' && inputs.filter != '') }}
         env:
           YM_REQUIRE_GPU: "1"
         run: cargo test -p ym-gpu --release --features fault-injection,ml --lib --test gpu_device --test gpu_chain 2>&1 | tee ym-gpu-features-${{ matrix.runner }}.log
       - name: The renderer on Metal (ym-core, every test, determinism and faults included; the GPU ones against the CPU reference)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && !(github.event_name == 'workflow_dispatch' && inputs.filter != '') }}
         env:
           YM_REQUIRE_GPU: "1"
         run: cargo test -p ym-core --release --features fault-injection --no-fail-fast -- --test-threads=2 2>&1 | tee ym-core-${{ matrix.runner }}.log
       - name: The app and ym give the same exports on Metal (ym-cli parity_gpu)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && !(github.event_name == 'workflow_dispatch' && inputs.filter != '') }}
         env:
           YM_REQUIRE_GPU: "1"
           YELLOWMOON_GPU: "on"
@@ -103,7 +156,7 @@ jobs:
       # frame. They are named by what they test, so the other ignored tests (development aids, child-process probes) stay out.
       # One thread: each holds a few hundred MB of device memory and the runner has 7 GB.
       - name: The 50 MP and 70 MP tests (ignored by default) on Metal
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && !(github.event_name == 'workflow_dispatch' && inputs.filter != '') }}
         env:
           YM_REQUIRE_GPU: "1"
         run: |
@@ -111,9 +164,13 @@ jobs:
             --ignored --test-threads=1 --nocapture 70_mp 50_mp fifty_megapixels gpu_spike_50mp 2>&1 | tee ym-gpu-large-${{ matrix.runner }}.log
           cargo test -p ym-core --release --features fault-injection --test gpu_export -- \
             --ignored --test-threads=1 --nocapture fifty_megapixels 2>&1 | tee ym-core-large-${{ matrix.runner }}.log
+          # The full scale-1 sweep of a 4000 px photo with raster masks and a Film node at every binding size and zoom
+          # (docs/23 §5.12): the case that lost the device on Metal before the work per submission was bounded.
+          cargo test -p ym-core --release --test any_graph -- \
+            --ignored --test-threads=1 --nocapture scale_one_4000_px 2>&1 | tee ym-core-scale-one-${{ matrix.runner }}.log
       # The encode split of docs/09 on this machine's CPU encoders (C13, resize, sharpening, DCT and Huffman, LZW, Deflate): print only.
       - name: Encode split (print only)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && !(github.event_name == 'workflow_dispatch' && inputs.filter != '') }}
         continue-on-error: true
         run: cargo test -p ym-export --release --test encode_split -- --ignored --nocapture 2>&1 | tee encode-split-${{ matrix.runner }}.log
       # ym and golden, in two invocations as in the golden-gpu job of ci.yml: `golden` switches on ym-raw's test-only `testgen`
@@ -121,22 +178,22 @@ jobs:
       # and before the generator, so that a generator that fails cannot take the binaries of the golden check and of the owner
       # photo steps with it (they used to be built inside the golden step, after the generator).
       - name: Build ym and golden (two invocations)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && !(github.event_name == 'workflow_dispatch' && inputs.filter != '') }}
         run: |
           cargo build --release -p ym-cli
           cargo build --release -p golden
       # The GPU golden subset (docs/13 "GPU golden"): the synthetic files, each rendered by `ym render --require-gpu` and held
       # against a CPU render of the same run on the same machine (a Mac's CPU path is not the Linux one expected.json describes,
       # so the stored pictures do not apply here: `--reference render`). A render that fell back to the CPU fails.
-      # Every step from here on carries `if: ${{ !cancelled() }}`, setup-python too: a step without an `if:` runs only while all
+      # Every step from here on carries `if: ${{ !cancelled() }}` (and the skip for a diagnostic dispatch), setup-python too: a step without an `if:` runs only while all
       # the steps before it succeeded, so the failed ym-core step of run 38746750138 skipped setup-python, `pip` then installed
       # the packages for the runner's own Python 3.14 and the import check of synthetic.sh failed. `python3 -m pip` puts the
       # packages where `python3` (setup-python's 3.12, as in the Linux jobs) looks for them.
       - uses: actions/setup-python@v5
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && !(github.event_name == 'workflow_dispatch' && inputs.filter != '') }}
         with: { python-version: "3.12" }
       - name: Synthetic ARW set (the generator and its requirements)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && !(github.event_name == 'workflow_dispatch' && inputs.filter != '') }}
         run: |
           which python3
           python3 --version
@@ -145,7 +202,7 @@ jobs:
           tools/fetch/spectral.sh
           tools/fetch/synthetic.sh --release
       - name: Golden check on Metal (the GPU subset against the CPU of this machine)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && !(github.event_name == 'workflow_dispatch' && inputs.filter != '') }}
         run: |
           target/release/golden check --device gpu --reference render --subset tools/golden/gpu-subset.txt \
             --ym target/release/ym --require-all --report golden-gpu-${{ matrix.runner }}.json 2>&1 | tee golden-gpu-${{ matrix.runner }}.txt
@@ -153,7 +210,7 @@ jobs:
       # cached by the checksums of tools/fetch/owner-photos.sha256. The cache holds the files and not the clone's .git
       # (persist-credentials is off, so no token can end up in a cache).
       - name: Owner photos (readme-photos branch, Git LFS)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && !(github.event_name == 'workflow_dispatch' && inputs.filter != '') }}
         id: owner
         uses: actions/cache@v4
         with:
@@ -162,7 +219,7 @@ jobs:
             !testdata/readme-photos/src/.git
           key: owner-photos-${{ hashFiles('tools/fetch/owner-photos.sha256') }}
       - name: Fetch the owner photos (cache miss)
-        if: ${{ !cancelled() && steps.owner.outputs.cache-hit != 'true' }}
+        if: ${{ !cancelled() && steps.owner.outputs.cache-hit != 'true' && !(github.event_name == 'workflow_dispatch' && inputs.filter != '') }}
         uses: actions/checkout@v4
         with:
           ref: readme-photos
@@ -173,16 +230,16 @@ jobs:
       # ships with macOS's Perl 5.34 (6.02) probably lacks (newer versions have it), and the runners have no unprefixed sha256sum.
       # Plain `shasum -a 256 -c` works with every version; it lists each file as OK.
       - name: Verify the owner photos
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && !(github.event_name == 'workflow_dispatch' && inputs.filter != '') }}
         run: cd testdata/readme-photos/src && shasum -a 256 -c "$GITHUB_WORKSPACE/tools/fetch/owner-photos.sha256"
       - name: One real photo, the device against the CPU (golden metric)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && !(github.event_name == 'workflow_dispatch' && inputs.filter != '') }}
         run: |
           target/release/golden device-check --ym target/release/ym --long-edge 1500 \
             --report device-check-${{ matrix.runner }}.json testdata/readme-photos/src/A1M01749.ARW 2>&1 | tee device-check-${{ matrix.runner }}.txt
       # The report of docs/10 `ym doctor --bench` on the same photo, for the record (a shared VM: the numbers are not a speed).
       - name: ym doctor --bench on the device (print only)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && !(github.event_name == 'workflow_dispatch' && inputs.filter != '') }}
         continue-on-error: true
         env:
           YELLOWMOON_GPU: require
@@ -207,13 +264,14 @@ jobs:
             device-check-${{ matrix.runner }}.json
             device-check-${{ matrix.runner }}.txt
             bench-${{ matrix.runner }}.txt
+            diag-*.log
           if-no-files-found: warn
 
   app:
     name: App and workspace on macOS
-    # Checkpoint commits snapshot work in progress and are not expected to build; skip them.
-    # Only in the upstream repository: the Windows port's fork builds with windows.yml instead.
-    if: ${{ github.repository == 'ngriaznov/yellowmoon' && (github.event_name != 'push' || !startsWith(github.event.head_commit.message, 'Checkpoint')) }}
+    # Checkpoint commits snapshot work in progress and are not expected to build; skip them. A dispatch with a filter is a
+    # diagnostic run of the Metal job only.
+    if: ${{ github.repository == 'ngriaznov/yellowmoon' && (github.event_name != 'push' || !startsWith(github.event.head_commit.message, 'Checkpoint')) && !(github.event_name == 'workflow_dispatch' && inputs.filter != '') }}
     runs-on: macos-15
     timeout-minutes: 90
     steps:

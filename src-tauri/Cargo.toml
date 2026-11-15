@@ -23,9 +23,13 @@ ym-core.workspace = true
 # Apple Auto's bridge to Apple's on-device model (docs/19 section 11; Apache-2.0, ours). Off Apple
 # silicon or without the macOS 27 SDK it builds a stub that reports why it is not available.
 ym-apple.workspace = true
+# Auto by Claude Code and Antigravity (docs/22 section 15): starts the person's own programs, which talk to their own services; no
+# HTTP client of ours (crates/ym-agents/tests/no_network.rs).
+ym-agents.workspace = true
 ym-color.workspace = true
 ym-export.workspace = true
 ym-gpu.workspace = true
+ym-lens.workspace = true
 ym-looks.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -46,8 +50,10 @@ specta-typescript.workspace = true
 # wgpu already pull in on macOS, so the lock file gains edges but no new crates.
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
-objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSGeometry"] }
-objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSView", "NSResponder", "NSGraphics", "NSWindow", "NSColor", "objc2-core-foundation"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSGeometry", "NSNotification", "NSString", "NSOperation", "block2"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSView", "NSResponder", "NSGraphics", "NSWindow", "NSColor", "NSWorkspace", "NSAccessibility", "objc2-core-foundation"] }
+# The closure the system calls when a display option changes (`src/a11y.rs`); MIT, already in the tree through objc2-foundation.
+block2 = "0.6"
 raw-window-handle = "0.6"
 wgpu.workspace = true
 pollster.workspace = true
@@ -61,8 +67,13 @@ muda = "0.20"
 # Builds the zips of the wizard tests and reads the TypeScript contract in the bindings test.
 zip.workspace = true
 regex = "1"
+# Peak resident memory (`getrusage`) in the ignored 2000-file test (`docs/26` H-10). MIT OR Apache-2.0 (docs/14); already in the build through `ym-ml`.
+libc = "0.2"
 # Synthetic ARW files for the command tests.
 ym-raw = { workspace = true, features = ["testgen"] }
+# The test doubles of Claude Code and `agy` and the paths to them, for the test that quitting stops a running request
+# (`docs/22` sections 12.10 and 15.2; only in tests: `ym-agents` itself is already a dependency).
+ym-agents = { workspace = true, features = ["test-support"] }
 # The native viewport's two pipelines (`src/present.rs`) drawn on any adapter by `tests/present.rs`
 # (MIT OR Apache-2.0; both already in the tree through ym-gpu, so nothing new is built).
 wgpu.workspace = true

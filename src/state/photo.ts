@@ -1,5 +1,5 @@
 /** Small helpers that turn a photo's summary into the words and pictures the screens show. */
-import type { PhotoId, PhotoStatus, PhotoSummary, SessionState } from "../api/types";
+import type { PhotoId, PhotoStatus, PhotoSummary, PixelSample, SessionState } from "../api/types";
 
 /** "DSC04204.ARW" gives "DSC04204". */
 export const photoName = (fileName: string): string => fileName.replace(/\.[^./\\]+$/, "");
@@ -115,7 +115,8 @@ export function developFraction(status: PhotoStatus): number {
     case "waiting":
       return 0;
     case "developing":
-      return { probe: 0.1, decode: 0.2, estimate: 0.4, thumbnail: 0.8 }[status.stage];
+      // `apple` never becomes a status (the store keeps it in `apple_pending`); it is listed for the type.
+      return { probe: 0.1, decode: 0.2, estimate: 0.4, thumbnail: 0.8, apple: 1 }[status.stage];
     case "ready":
     case "skipped":
       return 1;
@@ -140,3 +141,6 @@ export function bytesToUrl(bytes: readonly number[]): string {
 export function releaseUrl(url: string): void {
   if (url.startsWith("blob:") && typeof URL !== "undefined" && typeof URL.revokeObjectURL === "function") URL.revokeObjectURL(url);
 }
+
+/** The ⌥ readout's text for a pixel, "R 127 G 166 B 199": the one form the drawn badge and the sentence of the I key share. */
+export const pixelText = (pixel: Pick<PixelSample, "r" | "g" | "b">): string => `R ${pixel.r} G ${pixel.g} B ${pixel.b}`;

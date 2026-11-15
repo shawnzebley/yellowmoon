@@ -8,6 +8,7 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod a11y;
 mod about;
 mod api;
 mod app;
@@ -19,6 +20,7 @@ mod logging;
 mod menu;
 #[cfg(target_os = "macos")]
 mod native;
+mod node_thumbs;
 mod perf;
 #[cfg(target_os = "macos")]
 mod present;
@@ -26,6 +28,7 @@ mod system;
 #[cfg(test)]
 mod testing;
 mod thumbs;
+mod timeline;
 mod viewport;
 mod wire;
 mod wizard;

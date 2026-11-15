@@ -9,6 +9,7 @@ import { installManualRaf, mockRect } from "../test/raf";
 import { openPhotos, renderApp } from "../test/harness";
 import type { Harness } from "../test/harness";
 import type { MockOptions } from "../api.mock";
+import { inputPatch } from "../state/settingsGraph";
 
 let h: Harness | undefined;
 afterEach(() => {
@@ -49,8 +50,10 @@ describe("the native viewport", () => {
     const cell = await setup({ viewport: "native" });
     await waitFor(() => expect(document.documentElement).toHaveAttribute("data-native-viewport"));
     // screens.css makes the root, the body, #root and the Photos screen transparent; a new box between the cell and the screen would
-    // paint paper over the photo.
-    expect(cell.parentElement).toHaveAttribute("data-screen", "photos");
+    // paint paper over the photo. The only one is the photo's wrapper, which makes no box in the simple view (`display: contents`) and in
+    // the node view paints only beside the cell (`nodeview.node.test.ts`).
+    expect(cell.parentElement).toHaveClass("ym-viewer");
+    expect(cell.parentElement?.parentElement).toHaveAttribute("data-screen", "photos");
     h!.unmount();
     h = undefined;
     expect(document.documentElement).not.toHaveAttribute("data-native-viewport");
@@ -61,7 +64,7 @@ describe("the native viewport", () => {
     document.documentElement.setAttribute("style", "background: #ffffff; color-scheme: light");
     const cell = await setup({ viewport: "native" });
     await waitFor(() => expect(document.documentElement).toHaveAttribute("data-native-viewport"));
-    const screen = cell.parentElement as HTMLElement;
+    const screen = cell.closest<HTMLElement>(".ym-screen")!;
     for (const el of [document.documentElement, document.body, screen]) {
       expect(el.style.getPropertyValue("background-color")).toBe("transparent");
       expect(el.style.getPropertyPriority("background-color")).toBe("important");
@@ -104,7 +107,7 @@ describe("the fallback viewport", () => {
     await h!.api.viewportSetRect({ x: 0, y: 75, width: 1020, height: 680, scale: 2 });
     await waitFor(() => expect(cell.querySelector("img.ym-photo-cell__frame")).not.toBeNull());
     const first = cell.querySelector("img.ym-photo-cell__frame")?.getAttribute("src");
-    await h!.store.update({ exposure: { kind: "manual", ev: 1.5 } });
+    await h!.store.update(inputPatch({ exposure: { kind: "manual", ev: 1.5 } }));
     await waitFor(() => expect(cell.querySelector("img.ym-photo-cell__frame")?.getAttribute("src")).not.toBe(first));
   });
 
@@ -183,7 +186,7 @@ describe.each([undefined, "native", "fallback"] as const)("the pointer over the 
     await waitFor(() => expect(cell.querySelector(".ym-photo-cell__readout")).toHaveTextContent(/^R \d+ G \d+ B \d+$/));
     expect(sample).toHaveBeenCalledWith(450, 60);
     // A portrait photo is letterboxed: the left edge is paper and has nothing to read.
-    await h!.store.update({ orientation: 90 });
+    await h!.store.update(inputPatch({ orientation: 90 }));
     fireEvent.pointerMove(cell, { clientX: 5, clientY: 300, altKey: true });
     await waitFor(() => expect(cell.querySelector(".ym-photo-cell__readout")).toBeNull());
     expect(h!.store.getState().error).toBeNull();

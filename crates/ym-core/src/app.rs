@@ -4,18 +4,21 @@
 //! The Tauri application builds one [`Core`] at start and forwards each command to it; the CLI builds
 //! one per run. What the parts need from each other is settled here once:
 //!
-//! * the **renderer** reads looks through the look library and shows the display rendering the
-//!   preferences choose;
+//! * the **renderer** reads looks through the look library (the display rendering is always
+//!   Yellowmoon's own: there is no choice of it);
 //! * new photos get the **default look** from the preferences (or Neutral when that look is gone);
-//! * a change of the default look, the display rendering or the look list reaches the session and
-//!   the renderer, and then the application's `looks_changed` listener;
+//! * a change of the default look or the look list reaches the session, and then the application's
+//!   `looks_changed` listener;
 //! * an **export** snapshots the photos and the preference "Remove location from exports" when it is
 //!   queued, and runs through `export_photo`, the function the CLI calls too;
-//! * **Apple Auto** (`docs/19`) acts when the caller gives an advisor ([`CoreOptions::advisor`]: the
-//!   app and `ym` give `ym_apple::system_advisor()`, every other caller none), the preference or the
-//!   run's mode ([`CoreOptions::apple_auto`], [`Core::set_apple_auto_mode`]) is on and the advisor is
-//!   available; the availability is read again when a session opens, when the status is asked
-//!   ([`Core::apple_auto_status`]), when the preferences change and before each export.
+//! * **Auto providers** (`docs/19`, `docs/22`): Apple Intelligence, Claude Code and Antigravity act
+//!   when the caller gives advisors ([`CoreOptions::advisors`]: the app and `ym` give
+//!   `ym_apple::system_advisor()` and `ym_agents::system_advisors()`, every other caller none), the
+//!   chosen provider (the preference, or the run's choice, [`CoreOptions::auto_choice`],
+//!   [`Core::set_auto_choice`]) is available, and for a cloud provider its consent is saved or the
+//!   run named it; the availability is read again when a session opens, when the status is asked
+//!   ([`Core::auto_status`]), when an advisor says it changed ([`Core::on_auto_changed`]), when
+//!   the preferences change and before each export.
 //!
 //! Nothing here persists anything but the preferences and the looks (`docs/01` section
 //! Persistence).
@@ -25,14 +28,17 @@
 //! renderer.
 
 pub mod gpu;
+pub mod metal;
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 use std::time::Duration;
 
-use crate::apple_auto::{AppleAutoMode, AppleAutoStatus, AutoAdvisor, check_instructions};
+use crate::apple_auto::{Availability, UnavailableReason, check_instructions};
+use crate::auto_provider::{AutoChoice, AutoStatus, ProviderAdvisors};
 
 use ym_color::look::LookInput;
+use ym_lens::{LensInfo, LensLibrary};
 use ym_looks::import::Progress;
 use ym_looks::library::LookId;
 
@@ -42,19 +48,21 @@ use crate::export::ExportContext;
 use crate::export_queue::{
     ExportEstimate, ExportJob, ExportJobId, ExportQueue, ExportSink, JobSummary, QueueError,
 };
-use crate::looks::{
-    DisplayLutEntry, ImportRequest, LookEntry, LookService, LooksError, LooksImportResult,
-};
-use crate::pipeline::{AdvisorPictures, RenderError, RenderOptions, Renderer};
+use crate::looks::{ImportRequest, LookEntry, LookService, LooksError, LooksImportResult};
+use crate::pipeline::{AdvisorPictures, RenderError, RenderOptions, Renderer, Unloadable};
 use crate::preferences::{
-    DisplayRendering, LastUsedFolders, Preferences, PreferencesError, PreferencesPatch,
-    PreferencesStore, own_instructions,
+    LastUsedFolders, Preferences, PreferencesError, PreferencesPatch, PreferencesStore,
+    own_instructions,
 };
 use crate::session::{
-    AppleAutoEnv, ApplyScope, EventSink, PasteReport, PhotoId, RemoveOutcome, RestoreOutcome,
-    Session, SessionEnv, SessionError, default_decode_threads,
+    AppleAutoEnv, ApplyScope, EventSink, PasteReport, PhotoId, PictureRenderer, RemoveOutcome,
+    RestoreOutcome, Session, SessionEnv, SessionError, default_decode_threads,
 };
 use crate::settings::SettingsPatch;
+
+/// How long [`Core::export_start`] waits for a provider that still reads `checking` (`docs/22` section
+/// 3.3).
+pub const AUTO_SETTLE_BEFORE_EXPORT: Duration = Duration::from_secs(5);
 
 /// How long [`Core::shutdown`] waits for a cancelled export to delete its partial file. A cancel is
 /// noticed between render tiles and writer bands (a few tenths of a second at 24 MP); this is the
@@ -94,6 +102,8 @@ impl CoreError {
             Self::Looks(_) => "looks",
             Self::Preferences(_) => "preferences",
             Self::Export(_) => "export",
+            // A mask this computer cannot make or cannot find (`docs/23` section 9).
+            Self::Render(RenderError::Mask(_)) => "mask",
             Self::Render(_) => "render",
         }
     }
@@ -122,16 +132,17 @@ pub struct CoreOptions {
     /// application wants them; the CLI does not (it would spend the render worker on pictures
     /// nobody sees, and an export waits for such work).
     pub thumbnails: bool,
-    /// What looks at the photos for Apple Auto (`docs/19`): the app and `ym` give
-    /// `ym_apple::system_advisor()`; every other caller (tests, the golden tool, examples) gives none,
-    /// which is Apple Auto off and today's bytes everywhere.
-    pub advisor: Option<Arc<dyn AutoAdvisor>>,
-    /// How this run decides on Apple Auto: the preference ([`AppleAutoMode::FromPreference`], the
-    /// app's and `ym`'s default) or `ym --apple-auto on|off`.
-    pub apple_auto: AppleAutoMode,
-    /// Instructions for Apple Auto's model for this run instead of the `apple_auto_instructions`
-    /// preference (`ym --apple-auto-instructions FILE`, `docs/19` section 8); `None` follows the
-    /// preference. Checked by [`Core::open`].
+    /// What looks at the photos for the Auto providers (`docs/19`, `docs/22`): the app and `ym` give
+    /// Apple's `ym_apple::system_advisor()` and the two programs' `ym_agents::system_advisors()`;
+    /// every other caller (tests, the golden tool, examples) gives none, which is Yellowmoon's own
+    /// Auto and today's bytes everywhere.
+    pub advisors: ProviderAdvisors,
+    /// How this run chooses its provider: the preference ([`AutoChoice::FromPreference`], the app's
+    /// and `ym`'s default) or `ym --auto-provider p` ([`AutoChoice::Provider`]).
+    pub auto_choice: AutoChoice,
+    /// Instructions for the model for this run instead of the `apple_auto_instructions` preference
+    /// (`ym --auto-instructions FILE`, `docs/19` section 8); `None` follows the preference. Checked
+    /// by [`Core::open`].
     pub apple_auto_instructions: Option<String>,
 }
 
@@ -154,6 +165,9 @@ impl CoreOptions {
     pub fn new(data_root: PathBuf, app_root: PathBuf) -> Self {
         let render = RenderOptions {
             neural: crate::pipeline::NeuralStatus::probe(Some(&data_root)),
+            // The app and the CLI keep whole-image levels for the viewer; a render that has no
+            // viewer (the CLI's export) never asks for one.
+            levels: true,
             ..RenderOptions::default()
         };
         Self {
@@ -166,8 +180,8 @@ impl CoreOptions {
             forced_profile: None,
             home: None,
             thumbnails: true,
-            advisor: None,
-            apple_auto: AppleAutoMode::FromPreference,
+            advisors: ProviderAdvisors::default(),
+            auto_choice: AutoChoice::FromPreference,
             apple_auto_instructions: None,
         }
     }
@@ -186,9 +200,47 @@ pub struct Core {
     /// The export queue.
     pub exports: ExportQueue,
     data_root: PathBuf,
-    /// Apple Auto's instructions for this run when they override the preference
+    /// The Auto instructions for this run when they override the preference
     /// ([`CoreOptions::apple_auto_instructions`]).
     instructions_override: Option<String>,
+    /// The advisors the core was given (the same ones the session asks).
+    advisors: ProviderAdvisors,
+    /// Who is told when an advisor's availability changed ([`Core::on_auto_changed`]).
+    auto_hub: Arc<AutoHub>,
+    /// What memory pressure acts on, shared with the poll thread (`crate::memory`).
+    memory: Arc<crate::memory::Guard>,
+    /// The poll thread, while it runs ([`Core::start_memory_watch`]). Ended first when the core is dropped.
+    watch: Mutex<Option<crate::memory::Watch>>,
+}
+
+/// What an advisor's change notification does: the session reads the availability again, then the
+/// application's callbacks run (`docs/22` section 11.2). It exists before the session does, because
+/// the listener is registered first.
+#[derive(Default)]
+struct AutoHub {
+    session: OnceLock<Weak<Session>>,
+    callbacks: Mutex<Vec<Arc<dyn Fn() + Send + Sync>>>,
+}
+
+impl AutoHub {
+    fn callbacks(&self) -> MutexGuard<'_, Vec<Arc<dyn Fn() + Send + Sync>>> {
+        self.callbacks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The advisor said its availability changed. Runs on its probe thread: it never blocks, and it
+    /// starts no probe (`docs/22` section 3.3: the re-read on a change notification is "no
+    /// process"): the session reads what the advisors say and brings the photos in step.
+    fn changed(&self) {
+        if let Some(session) = self.session.get().and_then(Weak::upgrade) {
+            session.read_auto_availability();
+        }
+        let callbacks: Vec<_> = self.callbacks().clone();
+        for callback in callbacks {
+            callback();
+        }
+    }
 }
 
 impl std::fmt::Debug for Core {
@@ -201,7 +253,9 @@ impl std::fmt::Debug for Core {
 
 impl Core {
     /// Builds the core: opens the preferences and the look library, starts the render engine, the
-    /// decode pool and the export queue. Nothing is written to disk.
+    /// decode pool and the export queue. Nothing is written to disk, and **no Auto program is
+    /// started**: the advisors it was given are only read (`docs/22` section 3.3); the chosen one is
+    /// checked when photos are opened or an export starts.
     ///
     /// # Errors
     ///
@@ -216,42 +270,95 @@ impl Core {
             None => None,
         };
         let preferences = Arc::new(PreferencesStore::open(&options.app_root));
+        let prefs = preferences.get();
         let own = instructions_override
             .clone()
-            .unwrap_or_else(|| preferences.get().apple_auto_instructions);
+            .unwrap_or(prefs.apple_auto_instructions.clone());
         let looks = Arc::new(LookService::open(
             &options.app_root,
             &options.data_root,
             Arc::clone(&preferences),
         )?);
-        let renderer = Renderer::new(looks.provider(), options.render)?;
-        renderer.set_display(looks.display_choice());
+        // The data folder is read once: the lens library it holds goes to the renderer (which will run
+        // the lens, `docs/21`) and stays in the session's environment (which answers `lens_list`).
+        let env = SessionEnv::load(&options.data_root)?;
+        let mut render = options.render;
+        if render.lens.is_none() {
+            render.lens = env.lens_library.as_ref().ok().cloned();
+        }
+        if render.bokeh_model.is_none() {
+            render.bokeh_model = env.bokeh_model.as_ref().ok().cloned();
+        }
+        // SAM 2.1 small for the Object mask: found here (its weights load when a mask first needs them).
+        if render.object_model.is_none() {
+            render.object_model = crate::pipeline::ObjectModel::probe(&options.data_root);
+        }
+        // Depth Anything V2-Small for the Depth mask: found here too (its weights load when a mask first needs them).
+        // The test hook `YELLOWMOON_TEST_DEPTH=fake` puts a fake model in its place, for `ym` and the app alike.
+        if render.depth_model.is_none() {
+            render.depth_model =
+                if std::env::var(crate::pipeline::DepthModel::TEST_ENV).as_deref() == Ok("fake") {
+                    Some(crate::pipeline::DepthModel::fake_default())
+                } else {
+                    crate::pipeline::DepthModel::probe(&options.data_root)
+                };
+        }
+        // The lens reads the cameras' spectral curves from the same folder.
+        if render.data_root.is_none() {
+            render.data_root = Some(options.data_root.clone());
+        }
+        let renderer = Renderer::new(looks.provider(), render)?;
 
-        let mut env = SessionEnv::load(&options.data_root)?
+        // Optional background work (prefetches, thumbnail refreshes) stops while memory is critical (`docs/26` H-14).
+        let gate = Arc::new(crate::scheduler::BackgroundGate::new());
+        let mut env = env
+            .with_background_gate(Arc::clone(&gate))
             .with_events(options.session_events)
             .with_default_look(looks.effective_default())
-            .with_decode_threads(options.decode_threads);
+            .with_decode_threads(options.decode_threads)
+            // The mosaics the session holds are counted in the renderer's ledger (`docs/26` H-13).
+            .with_ledger(Arc::clone(renderer.ledger()));
         if options.thumbnails {
             env = env.with_thumbnails(renderer.thumbnail_renderer());
         }
         if let Some(profile) = &options.forced_profile {
             env = env.with_forced_profile(profile)?;
         }
-        if let Some(advisor) = options.advisor {
-            // The model's pictures come from a renderer of their own, without the device, so they
-            // are the CPU reference path's bytes whatever the GPU policy (`docs/19` section 3).
-            let pictures = AdvisorPictures::new(env.reference_look.clone(), &renderer.options())?;
+        // The pictures Apple Auto's model and Auto crop look at come from a renderer of their own,
+        // without the device, so they are the CPU reference path's bytes whatever the GPU policy
+        // (`docs/19` section 3, `docs/20` section 4).
+        let pictures: Arc<dyn PictureRenderer> = Arc::new(AdvisorPictures::new(
+            env.reference_look.clone(),
+            &renderer.options(),
+        )?);
+        env = env.with_pictures(Arc::clone(&pictures));
+        // The listener is registered first, then the session is built, then the availability is read
+        // once more, so a probe that finished in between is not missed (`docs/22` section 11.2).
+        let auto_hub = Arc::new(AutoHub::default());
+        let advisors = options.advisors;
+        if !advisors.is_empty() {
+            let hub = Arc::clone(&auto_hub);
+            advisors.on_change(Arc::new(move || hub.changed()));
             env = env.with_apple_auto(AppleAutoEnv {
-                preference: preferences.get().apple_auto,
-                mode: options.apple_auto,
+                preference: prefs.auto_provider,
+                consent: prefs.auto_consent,
+                choice: options.auto_choice,
                 instructions: own.clone(),
-                ..AppleAutoEnv::new(advisor, Arc::new(pictures))
+                ..AppleAutoEnv::new(advisors.clone(), pictures)
             });
         }
         let session = Arc::new(Session::new(env));
-        // The preference is known to the session with or without an advisor (the status says it).
-        session.set_apple_auto_preference(preferences.get().apple_auto);
+        // The switches are known to the session with or without advisors (the status says them).
+        session.set_auto_preference(prefs.auto_provider);
+        session.set_auto_consent(prefs.auto_consent);
+        session.set_auto_choice(options.auto_choice);
         session.set_apple_auto_instructions(&own);
+        let _ = auto_hub.session.set(Arc::downgrade(&session));
+        // What the advisors last said is read, and **no program is started**: nothing runs at launch
+        // (`docs/22` section 3.3, owner 2026-10-29). The chosen program is checked when photos are
+        // opened or an export starts (`Session::open`, `Core::export_start`), and every program when
+        // Preferences opens (`Core::auto_status`).
+        session.read_auto_availability();
 
         let ctx = Arc::new(
             ExportContext::new(renderer.clone())
@@ -259,16 +366,28 @@ impl Core {
         );
         let exports = ExportQueue::new(ctx, options.export_events);
 
+        // What a memory warning acts on, and the models it unloads: the two the renderer holds.
+        let memory = Arc::new(crate::memory::Guard::new(
+            renderer.clone(),
+            Arc::clone(&session),
+            gate,
+        ));
+        let models = renderer.options();
+        if let Some(model) = &models.object_model {
+            memory.register(Arc::clone(model) as Arc<dyn Unloadable>);
+        }
+        if let Some(model) = &models.depth_model {
+            memory.register(Arc::clone(model) as Arc<dyn Unloadable>);
+        }
+
         // The first listener on `looks_changed` keeps the session and the renderer in step; the
         // application's own listener (to tell the webview) is added after it.
         {
             let looks_weak = Arc::downgrade(&looks);
             let session = Arc::clone(&session);
-            let renderer = renderer.clone();
             looks.on_change(move || {
                 if let Some(looks) = looks_weak.upgrade() {
                     session.set_default_look(looks.effective_default());
-                    renderer.set_display(looks.display_choice());
                 }
             });
         }
@@ -280,6 +399,10 @@ impl Core {
             exports,
             data_root: options.data_root,
             instructions_override,
+            advisors,
+            auto_hub,
+            memory,
+            watch: Mutex::new(None),
         })
     }
 
@@ -301,6 +424,7 @@ impl Core {
         }
         self.renderer.set_gpu(slot.gpu().cloned(), slot.stages());
         self.renderer.set_gpu_strict(slot.policy().is_strict());
+        self.renderer.set_gpu_reopener(slot.reopener());
     }
 
     /// Registers the application's listener for `looks_changed`.
@@ -345,15 +469,18 @@ impl Core {
         self.session.restore_removed()
     }
 
-    /// Quitting: cancels exports and renders, and waits (up to [`SHUTDOWN_EXPORT_WAIT`]) for the
-    /// export queue to stop.
+    /// Quitting: cancels exports and renders, kills the programs Auto started and waits for them
+    /// ([`Core::cancel_auto`]), and waits (up to [`SHUTDOWN_EXPORT_WAIT`]) for the export queue to
+    /// stop.
     ///
     /// The process ends as soon as this returns, so a worker that was still writing would never
     /// get to delete its temporary file, and a hidden `.yellowmoon-*.tmp` of tens or hundreds of
     /// megabytes would stay in the person's export folder for good. A cancel is noticed between
     /// render tiles and writer bands, a fraction of a second away.
     pub fn shutdown(&self) {
+        self.stop_memory_watch();
         self.exports.cancel_all();
+        self.cancel_auto();
         self.close_session();
         self.renderer.scheduler().cancel_all();
         if !self.exports.wait_idle(SHUTDOWN_EXPORT_WAIT) {
@@ -362,6 +489,94 @@ impl Core {
                 SHUTDOWN_EXPORT_WAIT.as_secs()
             );
         }
+    }
+
+    // --- Memory pressure (`docs/26` H-14) ---------------------------------------------------
+
+    /// Lets go of what `level` lists (`crate::memory`): at warning the cached mosaics of the photos next to the one on screen,
+    /// the finished-frame caches of every photo that is not on screen, and the models; at critical also the device's resident
+    /// raw words of the other photos and the pool's free buffers. The photo on screen ([`Session::current`]) keeps every cache.
+    /// Normal frees nothing. A model that is running an inference unloads when it ends. Does not touch the background work: that
+    /// is [`Core::apply_pressure`].
+    pub fn trim_caches(&self, level: crate::memory::PressureLevel) -> crate::memory::TrimReport {
+        self.memory.trim(level)
+    }
+
+    /// Acts on one reading of the memory level, as the poll does: trims when the level rose, pauses the background work
+    /// (prefetches and thumbnail refreshes) at critical and resumes it below, and tells the listeners of
+    /// [`Core::on_memory_notice`] when the notice appears or goes.
+    pub fn apply_pressure(
+        &self,
+        level: crate::memory::PressureLevel,
+    ) -> crate::memory::PressureStep {
+        self.memory.apply(level)
+    }
+
+    /// Registers the application's listener for the memory notice: it is given the sentence to show
+    /// ([`crate::memory::MEMORY_NOTICE_SENTENCE`]) once on the way into critical, and `None` when the level is normal again.
+    /// It runs on the poll thread (or on the caller of [`Core::apply_pressure`]) and must not block.
+    pub fn on_memory_notice(&self, f: impl Fn(Option<&str>) + Send + Sync + 'static) {
+        self.memory.on_notice(Arc::new(f));
+    }
+
+    /// Puts a model under the idle unload and the memory warning, as the Object and Depth models are
+    /// (`pipeline::Unloadable`): a model that loads on first use joins with this one call.
+    pub fn register_unloadable(&self, model: Arc<dyn Unloadable>) {
+        self.memory.register(model);
+    }
+
+    /// Unloads the models that have been idle for their idle time (five minutes) and those whose unload waited for an inference.
+    /// The poll thread does this every tick; returns how many were unloaded.
+    pub fn sweep_idle_models(&self) -> usize {
+        self.memory.sweep()
+    }
+
+    /// The switch that pauses optional background work while memory is critical: the shell's thumbnail refresher waits on it.
+    #[must_use]
+    pub fn background_gate(&self) -> &Arc<crate::scheduler::BackgroundGate> {
+        &self.memory.gate
+    }
+
+    /// Starts the thread that reads `source` at once and then every `interval`, applies each reading ([`Core::apply_pressure`])
+    /// and sweeps the idle models. The application starts it with [`crate::memory::system_pressure_source`] and
+    /// [`crate::memory::POLL_INTERVAL`]; `ym` does not (a run of the CLI is short, has no window to tell, and its exports are
+    /// held to the ledger's budget). A thread that is running is stopped first.
+    ///
+    /// # Errors
+    ///
+    /// The operating system's error when the thread cannot start.
+    pub fn start_memory_watch(
+        &self,
+        source: crate::memory::PressureSource,
+        interval: Duration,
+    ) -> std::io::Result<()> {
+        let mut watch = self.watch.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(mut old) = watch.take() {
+            old.stop();
+        }
+        *watch = Some(crate::memory::Watch::start(
+            Arc::clone(&self.memory),
+            source,
+            interval,
+        )?);
+        Ok(())
+    }
+
+    /// Stops the poll thread and waits for it ([`Core::shutdown`] does this; so does dropping the core). Does nothing when it is
+    /// not running.
+    pub fn stop_memory_watch(&self) {
+        let old = self
+            .watch
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        drop(old);
+    }
+
+    /// How many readings of the level have been applied since the core was made (a test waits on it).
+    #[must_use]
+    pub fn memory_polls(&self) -> u64 {
+        self.memory.polls()
     }
 
     // --- Preferences ----------------------------------------------------------------------
@@ -378,17 +593,18 @@ impl Core {
     /// # Errors
     ///
     /// [`CoreError::Looks`] with "That look isn't in the library." or "File missing or changed.
-    /// Import again." or "Those display LUTs aren't imported…", [`CoreError::Preferences`] when the
+    /// Import again.", [`CoreError::Preferences`] when the
     /// file cannot be saved. Nothing changes on an error.
     pub fn preferences_set(&self, patch: &PreferencesPatch) -> Result<Preferences, CoreError> {
         let next = self.looks.preferences_set(patch)?;
         self.session
             .set_default_look(self.looks.effective_default());
-        self.renderer.set_display(self.looks.display_choice());
-        // Apple Auto follows its preference at once (off: every photo back to the rule; on: the
-        // photos without an answer are asked), with the availability read again; new instructions
-        // ask every photo again (unless this run overrides them).
-        self.session.set_apple_auto_preference(next.apple_auto);
+        // The Auto providers follow their preferences at once: a provider chosen, or its consent
+        // given or taken away, acts or stops acting with the availability read again, and the photos
+        // without an answer are asked; new instructions ask every photo again (unless this run
+        // overrides them).
+        self.session.set_auto_preference(next.auto_provider);
+        self.session.set_auto_consent(next.auto_consent);
         if self.instructions_override.is_none() {
             self.session
                 .set_apple_auto_instructions(&next.apple_auto_instructions);
@@ -396,20 +612,81 @@ impl Core {
         Ok(next)
     }
 
-    // --- Apple Auto -----------------------------------------------------------------------
+    // --- Auto providers -------------------------------------------------------------------
 
-    /// Apple Auto's status for the app's Preferences (whether to show the row) and `ym doctor`, with
-    /// the availability read again (`docs/19` sections 1, 2 and 8). Without an advisor it is not
-    /// available and has no reason.
+    /// The Auto status for the app's Preferences (the dropdown, its entries and whether to show it)
+    /// and `ym doctor`, with every advisor asked to read its availability again (`docs/22` sections
+    /// 3.3 and 11). It never waits for a process: the advisors probe in the background and the status
+    /// is built from what they last said. Without advisors every program is `not_installed` and the
+    /// dropdown is hidden.
     #[must_use]
-    pub fn apple_auto_status(&self) -> AppleAutoStatus {
-        self.session.apple_auto_status()
+    pub fn auto_status(&self) -> AutoStatus {
+        self.session.auto_status()
     }
 
-    /// Sets how this run decides on Apple Auto (`ym --apple-auto on|off`; the app keeps
-    /// [`AppleAutoMode::FromPreference`]). Takes effect at once, as the preference does.
-    pub fn set_apple_auto_mode(&self, mode: AppleAutoMode) {
-        self.session.set_apple_auto_mode(mode);
+    /// The Auto status as each advisor last said it, with no probe started. This is what the
+    /// webview reads after a change of the choice, the consent or the instructions, and on
+    /// `auto_status_changed`; only Preferences opening uses [`Core::auto_status`], which refreshes
+    /// every advisor (`docs/22` section 3.3 and decision D7).
+    #[must_use]
+    pub fn auto_status_cached(&self) -> AutoStatus {
+        self.session.auto_status_cached()
+    }
+
+    /// Sets how this run chooses its provider (`ym --auto-provider p`; the app keeps
+    /// [`AutoChoice::FromPreference`]). Takes effect at once, as the preference does.
+    pub fn set_auto_choice(&self, choice: AutoChoice) {
+        self.session.set_auto_choice(choice);
+    }
+
+    /// Registers the application's callback for "an advisor's availability changed" (the shell emits
+    /// `auto_status_changed`; the webview then asks [`Core::auto_status`] again). It runs on the
+    /// advisor's probe thread after the session has read the availability again, so it must not
+    /// block.
+    pub fn on_auto_changed(&self, f: impl Fn() + Send + Sync + 'static) {
+        self.auto_hub.callbacks().push(Arc::new(f));
+    }
+
+    /// Kills the requests and probes the advisors are running, stops the session asking, and waits
+    /// (up to [`crate::session::AUTO_CANCEL_WAIT`]) until the programs were reaped and their
+    /// temporary folders removed (`docs/22` section 9.4): the app calls it when it quits (through
+    /// [`Core::shutdown`]), so the process may end as soon as it returns. A child is not stopped by its
+    /// parent's death on Unix. It cannot be undone: nothing is asked afterwards.
+    pub fn cancel_auto(&self) {
+        self.session.cancel_auto();
+    }
+
+    /// Waits until the **chosen** provider's advisor is not probing, or `timeout` has passed, and
+    /// reads what it said (`ym`, and an export that starts while the chosen provider still reads
+    /// `checking`). The other advisors are not waited for: right after launch an export with one
+    /// program chosen must not spend its 5 s on another program's start-up probe (`docs/22`
+    /// section 3.3). It starts no probe of its own.
+    pub fn settle_auto(&self, timeout: Duration) {
+        self.advisors
+            .settle_provider(self.session.chosen_provider(), timeout);
+        self.session.read_auto_availability();
+    }
+
+    // --- Lens -------------------------------------------------------------------------------
+
+    /// `lens_list`: the seven lenses of `data/lenses` in menu order, with what the Lens card shows
+    /// (`docs/21` sections 1 and 10). Empty when the lens data could not be loaded
+    /// ([`Core::lens_library`] says why); a lens setting then renders as no lens.
+    #[must_use]
+    pub fn lens_list(&self) -> Vec<LensInfo> {
+        self.session
+            .lens_library()
+            .map(|library| library.lenses().to_vec())
+            .unwrap_or_default()
+    }
+
+    /// The lens library, or why it could not be loaded (`ym lenses list` and `--lens` say so).
+    ///
+    /// # Errors
+    ///
+    /// The reason, in plain words, when `<data>/lenses` is missing or damaged.
+    pub fn lens_library(&self) -> Result<Arc<LensLibrary>, String> {
+        self.session.lens_library()
     }
 
     // --- Looks ------------------------------------------------------------------------------
@@ -421,13 +698,6 @@ impl Core {
     pub fn looks_list(&self) -> Vec<LookEntry> {
         self.looks.reload();
         self.looks.list()
-    }
-
-    /// `looks_display_luts`.
-    #[must_use]
-    pub fn looks_display_luts(&self) -> Vec<DisplayLutEntry> {
-        self.looks.reload();
-        self.looks.display_luts()
     }
 
     /// `looks_import`: a zip, a folder or a `.cube` file; `input` answers the generic question.
@@ -478,6 +748,173 @@ impl Core {
         Ok(())
     }
 
+    /// `update_settings`: applies a patch to a photo's settings ([`Session::update_settings`]) and, when the photo is the
+    /// one being looked at and has an Object, Subject, People or Depth row, asks for what those rows read in the background
+    /// ([`Core::prepare_masks`], `docs/23` sections 4.4, 4.5 and 4.8: "as soon as the row exists on the photo").
+    ///
+    /// # Errors
+    ///
+    /// [`SessionError`] as [`Session::update_settings`].
+    pub fn update_settings(
+        &self,
+        id: PhotoId,
+        patch: &SettingsPatch,
+    ) -> Result<crate::settings::ResolvedSettings, SessionError> {
+        let resolved = self.session.update_settings(id, patch)?;
+        self.prepare_masks(id);
+        Ok(resolved)
+    }
+
+    /// Asks for what the photo's raster rows read, in the background, when it is the photo being looked at: SAM's features
+    /// for an Object row ([`Core::prepare_object`]), Vision's masks for a Subject or People row
+    /// ([`Core::prepare_vision`]) and the depth map for a Depth row ([`Core::prepare_depth`]). Returns at once.
+    pub fn prepare_masks(&self, id: PhotoId) {
+        self.prepare_object(id);
+        self.prepare_vision(id);
+        self.prepare_depth(id);
+    }
+
+    /// Asks for the depth map of the photo in the background when it is the photo being looked at and has a Depth row with
+    /// the eye on ([`Renderer::depth_prepare`]; `docs/23` section 4.8). Returns at once; the picture and the network run
+    /// on the worker, which waits 150 ms so that a drag of the Input's exposure makes one map. Nothing happens for a photo
+    /// that is not current, one without a Depth row, and a copy of Yellowmoon with no Depth model.
+    pub fn prepare_depth(&self, id: PhotoId) {
+        if self.session.current() != Some(id) || !self.renderer.depth_available() {
+            return;
+        }
+        let Ok(view) = self.session.view(id) else {
+            return;
+        };
+        if !crate::pipeline::has_depth_row(&view.settings) {
+            return;
+        }
+        if let Ok(src) = crate::pipeline::PhotoSource::from_session(&self.session, id) {
+            self.renderer.depth_prepare(&src);
+        }
+    }
+
+    /// `retry_depth(photo_id)` (`docs/23` section 4.8, "Try again"): starts the depth map of a photo again after it failed.
+    /// Returns at once; the worker's end is told to the listener ([`crate::pipeline::DepthPhase`]). Nothing happens for a photo
+    /// whose map did not fail, one that is not the photo being looked at, and a copy of Yellowmoon with no Depth model.
+    ///
+    /// # Errors
+    ///
+    /// [`CoreError::Session`] for a photo that is unknown or not developed yet.
+    pub fn retry_depth(&self, id: PhotoId) -> Result<(), CoreError> {
+        let src = crate::pipeline::PhotoSource::from_session(&self.session, id)?;
+        if self.session.current() == Some(id) {
+            self.renderer.depth_retry(&src);
+        }
+        Ok(())
+    }
+
+    /// Asks for the Subject and People masks of the photo in the background when it is the photo being looked at and has a
+    /// Subject or People row with the eye on ([`Renderer::vision_prepare`]; `docs/23` section 4.5). Returns at once; the
+    /// probe, the picture and Vision run on the worker. Nothing happens for a photo that is not current, one without such
+    /// a row, and a core given no Vision provider.
+    pub fn prepare_vision(&self, id: PhotoId) {
+        if self.session.current() != Some(id) || self.renderer.vision_masks().is_none() {
+            return;
+        }
+        let Ok(view) = self.session.view(id) else {
+            return;
+        };
+        if crate::pipeline::color::vision_kinds(&view.settings).is_empty() {
+            return;
+        }
+        if let Ok(src) = crate::pipeline::PhotoSource::from_session(&self.session, id) {
+            self.renderer.vision_prepare(&src);
+        }
+    }
+
+    /// Asks for the Object features of the photo in the background when it is the photo being looked at and has an Object
+    /// row with the eye on ([`Renderer::object_prepare`]). Returns at once; nothing happens for a photo that is not
+    /// current, one without an Object row, and a copy of Yellowmoon with no Object model.
+    pub fn prepare_object(&self, id: PhotoId) {
+        if self.session.current() != Some(id) || !self.renderer.object_available() {
+            return;
+        }
+        let Ok(view) = self.session.view(id) else {
+            return;
+        };
+        if !crate::pipeline::has_object_row(&view.settings) {
+            return;
+        }
+        if let Ok(src) = crate::pipeline::PhotoSource::from_session(&self.session, id) {
+            self.renderer.object_prepare(&src);
+        }
+    }
+
+    /// `mask_kinds`: the kinds of mask this machine can make now (`docs/23` section 9): Object when the SAM weights are
+    /// there, Subject and People where the Vision probe said yes (the first call runs the probe), Depth when the depth
+    /// weights are there.
+    #[must_use]
+    pub fn mask_kinds(&self) -> Vec<crate::settings::MaskKind> {
+        self.renderer.mask_kinds()
+    }
+
+    /// The kinds of mask this machine cannot make, each with its reason (`ym doctor`).
+    #[must_use]
+    pub fn mask_unavailable(
+        &self,
+    ) -> Vec<(crate::settings::MaskKind, crate::settings::MaskUnavailable)> {
+        crate::settings::mask_unavailable_with(self.renderer.mask_support())
+    }
+
+    /// `mask_find(photo_id, node, mask, prompt)` (`docs/23` section 9): what the row would become with the click or the box,
+    /// or that nothing was found there. It changes no settings. See [`Renderer::mask_find`].
+    ///
+    /// # Errors
+    ///
+    /// [`CoreError::Session`] for a photo that is unknown or not developed yet; [`CoreError::Render`] with the `mask` scope
+    /// for a model that is missing, a mask that is not an Object row and a row with 256 points already.
+    pub fn mask_find(
+        &self,
+        id: PhotoId,
+        node: u32,
+        mask: usize,
+        prompt: crate::pipeline::ObjectPrompt,
+        cancel: &ym_gpu::queue::CancelToken,
+    ) -> Result<crate::pipeline::MaskFound, CoreError> {
+        let src = crate::pipeline::PhotoSource::from_session(&self.session, id)?;
+        Ok(self.renderer.mask_find(&src, node, mask, prompt, cancel)?)
+    }
+
+    /// `sample_depth(photo_id, x, y)` (`docs/23` section 9, Pick depth): the far limit for the depth at the point
+    /// `(x, y)` of the photo frame, or `None` when no depth map can be made. It changes no settings. See
+    /// [`Renderer::sample_depth`].
+    ///
+    /// # Errors
+    ///
+    /// [`CoreError::Session`] for a photo that is unknown or not developed yet; [`CoreError::Render`] with the `mask` scope
+    /// for a model that is missing or a point that is not a number.
+    pub fn sample_depth(
+        &self,
+        id: PhotoId,
+        x: f64,
+        y: f64,
+        cancel: &ym_gpu::queue::CancelToken,
+    ) -> Result<Option<f64>, CoreError> {
+        let src = crate::pipeline::PhotoSource::from_session(&self.session, id)?;
+        Ok(self.renderer.sample_depth(&src, x, y, cancel)?)
+    }
+
+    /// `focus_plane(photo_id)` (`docs/23` section 9, Focus plane): the far limit for the plane the camera focused on, or why
+    /// there is none. It changes no settings. See [`Renderer::focus_plane`].
+    ///
+    /// # Errors
+    ///
+    /// [`CoreError::Session`] for a photo that is unknown or not developed yet; [`CoreError::Render`] with the `mask` scope
+    /// for a model that is missing.
+    pub fn focus_plane(
+        &self,
+        id: PhotoId,
+        cancel: &ym_gpu::queue::CancelToken,
+    ) -> Result<crate::pipeline::FocusPlane, CoreError> {
+        let src = crate::pipeline::PhotoSource::from_session(&self.session, id)?;
+        Ok(self.renderer.focus_plane(&src, cancel)?)
+    }
+
     /// `apply_look`: copies a look and its intensity to This photo, the Picked photos or All.
     ///
     /// # Errors
@@ -514,10 +951,18 @@ impl Core {
         ids: &[PhotoId],
         patch: &SettingsPatch,
     ) -> Result<PasteReport, CoreError> {
-        if let Some(look) = &patch.look {
+        if let Some(look) = patch.look() {
             self.looks.check_usable(look)?;
         }
-        Ok(self.session.paste_settings(ids, patch)?)
+        let report = self.session.paste_settings(ids, patch)?;
+        // A pasted graph may bring an Object row (empty) or Subject and People rows, which are worked out again on the
+        // new photo: the encoder and the worker start for the photo being looked at.
+        if let Some(current) = self.session.current()
+            && report.pasted.iter().any(|p| p.id == current)
+        {
+            self.prepare_masks(current);
+        }
+        Ok(report)
     }
 
     // --- Export -----------------------------------------------------------------------------
@@ -531,7 +976,7 @@ impl Core {
     /// `export_start`: snapshots the photos and the preference "Remove location from exports" and
     /// queues the job. Remembers the destination folder when one was chosen. Looks at the library
     /// folder first, as [`Core::looks_list`] does (and fires `looks_changed` if that changed the
-    /// list), so a look or display LUT whose file has gone is noticed now.
+    /// list), so a look whose file has gone is noticed now.
     ///
     /// The session need not have finished developing: the burst median exposure and the pooled
     /// noise of a photo depend on the photos of its burst and of its noise pool, and a photo whose
@@ -541,18 +986,21 @@ impl Core {
     ///
     /// # Errors
     ///
-    /// [`CoreError::Looks`] when the display LUT chosen in the preferences is gone,
-    /// [`CoreError::Export`] for the rest (`QueueError::Developing` when photos of the scope have
-    /// no estimates yet).
+    /// [`CoreError::Export`] (`QueueError::Developing` when photos of the scope have no estimates
+    /// yet).
     pub fn export_start(&self, job: &ExportJob) -> Result<ExportJobId, CoreError> {
-        // Look at the library folder first: a look or display LUT whose file has gone since the
-        // last look at it is noticed now, and a look the CLI imported is known.
+        // Look at the library folder first: a look whose file has gone since the last look at it is
+        // noticed now, and a look the CLI imported is known.
         self.looks.reload();
-        // A display LUT the user chose and that has since gone is an error, not ACES 2 in its place.
-        self.looks.check_display_rendering()?;
-        // Apple Auto may have become available, or stopped being, since the last look (`docs/19`
-        // section 1); the export's photos then wait for their answers.
-        self.session.refresh_apple_auto();
+        // The chosen provider is read again (`docs/19` section 1, `docs/22` section 3.3); the export's
+        // photos then wait for their answers. The program is asked to check only when it was never
+        // checked, and an export started in the first seconds waits for a check that is still running.
+        if matches!(
+            self.session.refresh_auto_for_export(),
+            Some(Availability::Unavailable(UnavailableReason::Checking))
+        ) {
+            self.settle_auto(AUTO_SETTLE_BEFORE_EXPORT);
+        }
         let remove_location = self.preferences.get().remove_location_from_exports;
         let id = self.exports.start(&self.session, job, remove_location)?;
         if let Some(folder) = &job.options.destination {
@@ -614,10 +1062,4 @@ impl Core {
             tracing::debug!(error = %e, "could not remember the folder: details");
         }
     }
-}
-
-/// Makes a [`DisplayRendering`] from a display LUT id, for callers that build patches.
-#[must_use]
-pub fn arri_display(id: LookId) -> DisplayRendering {
-    DisplayRendering::ArriDisplay { id }
 }

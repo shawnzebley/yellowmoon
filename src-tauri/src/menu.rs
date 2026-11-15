@@ -12,8 +12,8 @@
 //! the three settings items, whose keys ⇧⌘C, ⇧⌘V and ⌥⇧⌘V are the webview's too: ⇧⌘V and ⌥⇧⌘V mean
 //! "Paste and Match Style" in other apps, and a key that the page leaves alone in a text box falls
 //! through to the menu on macOS and would paste the settings onto photos from there. The menu
-//! shows all of these items without a key. The single-key shortcuts (P, Z, C, W, \ and the arrows)
-//! are not menu shortcuts for the same reason.
+//! shows all of these items without a key. The single-key shortcuts (P, Z, C, W, N, \ and the arrows)
+//! are not menu shortcuts for the same reason: View › Nodes shows no key.
 //!
 //! Three items change with what is open: Copy Settings needs a developed current photo, Paste
 //! Settings something copied as well, and Paste Settings to Picked something copied and a picked
@@ -225,6 +225,7 @@ pub fn spec() -> Vec<Menus> {
                     None,
                     MenuAction::BeforeAfter,
                 ),
+                web("nodes", "Nodes", None, MenuAction::Nodes),
                 web("fit", "Fit", None, MenuAction::Fit),
                 web("zoom_100", "100%", None, MenuAction::Zoom100),
                 web(
@@ -252,6 +253,29 @@ pub fn spec() -> Vec<Menus> {
             ],
         },
         Menus {
+            title: "Photo",
+            entries: vec![
+                web("crop", "Crop", None, MenuAction::Crop),
+                web("auto_crop", "Auto Crop", None, MenuAction::AutoCrop),
+                web("pick_white", "Pick White", None, MenuAction::PickWhite),
+                Separator,
+                web(
+                    "remove_photo",
+                    "Remove Photo",
+                    None,
+                    MenuAction::RemovePhoto,
+                ),
+                Separator,
+                web("bypass_node", "Bypass Node", None, MenuAction::BypassNode),
+                web(
+                    "mask_view",
+                    "Show or Hide Node Mask",
+                    None,
+                    MenuAction::MaskView,
+                ),
+            ],
+        },
+        Menus {
             title: "Looks",
             entries: vec![
                 web(
@@ -260,13 +284,28 @@ pub fn spec() -> Vec<Menus> {
                     None,
                     MenuAction::ImportArriLooks,
                 ),
-                web("import_cube", "Import .cube…", None, MenuAction::ImportCube),
+                web(
+                    "import_cube",
+                    "Import LUTs and look files…",
+                    None,
+                    MenuAction::ImportCube,
+                ),
                 web(
                     "make_default_look",
                     "Make Current Look Default",
                     None,
                     MenuAction::MakeDefaultLook,
                 ),
+                Separator,
+                web("look_1", "Apply Look 1", None, MenuAction::Look1),
+                web("look_2", "Apply Look 2", None, MenuAction::Look2),
+                web("look_3", "Apply Look 3", None, MenuAction::Look3),
+                web("look_4", "Apply Look 4", None, MenuAction::Look4),
+                web("look_5", "Apply Look 5", None, MenuAction::Look5),
+                web("look_6", "Apply Look 6", None, MenuAction::Look6),
+                web("look_7", "Apply Look 7", None, MenuAction::Look7),
+                web("look_8", "Apply Look 8", None, MenuAction::Look8),
+                web("look_9", "Apply Look 9", None, MenuAction::Look9),
                 Separator,
                 item(
                     "show_looks_folder",
@@ -497,6 +536,7 @@ mod tests {
                 "File",
                 "Edit",
                 "View",
+                "Photo",
                 "Looks",
                 "Window",
                 "Help"
@@ -528,6 +568,7 @@ mod tests {
             "Clear Picks",
             // View
             "Before/After",
+            "Nodes",
             "Fit",
             "100%",
             "Zoom In",
@@ -536,7 +577,7 @@ mod tests {
             "Previous Photo",
             // Looks
             "Import ARRI Looks…",
-            "Import .cube…",
+            "Import LUTs and look files…",
             "Make Current Look Default",
             "Show Looks Folder",
             // Help
@@ -602,6 +643,7 @@ mod tests {
             MenuAction::PickAll,
             MenuAction::ClearPicks,
             MenuAction::BeforeAfter,
+            MenuAction::Nodes,
             MenuAction::Fit,
             MenuAction::Zoom100,
             MenuAction::ZoomIn,
@@ -614,6 +656,21 @@ mod tests {
             MenuAction::CopySettings,
             MenuAction::PasteSettings,
             MenuAction::PasteSettingsToPicked,
+            MenuAction::Crop,
+            MenuAction::AutoCrop,
+            MenuAction::PickWhite,
+            MenuAction::RemovePhoto,
+            MenuAction::BypassNode,
+            MenuAction::MaskView,
+            MenuAction::Look1,
+            MenuAction::Look2,
+            MenuAction::Look3,
+            MenuAction::Look4,
+            MenuAction::Look5,
+            MenuAction::Look6,
+            MenuAction::Look7,
+            MenuAction::Look8,
+            MenuAction::Look9,
         ];
         let ours: HashSet<String> = all
             .iter()
@@ -658,6 +715,55 @@ mod tests {
         }
         // ⌘, ⌘O ⇧⌘O ⌘E ⌘W ⌘= ⌘-
         assert_eq!(seen.len(), 7);
+    }
+
+    /// "Single-key shortcuts" off (`docs/28` A-P11) must really turn those keys off, so the native
+    /// menu may not hold a key equivalent that is one key: every shortcut has ⌘, and no item of the
+    /// menu takes P, Z, C, W, N, F, B, M, A, a digit, a backslash, Delete or Backspace.
+    #[test]
+    fn no_item_has_a_single_key_equivalent() {
+        for (id, _, shortcut, _) in items() {
+            let Some(s) = shortcut else { continue };
+            assert!(s.contains("CmdOrCtrl+"), "{id}: {s} is not a ⌘ key");
+        }
+    }
+
+    /// The actions whose keys the switch turns off each have a menu item (`docs/28` A-P11), so
+    /// nothing is stranded: the Photo menu and the nine look items.
+    #[test]
+    fn every_action_of_a_single_key_has_an_item() {
+        let actions: Vec<MenuAction> = items()
+            .into_iter()
+            .filter_map(|(_, _, _, a)| match a {
+                Do::Webview(m) => Some(m),
+                _ => None,
+            })
+            .collect();
+        for needed in [
+            MenuAction::Pick,
+            MenuAction::BeforeAfter,
+            MenuAction::Nodes,
+            MenuAction::Fit,
+            MenuAction::Zoom100,
+            MenuAction::Crop,
+            MenuAction::AutoCrop,
+            MenuAction::PickWhite,
+            MenuAction::RemovePhoto,
+            MenuAction::BypassNode,
+            MenuAction::MaskView,
+            MenuAction::Look1,
+            MenuAction::Look5,
+            MenuAction::Look9,
+        ] {
+            assert!(actions.contains(&needed), "{needed:?}");
+        }
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|a| format!("{a:?}").starts_with("Look"))
+                .count(),
+            9
+        );
     }
 
     #[test]
@@ -711,6 +817,34 @@ mod tests {
     }
 
     #[test]
+    fn the_nodes_item_is_in_the_view_menu_with_no_key() {
+        // N is a plain letter that types, so it is the webview's, as P, Z, C and W are (`docs/11` §Menus).
+        let view = spec()
+            .into_iter()
+            .find(|m| m.title == "View")
+            .expect("View");
+        let labels: Vec<&str> = view
+            .entries
+            .iter()
+            .filter_map(|e| match e {
+                Entry::Item { label, .. } => Some(*label),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(labels[..2], ["Before/After", "Nodes"]);
+        let nodes = items().into_iter().find(|i| i.0 == "nodes").expect("nodes");
+        assert_eq!(
+            nodes,
+            ("nodes", "Nodes", None, Do::Webview(MenuAction::Nodes))
+        );
+        assert_eq!(action_for("nodes"), Some(Do::Webview(MenuAction::Nodes)));
+        assert_eq!(
+            serde_json::to_value(MenuAction::Nodes).expect("json"),
+            "nodes"
+        );
+    }
+
+    #[test]
     fn items_resolve_by_id() {
         assert_eq!(action_for("export"), Some(Do::Webview(MenuAction::Export)));
         assert_eq!(action_for("show_looks_folder"), Some(Do::ShowLooksFolder));
@@ -752,6 +886,7 @@ mod tests {
                 "File",
                 "Edit",
                 "View",
+                "Photo",
                 "Looks",
                 "Window",
                 "Help"

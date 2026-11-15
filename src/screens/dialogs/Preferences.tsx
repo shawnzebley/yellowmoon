@@ -1,31 +1,42 @@
 import { useEffect, useId, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
+import { Badge } from "@/components/glass/badge";
 import { Item, ItemActions, ItemContent, ItemDescription, ItemTitle } from "@/components/glass/item";
 import { Label } from "@/components/glass/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/glass/select";
 import { Textarea } from "@/components/glass/textarea";
-import type { AppleAutoStatus } from "../../api/types";
-import { Button, LinkButton, Segmented, Switch } from "../../components";
+import type { AutoProvider, AutoStatus, ProviderStatus } from "../../api/types";
+import { Button, LinkButton, RowNote, Switch } from "../../components";
 import { exportModel } from "../../export/model";
+import {
+  AUTO_GRADING_TITLE,
+  autoRowShown,
+  checkingNote,
+  dropdownEntries,
+  dropdownValue,
+  EXPERIMENTAL_LABEL,
+  EXPERIMENTAL_NOTE,
+  INSTRUCTIONS_COPY,
+  PROVIDER_HINTS,
+  PROVIDER_LIST_NAMES,
+  PROVIDER_NAMES,
+  providerNote,
+  savedChoiceNote,
+  savedProgramChecking,
+  unavailableTag,
+  USE_DEFAULT_AUTO,
+} from "../../state/autoProviders";
 import { useAppState, useStore } from "../../state/context";
 import type { AppStore } from "../../state/store";
 import { lookLabeller } from "../../state/looks";
-import { preferredDisplayLut } from "../../wizard/model";
 import { ExportOptionsForm } from "../export/ExportOptionsForm";
 import { Dialog } from "./Dialog";
 
-/** The title of the Apple Auto row (`docs/19` section 2). */
-export const APPLE_AUTO_TITLE = "Auto with Apple Intelligence";
+/** The label of the instructions field while Apple Intelligence grades (`docs/22` section 12.4; the others are in `INSTRUCTIONS_COPY`). */
+export const APPLE_INSTRUCTIONS_LABEL = INSTRUCTIONS_COPY.apple.label;
 
-/** Its hint, word for word from `docs/19` section 2. */
-export const APPLE_AUTO_HINT =
-  "Apple's on-device model looks at each photo and grades it: exposure, highlights, shadows, black level, contrast, warmth, tint, saturation and the colours of the shadows and highlights. It runs on this Mac and sends nothing anywhere. Turn it off to use Yellowmoon's own Auto, the same on every computer.";
-
-/** The label of the instructions field under the Apple Auto row (`docs/19` section 2). */
-export const APPLE_INSTRUCTIONS_LABEL = "Instructions for Apple Intelligence";
-
-/** Its hint (`docs/19` section 2). */
-export const APPLE_INSTRUCTIONS_HINT = "Apple's model reads these before each photo. The answer form stays the same.";
+/** Its hint. */
+export const APPLE_INSTRUCTIONS_HINT = INSTRUCTIONS_COPY.apple.hint;
 
 /** The button that puts the default instructions back (`docs/19` section 2). */
 export const APPLE_INSTRUCTIONS_RESET = "Reset to default";
@@ -37,13 +48,25 @@ export const APPLE_INSTRUCTIONS_SAVE_MS = 800;
 const charCount = (text: string): number => [...text].length;
 
 /**
- * The instructions Apple's model reads before each photo (`docs/19` section 2), under the Apple Auto row while its switch is on: a
- * glasscn text area holding the instructions in use (the default when none are saved), a hint, a count against the limit and a
- * Reset to default button, disabled while the text is the default. The text is saved when the field loses focus or when typing has
- * rested for {@link APPLE_INSTRUCTIONS_SAVE_MS}, never per keystroke; the default text is saved as `""` (the default), and text over
+ * The instructions the grading model reads before each photo (`docs/19` section 2, `docs/22` section 12.4), under the Auto grading row
+ * while a provider other than Default Auto grades: a glasscn text area holding the instructions in use (the default when none
+ * are saved), a hint, a count against the limit and a Reset to default button, disabled while the text is the default. The text is one
+ * for every provider; its label and hint name the one that grades (`provider`). It is saved when the field loses focus or when typing
+ * has rested for {@link APPLE_INSTRUCTIONS_SAVE_MS}, never per keystroke; the default text is saved as `""` (the default), and text over
  * the limit is not saved. A save that changes them asks every photo again (the core does it); Reset to default saves at once.
  */
-export function AppleInstructions({ store, saved, status }: { store: AppStore; saved: string; status: AppleAutoStatus }) {
+export function AppleInstructions({
+  store,
+  saved,
+  status,
+  provider = "apple",
+}: {
+  store: AppStore;
+  saved: string;
+  status: AutoStatus;
+  provider?: Exclude<AutoProvider, "yellowmoon">;
+}) {
+  const copy = INSTRUCTIONS_COPY[provider];
   const defaultText = status.default_instructions;
   const max = status.instructions_max_chars;
   const inUse = saved.trim() === "" ? defaultText : saved;
@@ -77,7 +100,7 @@ export function AppleInstructions({ store, saved, status }: { store: AppStore; s
   return (
     <div className="ym-pref__instructions" role="group" aria-labelledby={`${id}-label`}>
       <Label id={`${id}-label`} htmlFor={`${id}-text`} className="ym-pref__title">
-        {APPLE_INSTRUCTIONS_LABEL}
+        {copy.label}
       </Label>
       <Textarea
         id={`${id}-text`}
@@ -97,7 +120,7 @@ export function AppleInstructions({ store, saved, status }: { store: AppStore; s
       />
       <div className="ym-pref__instructions-foot">
         <p id={`${id}-hint`} className="ym-pref__hint">
-          {APPLE_INSTRUCTIONS_HINT}{" "}
+          {copy.hint}{" "}
           <span id={`${id}-count`} className="ym-pref__count">
             {`${count} of ${max} characters.`}
           </span>
@@ -128,18 +151,23 @@ interface RowProps {
   hint?: ReactNode;
   /** The hint is a paragraph: shown whole, where a hint is otherwise cut after two lines. */
   longHint?: boolean;
+  /** Under the hint, in the same column: a note that belongs to the row (Antigravity's Experimental note). */
+  note?: ReactNode;
+  /** The control sits at the top, level with the title, instead of in the middle of a tall text column. */
+  top?: boolean;
   children: ReactNode;
 }
 
 /** One row of Preferences: a title and a line of help at the left, the control at the right. */
-function Row({ title, hint, longHint = false, children }: RowProps) {
+function Row({ title, hint, longHint = false, note, top = false, children }: RowProps) {
   return (
-    <Item size="sm" role="group" aria-label={title} className="ym-pref">
+    <Item size="sm" role="group" aria-label={title} className={top ? "ym-pref ym-pref--top" : "ym-pref"}>
       <ItemContent className="ym-pref__text">
         <ItemTitle className="ym-pref__title" aria-hidden="true">
           {title}
         </ItemTitle>
         {hint ? <ItemDescription className={longHint ? "ym-pref__hint line-clamp-none" : "ym-pref__hint"}>{hint}</ItemDescription> : null}
+        {note}
       </ItemContent>
       <ItemActions className="ym-pref__control">{children}</ItemActions>
     </Item>
@@ -147,18 +175,171 @@ function Row({ title, hint, longHint = false, children }: RowProps) {
 }
 
 /**
+ * What a screen reader says for an entry of the dropdown: the name, "experimental" for Antigravity and, for a program that is listed but
+ * cannot be chosen, why ("Claude Code, not signed in", `docs/22` section 12.9). The visible tag and badge say the same in short.
+ */
+function entryLabel(status: ProviderStatus): string {
+  const tag = status.selectable ? null : unavailableTag(status.state);
+  return [PROVIDER_LIST_NAMES[status.provider], status.experimental ? "experimental" : null, tag ? tag.toLowerCase() : null]
+    .filter((part) => part !== null)
+    .join(", ");
+}
+
+/** An entry of the dropdown: the name, Antigravity's Experimental badge, and the muted tag of a program that cannot be chosen (`docs/22` section 12.1). */
+function EntryName({ status }: { status: ProviderStatus }) {
+  const tag = status.selectable ? null : unavailableTag(status.state);
+  return (
+    <>
+      {PROVIDER_LIST_NAMES[status.provider]}
+      {status.experimental ? (
+        <Badge variant="outline" className="ym-pref__badge">
+          {EXPERIMENTAL_LABEL}
+        </Badge>
+      ) : null}
+      {tag ? (
+        <Badge variant="secondary" className="ym-pref__tag">
+          {tag}
+        </Badge>
+      ) : null}
+    </>
+  );
+}
+
+/**
+ * The "Auto grading" row and what belongs to it (`docs/22` section 12): a glasscn `Select` of Default Auto, Apple Intelligence
+ * (while available), Claude Code and Antigravity (while listed; a program that is installed but cannot be used is listed disabled, with
+ * a tag), the hint of the provider that grades, Antigravity's Experimental note, a note under the row for each program that cannot be
+ * used and for a saved choice that is not available (with a "Use Default Auto" button that withdraws it), and the instructions. The
+ * select shows who grades now (`effective`), or the saved program itself while that is listed but cannot be chosen, so that choosing
+ * Default Auto is a real change (`dropdownValue`); choosing a program the person has not agreed to opens the consent dialog and changes
+ * nothing until they say yes (`AppStore.chooseProvider`).
+ */
+function AutoGrading({ store, auto, saved, os }: { store: AppStore; auto: AutoStatus; saved: string; os: string | null }) {
+  // When the consent dialog closes the focus goes back to the dropdown that opened it (Radix cannot: the list had already closed when
+  // the dialog mounted, so there was nothing to remember).
+  const trigger = useRef<HTMLButtonElement>(null);
+  const consentFor = useAppState((s) => s.consentFor);
+  const asked = useRef(false);
+  useEffect(() => {
+    if (consentFor !== null) asked.current = true;
+    else if (asked.current) {
+      asked.current = false;
+      trigger.current?.focus({ preventScroll: true });
+    }
+  }, [consentFor]);
+  const entries = dropdownEntries(auto);
+  const checking = checkingNote(auto);
+  const notes = [...auto.providers.map((p) => providerNote(p, os ?? "")), checking].filter((note): note is string => note !== null);
+  // A saved program that is still being checked for the first time is not known to be unavailable: no "isn't available now" until it is.
+  const saveNote = savedProgramChecking(auto) ? null : savedChoiceNote(auto.preference, auto.effective);
+  const experimental = auto.effective === "agy";
+  // The dropdown's value: the saved program itself while it is listed but not usable, else who grades. In the trigger that entry says why
+  // it is not usable (its tag) in place of the Experimental badge, which would not fit beside it in 220 px.
+  const shown = dropdownValue(auto);
+  const shownStatus = auto.providers.find((p) => p.provider === shown);
+  const shownTag = shownStatus !== undefined && !shownStatus.selectable && shown !== "yellowmoon" ? unavailableTag(shownStatus.state) : null;
+  const shownBadge = shown === "agy" && shownTag === null;
+  return (
+    <>
+      <Row
+        title={AUTO_GRADING_TITLE}
+        hint={PROVIDER_HINTS[auto.effective]}
+        longHint
+        top
+        note={
+          experimental ? (
+            <div className="ym-pref__experimental">
+              <Badge variant="outline">{EXPERIMENTAL_LABEL}</Badge>
+              <RowNote className="ym-pref__note">{EXPERIMENTAL_NOTE}</RowNote>
+            </div>
+          ) : null
+        }
+      >
+        <Select value={shown} onValueChange={(next) => void store.chooseProvider(next as AutoProvider)}>
+          <SelectTrigger ref={trigger} aria-label={AUTO_GRADING_TITLE} className="w-[220px]">
+            {/* Antigravity's name is short here ("Antigravity (agy)" is in the list) so that its badge fits the 220 px of the trigger. */}
+            <SelectValue>
+              {PROVIDER_NAMES[shown]}
+              {shownBadge ? (
+                <>
+                  {" "}
+                  <Badge variant="outline" className="ym-pref__badge h-4 px-1.5 text-[0.625rem]">
+                    {EXPERIMENTAL_LABEL}
+                  </Badge>
+                </>
+              ) : null}
+              {shownTag !== null ? (
+                <>
+                  {" "}
+                  <Badge variant="secondary" className="ym-pref__tag ym-pref__tag--trigger text-[0.625rem]">
+                    {shownTag}
+                  </Badge>
+                </>
+              ) : null}
+            </SelectValue>
+          </SelectTrigger>
+          <SelectContent>
+            {entries.map((entry) => (
+              // Radix names an option by its text; `aria-labelledby` is left out so that the label above says why an entry is disabled.
+              <SelectItem
+                key={entry.provider}
+                value={entry.provider}
+                disabled={entry.provider !== "yellowmoon" && !entry.selectable}
+                aria-label={entryLabel(entry)}
+                aria-labelledby={undefined}
+              >
+                <EntryName status={entry} />
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+      </Row>
+      {notes.length > 0 || saveNote !== null ? (
+        <div className="ym-pref__notes">
+          {notes.map((note) => (
+            <RowNote key={note} role="note" className="ym-pref__note">
+              {note}
+            </RowNote>
+          ))}
+          {saveNote !== null ? (
+            <div className="ym-pref__saved">
+              <RowNote role="note" className="ym-pref__note">
+                {saveNote}
+              </RowNote>
+              {/* Choosing Default Auto in the dropdown is no change while it is the value shown, and a saved program that is not listed
+                  cannot be shown there at all: this always withdraws the saved choice. No consent is involved. */}
+              <LinkButton
+                size="sm"
+                onClick={() => {
+                  void store.chooseProvider("yellowmoon");
+                  // The button goes with the note: the focus stays in the row (the dropdown), unless the row goes too.
+                  trigger.current?.focus({ preventScroll: true });
+                }}
+              >
+                {USE_DEFAULT_AUTO}
+              </LinkButton>
+            </div>
+          ) : null}
+        </div>
+      ) : null}
+      {auto.effective !== "yellowmoon" ? <AppleInstructions store={store} saved={saved} status={auto} provider={auto.effective} /> : null}
+    </>
+  );
+}
+
+/**
  * Preferences (⌘,, `docs/11-ui.md` §Preferences): a small window in the same style, one column of rows. Everything here is
- * a preference of `docs/01` §Persistence and is saved as soon as it changes; nothing needs a Save button. "Auto with Apple
- * Intelligence" is there only while Apple Auto is available on this computer, which is asked each time the window opens
- * (`docs/19` sections 1 and 2): absent everywhere else, the browser build included.
+ * a preference of `docs/01` §Persistence and is saved as soon as it changes; nothing needs a Save button. "Auto grading" is there only
+ * while Apple Intelligence is available or Claude Code or Antigravity is installed, which is asked each time the window opens
+ * (`docs/22` sections 3 and 12): absent everywhere else, the browser build included. The consent dialog (`AutoConsent`) opens over it.
  */
 export function Preferences() {
   const store = useStore();
   const prefs = useAppState((s) => s.preferences);
   const looks = useAppState((s) => s.looks);
-  const luts = useAppState((s) => s.displayLuts);
   const cli = useAppState((s) => s.cliLink);
-  const appleAuto = useAppState((s) => s.appleAuto);
+  const auto = useAppState((s) => s.auto);
+  const os = useAppState((s) => s.os);
   const exportOptions = useAppState((s) => s.exportOptions);
   const session = useAppState((s) => s.session);
   const settings = useAppState((s) => s.settings);
@@ -173,8 +354,6 @@ export function Preferences() {
   // A title that two libraries share says which one it is ("Film · LogC3"), since the list stands without its sections.
   const label = lookLabeller(looks ?? []);
   const lookOptions = (looks ?? []).filter((l) => !l.missing).map((l) => ({ value: l.id, label: label(l) }));
-  const arriLut = preferredDisplayLut(luts);
-  const usingArri = prefs?.display_rendering.kind === "arri_display";
 
   return (
     <Dialog
@@ -210,38 +389,7 @@ export function Preferences() {
               </SelectContent>
             </Select>
           </Row>
-          <Row
-            title="Display rendering"
-            hint={arriLut ? "How log becomes a picture." : "Import ARRI's display LUTs to use them here."}
-          >
-            <Segmented
-              fit
-              label="Display rendering"
-              size="md"
-              value={usingArri ? "arri" : "ours"}
-              onChange={(next) =>
-                void store.setPreferences({
-                  display_rendering: next === "arri" && arriLut ? { kind: "arri_display", id: arriLut.id } : { kind: "aces2" },
-                })
-              }
-              options={[
-                { value: "ours", label: "Ours · ACES 2" },
-                { value: "arri", label: "ARRI's", disabled: !arriLut, ariaLabel: arriLut ? "ARRI's display rendering" : "ARRI's display rendering, not imported" },
-              ]}
-            />
-          </Row>
-          {appleAuto?.available ? (
-            <>
-              <Row title={APPLE_AUTO_TITLE} hint={APPLE_AUTO_HINT} longHint>
-                <Switch
-                  label={APPLE_AUTO_TITLE}
-                  checked={prefs.apple_auto}
-                  onChange={(on) => void store.setPreferences({ apple_auto: on })}
-                />
-              </Row>
-              {prefs.apple_auto ? <AppleInstructions store={store} saved={prefs.apple_auto_instructions} status={appleAuto} /> : null}
-            </>
-          ) : null}
+          {auto !== null && autoRowShown(auto) ? <AutoGrading store={store} auto={auto} saved={prefs.apple_auto_instructions} os={os} /> : null}
           <Row title="Export defaults" hint="Format, quality, size, where files go and how they are named.">
             <LinkButton aria-expanded={editing} onClick={() => setEditing((on) => !on)}>
               {editing ? "Hide" : "Edit…"}
@@ -271,6 +419,13 @@ export function Preferences() {
               label="Check for updates automatically"
               checked={prefs.check_for_updates_automatically}
               onChange={(on) => void store.setPreferences({ check_for_updates_automatically: on })}
+            />
+          </Row>
+          <Row title="Single-key shortcuts" hint="Turn off if you use speech input or a screen reader. Every action stays in the menu bar.">
+            <Switch
+              label="Single-key shortcuts"
+              checked={prefs.single_key_shortcuts}
+              onChange={(on) => void store.setPreferences({ single_key_shortcuts: on })}
             />
           </Row>
           <Row

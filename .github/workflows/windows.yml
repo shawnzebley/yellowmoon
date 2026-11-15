@@ -139,7 +139,7 @@ jobs:
           DEST="$RUNNER_TEMP/ym/ym"
           mkdir -p "$DEST/data/looks"
           cp target/release/ym.exe "$DEST/"
-          cp -r data/alexa data/arri data/cameras data/models "$DEST/data/"
+          cp -r data/alexa data/arri data/cameras data/film data/lenses data/models "$DEST/data/"
           cp -r data/looks/builtin "$DEST/data/looks/builtin"
           cp data/looks/arri-packages.json "$DEST/data/looks/"
           cp LICENSE NOTICE THIRD-PARTY.md "$DEST/"

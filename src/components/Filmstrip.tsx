@@ -1,9 +1,13 @@
-import { useEffect, useId, useRef, useState } from "react";
-import type { FocusEvent, KeyboardEvent, MouseEvent, PointerEvent, ReactNode } from "react";
+import { memo, useCallback, useEffect, useId, useRef, useState } from "react";
+import type { CSSProperties, FocusEvent, KeyboardEvent, MouseEvent, PointerEvent, ReactNode } from "react";
 import { ContextMenu, ContextMenuContent, ContextMenuItem, ContextMenuShortcut, ContextMenuTrigger } from "@/components/glass/context-menu";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/glass/tooltip";
 import { cx } from "./cx";
+import { useStableCallback } from "./hooks";
+import { NodesGlyph } from "./NodesGlyph";
 import { Tag } from "./Tag";
 import type { TabId } from "./tabs";
+import { useWindowedRange } from "./windowed";
 
 /** What a thumbnail shows: a picture, a placeholder while developing, or a "can't open" tag. */
 export type FilmstripStatus = "ready" | "developing" | "failed";
@@ -22,6 +26,11 @@ export interface FilmstripPhoto {
   picked?: boolean;
   /** Export mode only: this photo will be exported. Others are dimmed. */
   included?: boolean;
+  /**
+   * What the photo's graph has that the simple view does not show, in words ("4 nodes", "Node 1 has masks or a trim"): the thumbnail
+   * carries the nodes glyph at its bottom left with these words as its tooltip, and its name says them too (`docs/23` §6).
+   */
+  nodes?: string;
 }
 
 export interface FilmstripProps {
@@ -51,6 +60,13 @@ export interface FilmstripProps {
   tab?: TabId;
   /** Accessible name of the strip. Defaults to "Photos" (browse) or "Photos to export". */
   label?: string;
+  /**
+   * The photos the strip draws changed (a windowed strip only: from 100 photos on), as ids in order. The shell keeps the thumbnails
+   * under a byte budget; this is how it learns which photos are on screen (`docs/26` H-11). Not called for a strip drawn whole.
+   */
+  onInView?: (ids: number[]) => void;
+  /** Hidden (the Photos screen's full screen, F). The strip still follows the photo on screen and shows it when it is back. */
+  hidden?: boolean;
   className?: string;
 }
 
@@ -116,6 +132,106 @@ function MenuAround({
   );
 }
 
+/** What `Thumb` draws for one photo. */
+interface ThumbProps {
+  photo: FilmstripPhoto;
+  mode: "browse" | "export";
+  isCurrent: boolean;
+  /** Browse mode: this thumbnail is the strip's one tab stop. */
+  tabbable: boolean;
+  /** A right-click menu about this photo is open. */
+  menuOpen: boolean;
+  register: (id: number | string, node: HTMLElement | null) => void;
+  onActivate: (id: number | string, pick: boolean) => void;
+}
+
+/** The words that name a photo, for its accessible name. */
+function describe(photo: FilmstripPhoto, mode: "browse" | "export"): string {
+  return [
+    photo.name,
+    photo.status === "failed" ? "can't open" : photo.status === "developing" ? "developing" : null,
+    photo.picked ? "picked" : null,
+    photo.nodes ? photo.nodes.charAt(0).toLowerCase() + photo.nodes.slice(1) : null,
+    mode === "export" && photo.included ? "will be exported" : null,
+  ]
+    .filter(Boolean)
+    .join(", ");
+}
+
+/** Two photos draw the same: the fields `Thumb` reads, by value (the list is made again whenever anything about any photo changes). */
+const samePhoto = (a: FilmstripPhoto, b: FilmstripPhoto): boolean =>
+  a === b || (a.id === b.id && a.name === b.name && a.src === b.src && a.status === b.status && a.picked === b.picked && a.included === b.included && a.nodes === b.nodes);
+
+/** One thumbnail. Memoised by value, so a key press draws the two thumbnails that change and not the other hundreds. */
+const Thumb = memo(
+  function Thumb({ photo, mode, isCurrent, tabbable, menuOpen, register, onActivate }: ThumbProps) {
+    const content = (
+      <>
+        {photo.status !== "failed" && photo.status !== "developing" && photo.src ? (
+          <img src={photo.src} alt="" draggable={false} loading="lazy" decoding="async" />
+        ) : null}
+        {photo.status === "failed" ? (
+          <span className="ym-filmstrip__failed">
+            <Tag variant="cant-open" size="sm" />
+          </span>
+        ) : null}
+        {photo.picked ? <span className="ym-filmstrip__picked" aria-hidden="true" /> : null}
+        {photo.nodes ? (
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <span className="ym-filmstrip__nodes" data-nodes={photo.nodes}>
+                <NodesGlyph />
+              </span>
+            </TooltipTrigger>
+            <TooltipContent>{photo.nodes}</TooltipContent>
+          </Tooltip>
+        ) : null}
+      </>
+    );
+    const common = {
+      "data-photo-id": String(photo.id),
+      "data-status": photo.status === "ready" ? undefined : photo.status,
+      ref: (node: HTMLElement | null) => register(photo.id, node),
+    };
+    if (mode === "export") {
+      return (
+        <span
+          {...common}
+          role="img"
+          aria-label={describe(photo, mode)}
+          className="ym-filmstrip__thumb"
+          aria-current={isCurrent ? "true" : undefined}
+          data-in-export={photo.included ? "true" : "false"}
+        >
+          {content}
+        </span>
+      );
+    }
+    return (
+      <button
+        {...common}
+        type="button"
+        className="ym-filmstrip__thumb"
+        aria-label={`Show ${describe(photo, mode)}`}
+        aria-current={isCurrent ? "true" : "false"}
+        data-menu={menuOpen ? "open" : undefined}
+        tabIndex={tabbable ? 0 : -1}
+        onClick={(event: MouseEvent<HTMLButtonElement>) => onActivate(photo.id, event.metaKey)}
+      >
+        {content}
+      </button>
+    );
+  },
+  (a, b) =>
+    a.mode === b.mode &&
+    a.isCurrent === b.isCurrent &&
+    a.tabbable === b.tabbable &&
+    a.menuOpen === b.menuOpen &&
+    a.register === b.register &&
+    a.onActivate === b.onActivate &&
+    samePhoto(a.photo, b.photo),
+);
+
 /**
  * The filmstrip under the photo: 3:2 thumbnails as tall as the row less the panel inset above and
  * below (24 px, the tool panel's own inset), the current one told apart by a 3 px accent ring, a
@@ -135,6 +251,8 @@ export function Filmstrip({
   caption,
   tab,
   label,
+  hidden = false,
+  onInView,
   className,
 }: FilmstripProps) {
   const captionId = useId();
@@ -142,7 +260,18 @@ export function Filmstrip({
   const scroller = useRef<HTMLDivElement>(null);
   const focusAfter = useRef<number | string | null>(null);
   const currentIndex = photos.findIndex((p) => p.id === currentId);
-  const tabbableIndex = currentIndex >= 0 ? currentIndex : 0;
+  // Only the thumbnails in view and a margin are drawn once the folder is large (`docs/11` §Large folders).
+  const win = useWindowedRange({ count: photos.length, axis: "x", list: scroller, scroller, itemSelector: ".ym-filmstrip__thumb", estimate: 120 });
+  // The strip's one tab stop is the photo on screen; when that one is far off and not drawn, the first drawn thumbnail takes it.
+  const tabbableIndex = currentIndex >= win.start && currentIndex < win.end ? currentIndex : win.start;
+  // The shell learns which photos are drawn, so that it can make again a thumbnail it let go of while the photo was out of sight.
+  const drawnIds = win.windowed && !hidden ? photos.slice(win.start, win.end).flatMap((p) => (typeof p.id === "number" ? [p.id] : [])) : null;
+  const drawnKey = drawnIds === null ? null : drawnIds.join(",");
+  const latestDrawn = useRef(drawnIds);
+  latestDrawn.current = drawnIds;
+  useEffect(() => {
+    if (drawnKey !== null && onInView && latestDrawn.current) onInView(latestDrawn.current);
+  }, [drawnKey, onInView]);
   const pickedCount = photos.filter((p) => p.picked).length;
 
   // One context menu for the whole strip (a menu per thumbnail would be hundreds of Radix roots to redraw whenever a thumbnail
@@ -172,15 +301,28 @@ export function Filmstrip({
   }, [photos, currentId]);
 
   // Keep the current photo in view, and keep focus on it after keyboard navigation. Only the strip
-  // scrolls, sideways: `scrollIntoView` would also move the page.
+  // scrolls, sideways: `scrollIntoView` would also move the page. A hidden strip has no boxes to measure; it reveals the photo on
+  // screen when it shows again (the arrows moved through the photos in full screen).
+  // A photo that is not drawn (far off in a large folder) is brought into view by arithmetic, which draws it; the effect runs again then.
+  const toReveal = useRef<number | string | null>(null);
   useEffect(() => {
-    const el = currentId === null ? undefined : refs.current.get(currentId);
-    if (!el) return;
+    toReveal.current = currentId === null || hidden ? null : currentId;
+  }, [currentId, hidden]);
+  const { scrollToIndex } = win;
+  useEffect(() => {
+    const id = toReveal.current;
+    if (id === null) return;
+    const el = refs.current.get(id);
+    if (!el) {
+      if (currentIndex >= 0) scrollToIndex(currentIndex);
+      return;
+    }
+    toReveal.current = null;
     const strip = scroller.current;
     if (strip) strip.scrollLeft += scrollOffsetToReveal(strip.getBoundingClientRect(), el.getBoundingClientRect());
-    if (focusAfter.current === currentId) el.focus({ preventScroll: true });
+    if (focusAfter.current === id) el.focus({ preventScroll: true });
     focusAfter.current = null;
-  }, [currentId]);
+  }, [currentId, hidden, currentIndex, scrollToIndex, win.start, win.end]);
 
   const onKeyDown = (event: KeyboardEvent<HTMLElement>): void => {
     if (mode !== "browse" || event.metaKey || event.ctrlKey || event.altKey) return;
@@ -205,33 +347,21 @@ export function Filmstrip({
 
   const captionText = caption ?? filmstripCaption(photos, currentId, mode);
 
-  const thumbContent = (photo: FilmstripPhoto): ReactNode => (
-    <>
-      {photo.status !== "failed" && photo.status !== "developing" && photo.src ? <img src={photo.src} alt="" draggable={false} /> : null}
-      {photo.status === "failed" ? (
-        <span className="ym-filmstrip__failed">
-          <Tag variant="cant-open" size="sm" />
-        </span>
-      ) : null}
-      {photo.picked ? <span className="ym-filmstrip__picked" aria-hidden="true" /> : null}
-    </>
-  );
-
-  const describe = (photo: FilmstripPhoto): string =>
-    [
-      photo.name,
-      photo.status === "failed" ? "can't open" : photo.status === "developing" ? "developing" : null,
-      photo.picked ? "picked" : null,
-      mode === "export" && photo.included ? "will be exported" : null,
-    ]
-      .filter(Boolean)
-      .join(", ");
+  const register = useCallback((id: number | string, node: HTMLElement | null) => {
+    if (node) refs.current.set(id, node);
+    else refs.current.delete(id);
+  }, []);
+  const activate = useStableCallback((id: number | string, pick: boolean) => {
+    if (pick) onTogglePick?.(id);
+    else onSelect?.(id);
+  });
 
   return (
     <nav
       aria-label={label ?? (mode === "export" ? "Photos to export" : "Photos")}
       aria-describedby={captionId}
       className={cx("ym-filmstrip", className)}
+      hidden={hidden || undefined}
       data-tab={tab}
       onKeyDown={onKeyDown}
       onFocus={onFocusIn}
@@ -258,51 +388,39 @@ export function Filmstrip({
           </ContextMenuContent>
         }
       >
-        <div ref={scroller} className="ym-filmstrip__scroll">
-          {photos.map((photo, index) => {
-            const isCurrent = photo.id === currentId;
-            const common = {
-              "data-photo-id": String(photo.id),
-              "data-status": photo.status === "ready" ? undefined : photo.status,
-              ref: (node: HTMLElement | null) => {
-                if (node) refs.current.set(photo.id, node);
-                else refs.current.delete(photo.id);
-              },
-            };
-            if (mode === "export") {
+        {/* In export mode the thumbnails are pictures, not controls, so nothing in the strip takes the focus and the keyboard could not scroll
+            it: it is then a stop of its own, a named region (docs/28 A-02; axe `scrollable-region-focusable`). Browse mode has its roving thumbnails. */}
+        <div
+          ref={scroller}
+          className="ym-filmstrip__scroll"
+          {...(mode === "export" ? { role: "region", "aria-label": "List of photos to export", tabIndex: 0 } : undefined)}
+        >
+          {/* A thumbnail is a button (browse) or a picture (export), and ARIA gives neither a position in a set, so each sits in a list item that
+              has it (docs/28 A-08). Only the drawn ones are in the page, so the set size is the whole folder's. The wrappers are boxes, not
+              `display: contents`, which older WebKit drops from the accessibility tree; they add no Tab stop. */}
+          <div role="list" className="ym-filmstrip__list">
+            {photos.slice(win.start, win.end).map((photo, i) => {
+              const index = win.start + i;
+              // The space of the thumbnails that are not drawn is the margin of the first and last one that is.
+              const style: CSSProperties | undefined =
+                win.windowed && (index === win.start || index === win.end - 1)
+                  ? { marginLeft: index === win.start ? win.before : undefined, marginRight: index === win.end - 1 ? win.after : undefined }
+                  : undefined;
               return (
-                <span
-                  key={photo.id}
-                  {...common}
-                  role="img"
-                  aria-label={describe(photo)}
-                  className="ym-filmstrip__thumb"
-                  aria-current={isCurrent ? "true" : undefined}
-                  data-in-export={photo.included ? "true" : "false"}
-                >
-                  {thumbContent(photo)}
-                </span>
+                <div key={photo.id} role="listitem" aria-setsize={photos.length} aria-posinset={index + 1} className="ym-filmstrip__item" style={style}>
+                  <Thumb
+                    photo={photo}
+                    mode={mode}
+                    isCurrent={photo.id === currentId}
+                    tabbable={index === tabbableIndex}
+                    menuOpen={menu.open && menu.id === photo.id}
+                    register={register}
+                    onActivate={activate}
+                  />
+                </div>
               );
-            }
-            return (
-              <button
-                key={photo.id}
-                {...common}
-                type="button"
-                className="ym-filmstrip__thumb"
-                aria-label={`Show ${describe(photo)}`}
-                aria-current={isCurrent ? "true" : "false"}
-                data-menu={menu.open && menu.id === photo.id ? "open" : undefined}
-                tabIndex={index === tabbableIndex ? 0 : -1}
-                onClick={(event: MouseEvent<HTMLButtonElement>) => {
-                  if (event.metaKey) onTogglePick?.(photo.id);
-                  else onSelect?.(photo.id);
-                }}
-              >
-                {thumbContent(photo)}
-              </button>
-            );
-          })}
+            })}
+          </div>
           </div>
       </MenuAround>
       <span id={captionId} className="ym-filmstrip__caption">

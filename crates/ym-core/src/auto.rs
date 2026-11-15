@@ -31,14 +31,6 @@
 //!    (step 6) needs the other photos, so the session does it ([`burst_frame`]) and stores the
 //!    shared value in [`ExposureResult::ev`] (`own_ev` keeps the photo's own).
 //!
-//!    3b. **The white lift** (`ym_color::exposure::white`, `docs/02` C12 step 1b): the same preview, through
-//!    the all-Auto chain at the photo's exposure and C7 at its defaults (`Rolloff::default()`: the
-//!    highlight range at 1, so highlights the range already takes to white need less lift), sized for the
-//!    reference look (Signature) by [`estimate_white`]: the amount `A` and the anchor, two scalars per
-//!    photo ([`AutoEstimates::white`]). The user's own `rolloff` never re-sizes it. Estimated at the photo's own exposure; a burst median that replaces
-//!    the exposure does not re-size it (with the constant camera gain that happens only for a frame
-//!    the highlight guard lowered, by at most one stop). No burst rule: the estimate is a function of
-//!    the photo's own preview, so the app and `ym` give the same two numbers for any set of photos.
 //! 4. **The noise model** ([`NoiseResult`]): `ym_noise::estimate` on the image area with the prior
 //!    of the body and ISO (`data/cameras/noise`), pooled across the session by the session
 //!    (`pool_key`). A Lossless M or S file has no mosaic to measure and gets the prior alone.
@@ -54,16 +46,12 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use ym_color::chain::{ChainError, ColorEstimates, FusedChain, ProfileTables};
 use ym_color::consts::Vec3;
-use ym_color::exposure::white::{WhiteEstimate, estimate_white};
 use ym_color::exposure::{
-    AutoExposure, BurstFrame, ExposureError, ExposureSetting, PreviewRgb, ShotSettings,
-    auto_exposure,
+    AutoExposure, BurstFrame, ExposureError, PreviewRgb, ShotSettings, auto_exposure,
 };
 use ym_color::illum::{IllumError, IlluminantEstimate, IlluminantModel, RawPreview, ShotInfo};
-use ym_color::look::LookTransform;
 use ym_color::spectral::{ClassProbabilities, LightClass};
-use ym_color::tone::ToneParams;
-use ym_color::wb::{self, LightSource, SceneLight, WbError, WbReadout, WhiteBalance};
+use ym_color::wb::{self, SceneLight, WbError, WbReadout};
 use ym_gpu::cpu::detail::NoiseReduction;
 use ym_gpu::cpu::lens::{LensSwitches, LensTags};
 use ym_gpu::cpu::sharpen::auto_sharpen;
@@ -80,9 +68,10 @@ use ym_raw::decode::RawImage;
 use ym_raw::layout::{CfaColor, DecodeKind, Layout, Rect};
 
 use crate::apple_auto::{AppleAuto, AppleValues, AutoSteps};
+use crate::auto_provider::AutoProvider;
 use ym_raw::metadata::RawMetadata;
 
-use crate::settings::{DevelopSettings, NoiseReductionValue, Rolloff, SharpenValue};
+use crate::settings::{DevelopSettings, NoiseReductionValue, SharpenValue};
 
 /// Preview block size: one preview pixel is the mean of this many photosites per side (1/8).
 pub const PREVIEW_BLOCK_PX: usize = 8;
@@ -104,21 +93,36 @@ pub const FALLBACK_DEFAULT_K: f64 = 5500.0;
 /// Base ISO assumed for Auto sharpening when the gain table does not name one.
 pub const DEFAULT_BASE_ISO: u32 = 100;
 
-/// Why the automatic estimates could not be made. A photo with this error is skipped.
+/// Why the automatic estimates could not be made. A photo with this error is skipped. The sentence
+/// the person reads is plain; the specific reason is [`AutoError::detail`], for the log.
 #[derive(Debug, thiserror::Error)]
 pub enum AutoError {
     /// The decoded image cannot be analysed (too small, or levels that make no sense).
-    #[error("This photo can't be analysed ({0}). Copy it from the card again, or skip it.")]
+    #[error("Yellowmoon can't develop this photo. Copy it from the card again, or skip it.")]
     BadImage(String),
     /// Auto exposure failed.
-    #[error("This photo can't be analysed ({0}). Skip it and open the others.")]
+    #[error("Yellowmoon can't develop this photo. Skip it and open the others.")]
     Exposure(#[from] ExposureError),
     /// The colour chain could not be built.
-    #[error("This photo can't be analysed ({0}). Skip it and open the others.")]
+    #[error("Yellowmoon can't develop this photo. Skip it and open the others.")]
     Chain(#[from] ChainError),
     /// A white was unusable.
-    #[error("This photo can't be analysed ({0}). Skip it and open the others.")]
+    #[error("Yellowmoon can't develop this photo. Skip it and open the others.")]
     White(#[from] WbError),
+}
+
+impl AutoError {
+    /// The technical reason (the picture is too small, a level has no range, no noise prior), which
+    /// goes to the log and never to the person.
+    #[must_use]
+    pub fn detail(&self) -> String {
+        match self {
+            Self::BadImage(detail) => detail.clone(),
+            Self::Exposure(e) => e.to_string(),
+            Self::Chain(e) => e.to_string(),
+            Self::White(e) => e.to_string(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1153,9 +1157,6 @@ pub struct AutoEstimates {
     pub color: ColorEstimates,
     /// The automatic exposure.
     pub exposure: ExposureResult,
-    /// The white lift: the automatic amount and the anchor (`docs/02` C12 step 1b). Add the user's
-    /// `white_offset_ev` with [`WhiteEstimate::lift`].
-    pub white: WhiteEstimate,
     /// The noise model.
     pub noise: NoiseResult,
     /// What `sharpen: Auto` resolves to.
@@ -1185,41 +1186,70 @@ pub struct AutoEstimates {
     /// The Apple Auto steps in effect: the photo's answer, or its burst's shared steps (`docs/19`
     /// section 5). `None` when Auto is the rule.
     pub apple_steps: Option<AutoSteps>,
+    /// The provider whose grading `apple` and `apple_steps` are (`docs/22` section 14.1): the
+    /// chosen provider while one acts or is asked about, [`AutoProvider::Yellowmoon`] while the
+    /// state is off.
+    pub provider: AutoProvider,
 }
 
-/// Which Auto made a photo's automatic values (`docs/19` sections 8 and 9: `ym:Auto`, `auto.source`).
+/// Which Auto made a photo's automatic values (`docs/19` sections 8 and 9, `docs/22` section 14:
+/// `ym:Auto`, `auto.source`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AutoSource {
-    /// Yellowmoon's own Auto.
+    /// Default Auto.
     Rule,
-    /// Apple Auto's answer (the photo's own or its burst's).
+    /// Apple Intelligence's answer (the photo's own or its burst's).
     Apple,
+    /// Claude Code's answer (the photo's own or its burst's).
+    Claude,
+    /// Antigravity's answer (the photo's own or its burst's).
+    Agy,
 }
 
 impl AutoSource {
-    /// The wire name: `rule` or `apple`.
+    /// The wire name: `rule`, `apple`, `claude` or `agy`.
     #[must_use]
     pub fn name(self) -> &'static str {
         match self {
             Self::Rule => "rule",
             Self::Apple => "apple",
+            Self::Claude => "claude",
+            Self::Agy => "agy",
+        }
+    }
+
+    /// The source of answers from `provider`: Default Auto is the rule.
+    #[must_use]
+    pub fn of(provider: AutoProvider) -> Self {
+        match provider {
+            AutoProvider::Yellowmoon => Self::Rule,
+            AutoProvider::Apple => Self::Apple,
+            AutoProvider::Claude => Self::Claude,
+            AutoProvider::Agy => Self::Agy,
         }
     }
 }
 
-/// The `auto` object of `src/api/types.ts` (`AutoEstimates` there) and of `ym render --json`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct AutoSummary {
+/// What Auto resolves to for the Input (`docs/23` section 3.9): the exposure, the Kelvin and tint
+/// and what Auto sharpening and noise reduction resolve to.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct InputAuto {
     /// `EV_auto` (with Apple Auto's change, when there is one).
     pub exposure_ev: f64,
-    /// The automatic white lift in stops (0 for a photo with nothing above +1 stop to lift): the
-    /// Automatic card's White row. The lift in effect is this plus `white_offset_ev`.
-    pub white_ev: f64,
     /// The Auto Kelvin (a multiple of 50; with Apple Auto's nudge, when there is one).
     pub kelvin: f64,
     /// The Auto tint.
     pub tint: f64,
+    /// What `sharpen: Auto` resolves to.
+    pub sharpen: SharpenValue,
+    /// What `noise_reduction: Auto` resolves to.
+    pub noise_reduction: NoiseReductionValue,
+}
+
+/// What Auto resolves to for Main (`docs/23` section 3.9): only Main can be Auto.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct MainAuto {
     /// What `contrast: Auto` resolves to: 0, or Apple Auto's contrast.
     pub contrast: f64,
     /// What `saturation: Auto` resolves to: 0, or Apple Auto's saturation.
@@ -1234,9 +1264,22 @@ pub struct AutoSummary {
     pub balance_shadows: [f64; 2],
     /// What the highlights wheel's Auto resolves to: `[0, 0]`, or Apple Auto's highlight colour.
     pub balance_highlights: [f64; 2],
-    /// Which Auto made these values: `rule` or `apple`.
+}
+
+/// The `auto` object of `ym render --json` and the `estimates` of the resolved settings
+/// (`AutoEstimates` of `src/api/types.ts`), **grouped by the node each number is for**
+/// (`docs/23` section 3.9): `input` and `main`, and beside them what belongs to the photo.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AutoSummary {
+    /// What Auto resolves to for the Input.
+    pub input: InputAuto,
+    /// What Auto resolves to for Main.
+    pub main: MainAuto,
+    /// Which Auto made these values: `rule`, `apple`, `claude` or `agy`.
     pub source: AutoSource,
-    /// Where the photo stands with Apple Auto (`docs/19` section 12).
+    /// The chosen provider's wire name (`docs/22` section 14.1).
+    pub provider: AutoProvider,
+    /// Where the photo stands with the chosen provider's Auto (`docs/19` section 12).
     pub apple: AppleAuto,
     /// Apple Auto's steps in effect (the photo's answer, or its burst's shared steps), `None` when
     /// Auto is the rule. A step the model left empty is `null`: nothing was set for that control.
@@ -1247,10 +1290,6 @@ pub struct AutoSummary {
     pub light_confidence: f64,
     /// The noise model `variance = a * signal + b`.
     pub noise: NoiseAb,
-    /// What `sharpen: Auto` resolves to.
-    pub sharpen: SharpenValue,
-    /// What `noise_reduction: Auto` resolves to.
-    pub noise_reduction: NoiseReductionValue,
 }
 
 /// The shot-noise gain and read-noise variance, in normalised units.
@@ -1324,23 +1363,6 @@ impl AutoEstimates {
         inputs: &AutoInputs<'_>,
         white_scale: Vec3,
     ) -> Result<Self, AutoError> {
-        Self::compute_with_look(raw, inputs, white_scale, None)
-    }
-
-    /// As [`AutoEstimates::compute_scaled`], with the white lift sized for `reference_look` (the
-    /// Signature look: the lift's amount is what the picture needs on top of that look, so the two do
-    /// not add up twice; `None` is the identity look). The session passes the Signature look from the
-    /// data folder; the lift does not follow the look a photo is later given.
-    ///
-    /// # Errors
-    ///
-    /// As [`AutoEstimates::compute_scaled`].
-    pub fn compute_with_look(
-        raw: &RawImage,
-        inputs: &AutoInputs<'_>,
-        white_scale: Vec3,
-        reference_look: Option<&LookTransform>,
-    ) -> Result<Self, AutoError> {
         let meta = &raw.meta;
         wb::scale_white([1.0; 3], white_scale)?;
         let preview = build_preview(raw)?;
@@ -1373,7 +1395,6 @@ impl AutoEstimates {
         };
         let meter = auto_exposure(&preview_rgb, metering.matrix())?;
         color.ev_auto = meter.ev_auto;
-        let white = white_lift_estimate(&color, tables, &preview_rgb, reference_look)?;
         let noise = estimate_noise(raw, inputs.priors)?;
         let (sharpen, noise_reduction) =
             auto_detail_values(meta.iso, base_iso(inputs.priors, meta), meta.f_number);
@@ -1385,7 +1406,6 @@ impl AutoEstimates {
                 own_ev: meter.ev_auto,
                 meter,
             },
-            white,
             noise,
             sharpen,
             noise_reduction,
@@ -1399,6 +1419,7 @@ impl AutoEstimates {
             balance_highlights: [0.0, 0.0],
             apple: AppleAuto::Off,
             apple_steps: None,
+            provider: AutoProvider::Yellowmoon,
         })
     }
 
@@ -1425,7 +1446,7 @@ impl AutoEstimates {
     /// the white its nudges of warmth and tint (and the readout follows them), and highlights,
     /// shadows, black, contrast, saturation and the shadows and highlights wheels their values. A
     /// step the model left empty keeps the value without Apple Auto.
-    /// The highlight guard is not applied again and the white lift is not sized again. `steps` of
+    /// The highlight guard is not applied again. `steps` of
     /// `None` (no answer, a failure, Apple Auto off) leave every value at the rule's, bit for bit; only
     /// `apple` records the state. A step out of its range counts as no answer.
     #[must_use]
@@ -1433,10 +1454,12 @@ impl AutoEstimates {
         &self,
         steps: Option<AutoSteps>,
         state: AppleAuto,
+        provider: AutoProvider,
         tables: ProfileTables<'_>,
     ) -> Self {
         let mut s = self.clone();
         s.apple = state;
+        s.provider = provider;
         let Some((steps, values)) = steps.and_then(|st| st.values().map(|v| (st, v))) else {
             s.apple_steps = None;
             return s;
@@ -1481,11 +1504,11 @@ impl AutoEstimates {
         s
     }
 
-    /// Which Auto made the values: Apple Auto's when steps are in effect, else the rule.
+    /// Which Auto made the values: the provider's when steps are in effect, else the rule.
     #[must_use]
     pub fn source(&self) -> AutoSource {
         if self.apple_steps.is_some() {
-            AutoSource::Apple
+            AutoSource::of(self.provider)
         } else {
             AutoSource::Rule
         }
@@ -1514,13 +1537,40 @@ impl AutoEstimates {
         settings: &DevelopSettings,
         picked_white: Option<Vec3>,
     ) -> Result<FusedChain, ChainError> {
+        let input = settings.input();
         self.color.chain(
             tables_of(profile),
-            settings.light_source,
-            settings.white_balance.to_color(),
-            settings.exposure.to_color(),
-            picked_white.filter(|_| settings.white_pick.is_some()),
+            input.light_source,
+            input.white_balance.to_color(),
+            input.exposure.to_color(),
+            picked_white.filter(|_| input.white_pick.is_some()),
         )
+    }
+
+    /// What Auto resolves to for the Input.
+    #[must_use]
+    pub fn input_auto(&self) -> InputAuto {
+        InputAuto {
+            exposure_ev: self.exposure.ev,
+            kelvin: self.readout.kelvin_k,
+            tint: self.readout.tint,
+            sharpen: self.sharpen,
+            noise_reduction: self.noise_reduction,
+        }
+    }
+
+    /// What Auto resolves to for Main.
+    #[must_use]
+    pub fn main_auto(&self) -> MainAuto {
+        MainAuto {
+            contrast: self.contrast,
+            saturation: self.saturation,
+            highlights: self.highlights,
+            shadows: self.shadows,
+            black: self.black,
+            balance_shadows: self.balance_shadows,
+            balance_highlights: self.balance_highlights,
+        }
     }
 
     /// The summary the UI and `--json` show.
@@ -1535,18 +1585,10 @@ impl AutoEstimates {
             })
             .0;
         AutoSummary {
-            exposure_ev: self.exposure.ev,
-            white_ev: self.white.amount_ev,
-            kelvin: self.readout.kelvin_k,
-            tint: self.readout.tint,
-            contrast: self.contrast,
-            saturation: self.saturation,
-            highlights: self.highlights,
-            shadows: self.shadows,
-            black: self.black,
-            balance_shadows: self.balance_shadows,
-            balance_highlights: self.balance_highlights,
+            input: self.input_auto(),
+            main: self.main_auto(),
             source: self.source(),
+            provider: self.provider,
             apple: self.apple.clone(),
             apple_steps: self.apple_steps,
             light_class,
@@ -1555,46 +1597,8 @@ impl AutoEstimates {
                 a: self.noise.model.a,
                 b: self.noise.model.b,
             },
-            sharpen: self.sharpen,
-            noise_reduction: self.noise_reduction,
         }
     }
-}
-
-/// The white lift of a photo (`docs/02` C12 step 1b): its preview through the all-Auto chain at the
-/// photo's exposure and C7 at its defaults, not the user's (`Rolloff::default()`: the highlight range at
-/// 1 with the chain's clip level, `ClipLevel::luma`), sized for `reference_look`. The noise floor is 0,
-/// so the toe is off whatever its amount: it only acts within a few noise floors of black, far from the
-/// percentiles the estimate reads.
-fn white_lift_estimate(
-    color: &ColorEstimates,
-    tables: ProfileTables<'_>,
-    preview: &PreviewRgb<'_>,
-    reference_look: Option<&LookTransform>,
-) -> Result<WhiteEstimate, AutoError> {
-    let chain = color.chain(
-        tables,
-        LightSource::Auto,
-        WhiteBalance::Auto,
-        ExposureSetting::Auto,
-        None,
-    )?;
-    let rolloff = Rolloff::default();
-    let Ok(tone) = ToneParams::new(
-        rolloff.highlights,
-        rolloff.low_light,
-        chain.clip().luma(),
-        0.0,
-    ) else {
-        // A clip level that is not a positive number: nothing to size a lift against.
-        return Ok(WhiteEstimate::none());
-    };
-    Ok(estimate_white(
-        preview,
-        chain.matrix(),
-        &tone,
-        reference_look,
-    )?)
 }
 
 /// The three tables of a profile that the colour chain reads.

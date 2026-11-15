@@ -508,7 +508,7 @@ fn intensity_zero_is_neutral_and_one_hundred_is_the_look_exactly() {
 
 fn plain_chain(look: Option<LookSetting>) -> ColorChain {
     // Camera RGB is linear AWG4 (identity matrix), C7 off, no grade, no curves: only the look and the
-    // display transform (ACES 2 with the placement) act, sRGB output, no dither.
+    // display transform (the cine rendering) act, sRGB output, no dither.
     let identity: Mat3 = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
     let tone = ToneParams::IDENTITY;
     let mut p = ChainParams::new(identity, tone);

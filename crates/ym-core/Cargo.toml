@@ -16,8 +16,16 @@ ym-color.workspace = true
 ym-gpu.workspace = true
 ym-noise.workspace = true
 ym-ml.workspace = true
+# The lens library (`docs/21`): the data of the seven lenses, loaded once, and the lens plan.
+ym-lens.workspace = true
 ym-looks.workspace = true
 ym-export.workspace = true
+# Free space of the destination folder for the warning before an export (`docs/26-hardening.md` P2-3). MIT OR Apache-2.0
+# (docs/14); already in the build through `ym-looks`.
+fs4.workspace = true
+ym-compose.workspace = true
+# The Film node's engine (`docs/24`): the baked chain and the spatial passes.
+ym-film.workspace = true
 thiserror.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -45,7 +53,16 @@ force-demosaic = []
 # runs out of budget, a shader that does not compile, a lost device, a cancel, a failing tile), so that
 # `tests/render_gpu.rs` can show that a device error ends in the CPU render and never in a wrong
 # picture. Off by default and never enabled by a shipped build.
-fault-injection = ["ym-gpu/fault-injection"]
+fault-injection = ["ym-gpu/fault-injection", "ym-export/fault-injection"]
+# TEST-ONLY. Turns on `ym-gpu`'s picture probe (`tail::set_picture_probe`) for
+# `tests/render_film_device.rs::the_colour_pass_of_the_tail_is_close_to_the_cpus_before_output_sharpening`. Off by
+# default and never enabled by a shipped build.
+tail-probe = ["ym-gpu/tail-probe"]
+
+# The macOS memory-pressure level, `sysctl kern.memorystatus_vm_pressure_level` (`docs/26` H-14). MIT OR Apache-2.0 (docs/14); already
+# in the build through `ym-ml`. Only on macOS: elsewhere the level is always normal.
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 tempfile.workspace = true
@@ -54,9 +71,15 @@ tempfile.workspace = true
 tracing-subscriber.workspace = true
 # The synthetic ARW writer (`ym_raw::testgen`) behind the session and estimate tests.
 ym-raw = { workspace = true, features = ["testgen"] }
+# A complete synthetic lens folder (`ym_lens::test_support`) for the tests of the lens setting and of
+# `Core::lens_list`.
+ym-lens = { workspace = true, features = ["test-support"] }
 # JSON Schema validation of settings documents against `schema/settings.schema.json` (MIT; default
 # features, which resolve references over HTTP and from files, are off, as in ym-profiles).
 jsonschema = { version = "0.58", default-features = false }
 # Decodes the embedded JPEG previews of real files for the auto-exposure comparison in
 # tests/real_files.rs (MIT OR Apache-2.0 OR Zlib; the same version as ym-color's dev-dependency).
 zune-jpeg = "0.5"
+# Peak resident memory (`getrusage`) in the ignored 2000-file test (`tests/folders_2000.rs`, `docs/26` H-10).
+# MIT OR Apache-2.0 (docs/14); already in the build through `ym-ml`.
+libc = "0.2"

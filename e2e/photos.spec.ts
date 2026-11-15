@@ -1,5 +1,6 @@
 import { expect, test } from "@playwright/test";
 import type { Page } from "@playwright/test";
+import { canvasOf, fitInside } from "../src/screens/crop/cropMath";
 import { configureMock, failNext, lookTilesLoaded, openApp, openPhotos, recordCalls, setUpdateState, setValue, settle, showUpdateReady, watchErrors } from "./helpers/app";
 
 /** A manual contrast or saturation (`docs/19` section 5: Auto or a value). */
@@ -113,7 +114,7 @@ test.describe("the flow", () => {
       await expect(tabs(page).getByRole("tab", { name })).toHaveAttribute("aria-selected", "true");
       await expect.poll(() => page.getByRole("tabpanel").evaluate((el) => getComputedStyle(el).getPropertyValue("--primary").trim())).toBe(accent);
       // Yellow is for buttons: no tab paints its title block in its colour.
-      expect(await page.locator(".ym-title-block").evaluate((el) => getComputedStyle(el).backgroundColor)).not.toMatch(/^rgb\(/);
+      expect(await page.locator(".ym-title-block:visible").evaluate((el) => getComputedStyle(el).backgroundColor)).not.toMatch(/^rgb\(/);
     }
   });
 
@@ -139,9 +140,9 @@ test.describe("the flow", () => {
     const first = await sizes();
     expect(first.length).toBeGreaterThanOrEqual(2);
     expect(first.length).toBeLessThan(9);
-    await page.locator(".ym-tools__scroll").evaluate((el) => {
-      el.scrollTop = el.scrollHeight;
-    });
+    // The last tile, brought into view, not the end of the panel: the Tone card below the grid is short, so what the end of the panel shows
+    // depends on the window (with the Lens card below Tone, as it was, the end of the panel showed no tile at all).
+    await page.locator(".ym-look-tile").last().evaluate((el) => el.scrollIntoView({ block: "end" }));
     await expect.poll(async () => (await sizes()).length).toBe(9);
     await settle(page);
     expect((await sizes()).every(([w, h]) => w === 240 && h === 160)).toBe(true);
@@ -196,7 +197,7 @@ test.describe("controls with the real mouse", () => {
     const calls = await recordCalls(page, "updateSettings");
     await dragSlider(page, "Exposure", 0.8, 8);
     await expect(valueBox(page, "Exposure")).not.toHaveValue("+0.30");
-    const patches = (await calls()).map((c) => c.args[1] as { exposure: { kind: "auto" } | { kind: "manual"; ev: number } });
+    const patches = (await calls()).map((c) => (c.args[1] as { nodes: { input: { exposure: { kind: "auto" } | { kind: "manual"; ev: number } } } }).nodes.input);
     expect(patches.length).toBeGreaterThanOrEqual(2);
     // A value dropped on the detent (+0.30) is Automatic again; every other one is manual and in range.
     expect(patches.every((p) => p.exposure.kind === "auto" || (p.exposure.ev >= -4 && p.exposure.ev <= 4))).toBe(true);
@@ -234,7 +235,7 @@ test.describe("controls with the real mouse", () => {
     await expect(valueBox(page, "Output")).not.toHaveAttribute("data-changed", "true");
     const calls = await recordCalls(page, "updateSettings");
     await dragSlider(page, "Output", 0.2, 6);
-    const patches = (await calls()).map((c) => c.args[1] as { output_sharpening: number });
+    const patches = (await calls()).map((c) => (c.args[1] as { nodes: { output: { output_sharpening: number } } }).nodes.output);
     expect(patches.length).toBeGreaterThanOrEqual(2);
     // Every patch is a plain number on the grid of 5 inside 0 to 200, and the last one is on screen.
     expect(patches.every((p) => Number.isInteger(p.output_sharpening / 5) && p.output_sharpening >= 0 && p.output_sharpening <= 200)).toBe(true);
@@ -245,12 +246,12 @@ test.describe("controls with the real mouse", () => {
     await expect(valueBox(page, "Output")).toHaveValue("35%");
     await page.getByRole("button", { name: "Reset Output" }).click();
     await expect(valueBox(page, "Output")).toHaveValue("100%");
-    expect((await calls()).at(-1)!.args[1]).toEqual({ output_sharpening: 100 });
+    expect((await calls()).at(-1)!.args[1]).toEqual({ nodes: { output: { output_sharpening: 100 } } });
     // The card's Reset puts the whole card back, Output included.
     await setValue(page, "Output", "60");
     await card.getByRole("button", { name: "Reset" }).first().click();
     await expect(valueBox(page, "Output")).toHaveValue("100%");
-    expect((await calls()).at(-1)!.args[1]).toEqual({ sharpen: { kind: "auto" }, output_sharpening: 100 });
+    expect((await calls()).at(-1)!.args[1]).toEqual({ nodes: { input: { sharpen: { kind: "auto" } }, output: { output_sharpening: 100 } } });
   });
 
   test("a change on one tab is shown on the Look tab's Automatic card as EDITED", async ({ page }) => {
@@ -289,9 +290,10 @@ test.describe("controls with the real mouse", () => {
     await page.mouse.move(box.x + box.width / 2, box.y + box.height * 0.3, { steps: 6 });
     await page.mouse.up();
     await expect(plot.getByRole("slider")).toHaveCount(3);
-    const last = (await calls()).at(-1)!.args[1] as { curve: { luma: number[][] } };
-    expect(last.curve.luma).toHaveLength(3);
-    expect(last.curve.luma[1]![1]).toBeGreaterThan(0.6);
+    const last = (await calls()).at(-1)!.args[1] as { nodes: { "1": { grade: { curve: { luma: number[][] } } } } };
+    const luma = last.nodes["1"].grade.curve.luma;
+    expect(luma).toHaveLength(3);
+    expect(luma[1]![1]).toBeGreaterThan(0.6);
     // Dragging the point far off the plot removes it.
     const point = plot.getByRole("slider", { name: "Point 2 of 3" });
     const p = (await point.boundingBox())!;
@@ -318,12 +320,14 @@ test.describe("controls with the real mouse", () => {
     await expect(valueBox(page, "Highlights")).toHaveValue("0.80");
   });
 
-  test("Crop, Pick white and Before sit in the header with the shortcuts in their tooltips", async ({ page }) => {
+  test("Crop and Before sit in the header with the shortcuts in their tooltips; Pick white is in the Colour tab with its key", async ({ page }) => {
     await photos(page);
     // A title is a glass tooltip and the button's description.
     await expect(page.getByRole("button", { name: "Before" })).toHaveAccessibleDescription(/\\/);
     await expect(page.getByRole("button", { name: "Crop" })).toHaveAccessibleDescription("Crop (C)");
-    await expect(page.getByRole("button", { name: "Pick white" })).toHaveAccessibleDescription("Pick white (W)");
+    await expect(page.getByRole("banner").getByRole("button", { name: "Pick white" })).toHaveCount(0);
+    await page.getByRole("tab", { name: "Colour" }).click();
+    await expect(page.getByRole("button", { name: "Pick white" })).toHaveAccessibleDescription("Click something neutral on the photo (W)");
     await page.getByRole("button", { name: "Crop" }).hover();
     await expect(page.getByRole("tooltip").first()).toHaveText("Crop (C)");
   });
@@ -332,8 +336,8 @@ test.describe("controls with the real mouse", () => {
 test.describe("keyboard shortcuts", () => {
   test("the shortcuts of docs/11", async ({ page }) => {
     await photos(page);
-    // ⌘1 to ⌘6
-    for (const [key, name] of [["2", "Light"], ["3", "Colour"], ["4", "Detail"], ["5", "Curve"], ["6", "RAW"], ["1", "Look"]] as const) {
+    // ⌘1 to ⌘7, in the order of the bar
+    for (const [key, name] of [["2", "Lens"], ["3", "Light"], ["4", "Colour"], ["5", "Detail"], ["6", "Curve"], ["7", "RAW"], ["1", "Look"]] as const) {
       await page.keyboard.press(`Meta+${key}`);
       await expect(tabs(page).getByRole("tab", { name })).toHaveAttribute("aria-selected", "true");
     }
@@ -348,9 +352,9 @@ test.describe("keyboard shortcuts", () => {
     await expect(page.getByText(/^3 of 12 · /)).toBeVisible();
     // P picks, ⌘A picks all
     await page.keyboard.press("p");
-    await expect(page.getByText("2 picked")).toBeVisible();
+    await expect(page.locator(".ym-filmstrip__caption")).toContainText("2 picked");
     await page.keyboard.press("Meta+a");
-    await expect(page.getByText("12 picked")).toBeVisible();
+    await expect(page.locator(".ym-filmstrip__caption")).toContainText("12 picked");
     await expect(page.getByRole("button", { name: /Export 12/ })).toBeVisible();
     // \ flips Before
     await page.keyboard.press("\\");
@@ -367,7 +371,7 @@ test.describe("keyboard shortcuts", () => {
 
   test("⌘Z and ⇧⌘Z undo and redo changes to the photo on screen", async ({ page }) => {
     await photos(page);
-    await page.keyboard.press("Meta+2");
+    await page.keyboard.press("Meta+3");
     await setValue(page, "Contrast", "30");
     await expect(valueBox(page, "Contrast")).toHaveValue("+30");
     await setValue(page, "Brightness", "-10");
@@ -451,9 +455,14 @@ test.describe("crop and pick white by mouse", () => {
     await expect(valueBox(page, "Straighten")).toHaveValue("+2.5°");
     await panel.getByRole("button", { name: /^Done/ }).click();
     await expect(page.getByRole("complementary", { name: "Tools" })).toBeVisible();
-    // The browser build shows the cropped picture: the frame is now 0.7 × 0.6 of the photo.
+    // The browser build shows the cropped picture. The frame was 0.7 × 0.6 of the photo from its top left corner, which 2.5° of
+    // straightening leaves empty, so the frame sent is that one fitted inside the straightened photo (no border in photos, docs/11
+    // §Crop): smaller about its own centre, the same shape. The picture is 1500 × 1000 units.
     const src = await page.locator(".ym-photo-cell__image").getAttribute("src");
-    expect(decodeURIComponent(src!)).toMatch(/viewBox="0 0 1050 600"/);
+    const viewBox = /viewBox="([^"]+)"/.exec(decodeURIComponent(src!))![1]!.split(" ").map(Number);
+    const fitted = fitInside({ x: 0, y: 0, width: 0.7, height: 0.6 }, 2.5, canvasOf(8640, 5760, 0));
+    [fitted.x * 1500, fitted.y * 1000, fitted.width * 1500, fitted.height * 1000].forEach((want, i) => expect(Math.abs(viewBox[i]! - want)).toBeLessThan(0.5));
+    expect(viewBox[0]).toBeGreaterThan(0);
     await page.keyboard.press("Meta+z");
     const undone = await page.locator(".ym-photo-cell__image").getAttribute("src");
     expect(decodeURIComponent(undone!)).toMatch(/viewBox="0 0 1500 1000"/);
@@ -470,10 +479,10 @@ test.describe("crop and pick white by mouse", () => {
     expect(decodeURIComponent((await page.locator(".ym-photo-cell__image").getAttribute("src"))!)).toMatch(/viewBox="0 0 1500 1000"/);
   });
 
-  test("Pick white: crosshair cursor, header hint, a click sets the white balance, Esc cancels", async ({ page }) => {
+  test("Pick white: crosshair cursor, the pill on the photo, a click sets the white balance, Esc cancels", async ({ page }) => {
     await photos(page);
     await page.keyboard.press("w");
-    await expect(page.getByText("Click something neutral: grey or white.")).toBeVisible();
+    await expect(page.getByText("Click something neutral: grey or white. Esc cancels.")).toBeVisible();
     const layer = page.getByRole("application");
     await expect(layer).toHaveCSS("cursor", "crosshair");
     await page.keyboard.press("Escape");
@@ -518,6 +527,26 @@ test.describe("error states", () => {
     await expect(page.getByRole("region", { name: "Automatic" })).toBeVisible();
   });
 
+  test("a Ready photo whose file went away is tagged CAN'T OPEN and says it is not found when it is shown", async ({ page }) => {
+    await openApp(page, { mockVanish: "DSC04207", mockCurrent: 0 });
+    await openPhotos(page);
+    // Ready first: the file is missed when it is read again.
+    const ready = page.getByRole("button", { name: "Show DSC04207" });
+    await expect(ready).toBeVisible();
+    await ready.click();
+    const thumb = page.getByRole("button", { name: "Show DSC04207, can't open" });
+    await expect(thumb).toContainText("Can't open");
+    await expect(thumb.locator('[data-slot="badge"]')).toHaveAttribute("data-variant", "cant-open");
+    await expect(page.getByText("This file can't be opened.", { exact: true })).toBeVisible();
+    await expect(
+      page.locator(".ym-photo-note").getByText("Yellowmoon can't find this file any more. It may have been moved, renamed or its drive disconnected."),
+    ).toBeVisible();
+    // Nothing to adjust, and the other photos still work.
+    await expect(page.getByRole("region", { name: "Automatic" })).toHaveCount(0);
+    await page.keyboard.press("ArrowRight");
+    await expect(page.getByRole("region", { name: "Automatic" })).toBeVisible();
+  });
+
   test("a look whose file is missing is disabled, says why, and can't be picked", async ({ page }) => {
     await photos(page, { mockMissing: "film-warm" });
     const tile = page.getByRole("button", { name: /Film warm look, key 3, file missing or changed/ });
@@ -539,7 +568,7 @@ test.describe("error states", () => {
   test("an error from the core shows over the photos and can be dismissed", async ({ page }) => {
     await photos(page);
     await failNext(page, "updateSettings", { scope: "render", message: "The photo couldn't be drawn. Try the change again." });
-    await page.keyboard.press("Meta+2");
+    await page.keyboard.press("Meta+3");
     await setValue(page, "Contrast", "40");
     await expect(page.getByRole("alert")).toHaveText(/The photo couldn't be drawn\. Try the change again\./);
     // The control goes back to what the core has.
@@ -576,7 +605,14 @@ test("a folder of 500 photos: the first one opens while the rest develop, and th
   await openApp(page, { mockPhotos: 500, mockHold: 40 });
   await page.getByRole("button", { name: "Open files…" }).click();
   await expect(page.getByRole("heading", { level: 2, name: "Developing 500 photos" })).toBeVisible();
-  await expect(page.getByRole("list", { name: "Photos being developed" }).getByText("Ready", { exact: true })).toHaveCount(40);
+  // The list draws the rows in view and a margin (docs/26 H-09), not all 500; some of them already say Ready.
+  const list = page.getByRole("list", { name: "Photos being developed" });
+  await expect(list.getByText("Ready", { exact: true }).first()).toBeVisible();
+  // Development has reached its hold: 40 photos are ready (asked of the mock; the list draws only some of the rows).
+  await expect
+    .poll(() => page.evaluate(async () => (await window.__yellowmoon!.mockApi.sessionState()).photos.filter((p) => p.status.kind === "ready").length))
+    .toBe(40);
+  expect(await list.getByRole("listitem").count()).toBeLessThan(100);
   await page.getByRole("button", { name: /Open photos/ }).click();
   await expect(page.getByRole("region", { name: "Automatic" })).toBeVisible();
   await expect(page.getByText("2026-10-04 · 500 photos")).toBeVisible();
@@ -584,6 +620,10 @@ test("a folder of 500 photos: the first one opens while the rest develop, and th
   await page.keyboard.press("ArrowRight");
   await expect(page.locator(".ym-filmstrip__caption")).toHaveText("2 of 500 · 0 picked");
   await page.keyboard.press("End");
+  // The strip draws the thumbnails in view, so the last one is there once the strip has been scrolled to its end (the scroll bar is true).
+  const strip = page.locator(".ym-filmstrip__scroll");
+  await strip.evaluate((el) => void (el.scrollLeft = el.scrollWidth));
+  expect(await strip.evaluate((el) => el.scrollWidth)).toBeGreaterThan(500 * 100);
   // A photo that is still developing says so and has nothing to adjust.
   await page.getByRole("button", { name: "Show DSC04700, developing" }).click();
   await expect(page.locator(".ym-filmstrip__caption")).toHaveText("500 of 500 · 0 picked");
@@ -591,16 +631,49 @@ test("a folder of 500 photos: the first one opens while the rest develop, and th
   await expect(page.getByRole("region", { name: "Automatic" })).toHaveCount(0);
   // The window still takes keys: ⌘A picks the photos that are ready, not the ones still developing.
   await page.keyboard.press("Meta+a");
-  await expect(page.getByText("40 picked")).toBeVisible();
+  await expect(page.locator(".ym-filmstrip__caption")).toContainText("40 picked");
 });
 
 test("settings made before the session opens come through the mock (initialSettings)", async ({ page }) => {
   await openApp(page, MOCKUP);
-  await configureMock(page, { initialSettings: { DSC04204: { highlights: manual(-18), shadows: manual(12), saturation: manual(6) } } });
+  await configureMock(page, { initialSettings: { DSC04204: { nodes: { "1": { grade: { highlights: manual(-18), shadows: manual(12), saturation: manual(6) } } } } } });
   await openPhotos(page);
-  await page.keyboard.press("Meta+2");
+  await page.keyboard.press("Meta+3");
   await expect(valueBox(page, "Highlights")).toHaveValue("−18");
   await expect(valueBox(page, "Shadows")).toHaveValue("+12");
-  await page.keyboard.press("Meta+3");
+  await page.keyboard.press("Meta+4");
   await expect(valueBox(page, "Saturation")).toHaveValue("+6");
+});
+
+// A folder of 2000 photos (docs/26 H-09): the lists draw the rows in view and a margin, so the page stays small. The audit counted 8,088
+// nodes on the Start list, 2,267 on the Photos screen and 16,063 with the export queue running.
+async function nodeCount(page: Page): Promise<number> {
+  const n = await page.evaluate(() => document.querySelectorAll("*").length);
+  console.log(`DOM nodes: ${n}`);
+  return n;
+}
+
+test("a folder of 2000 photos keeps the page under 1,500 elements on Start, Photos and while the export runs", async ({ page }) => {
+  await openApp(page, { mockPhotos: 2000, mockSpeed: "Infinity", mockExportHold: 1500.5 });
+  await page.getByRole("button", { name: "Open files…" }).click();
+  await expect(page.getByRole("heading", { level: 2, name: /^(2000 photos ready|Grading 2000 photos with .*)$/ })).toBeVisible({ timeout: 90_000 });
+  expect(await nodeCount(page)).toBeLessThan(1500);
+  await page.getByRole("button", { name: /Open photos/ }).click();
+  await expect(page.getByRole("region", { name: "Automatic" })).toBeVisible();
+  await expect(page.locator(".ym-filmstrip__caption")).toHaveText("1 of 2000 · 0 picked");
+  expect(await nodeCount(page)).toBeLessThan(1500);
+  // The last photo is reached by scrolling the strip to its end, and drawn; the strip does not draw the others.
+  await page.locator(".ym-filmstrip__scroll").evaluate((el) => void (el.scrollLeft = el.scrollWidth));
+  await page.getByRole("button", { name: "Show DSC06200" }).click();
+  await expect(page.locator(".ym-filmstrip__caption")).toHaveText("2000 of 2000 · 0 picked");
+  await expect(page.locator(".ym-filmstrip__thumb[aria-current=true]")).toBeVisible();
+  expect(await page.locator(".ym-filmstrip__thumb").count()).toBeLessThan(100);
+  await page.keyboard.press("Meta+a");
+  await expect(page.locator(".ym-filmstrip__caption")).toHaveText("2000 of 2000 · 2000 picked");
+  await page.keyboard.press("Meta+e");
+  await page.getByRole("button", { name: /^Export 2000 photos/ }).click();
+  await expect(page.getByRole("list", { name: "Export queue" })).toBeVisible();
+  await expect.poll(() => page.getByRole("list", { name: "Export queue" }).getByText("Done", { exact: true }).count(), { timeout: 60_000 }).toBeGreaterThan(0);
+  expect(await nodeCount(page)).toBeLessThan(1500);
+  await page.evaluate(() => window.__yellowmoon!.mockApi.flush());
 });

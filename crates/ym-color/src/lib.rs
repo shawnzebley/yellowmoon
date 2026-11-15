@@ -1,7 +1,7 @@
 //! Colour pipeline maths: the CPU reference for every colour stage.
 //!
 //! Pure maths with no GPU dependency: LogC3/LogC4, AWG3/AWG4, ARRI's CCT matrices, the sensor map,
-//! white balance, CDL, cube LUTs, the ACES 2 output transform, the illuminant estimator and the camera
+//! white balance, CDL, cube LUTs, the cine rendering (the display transform), the illuminant estimator and the camera
 //! default rendering of the Before view. Colour maths runs in f64 here; the WGSL kernels in `ym-gpu` are
 //! checked against these functions.
 //!
@@ -10,7 +10,6 @@
 
 #![warn(missing_docs)]
 
-pub mod aces2;
 pub mod alf;
 pub mod arri;
 pub mod camera_default;
@@ -29,6 +28,11 @@ pub mod illum;
 pub mod logc;
 pub mod look;
 pub mod lut;
+pub mod mask;
+pub mod mask_depth;
+pub mod mask_raster;
+pub mod plan;
+pub mod schedule;
 pub mod sensor_map;
 pub mod spectral;
 pub mod tone;

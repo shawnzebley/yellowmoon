@@ -318,6 +318,34 @@ impl Developed {
     }
 }
 
+/// A night scene of defocused lights (discs of 1.5 % of the width on a dark ground, 4 x 6 of them): the blur the
+/// bokeh detector finds, so L1 (`docs/21` section 4) reshapes the photo when a slider asks for it.
+pub fn bokeh_developed(w: u32, h: u32, model: &str, profile: &str) -> Developed {
+    let scene = Scene::new(w, h, light(profile, 5500.0), Layout::Uniform, 0.02).noise(2e-4, 1e-6);
+    let mut mosaic = scene.mosaic();
+    let code = (scene.black + 0.45 * (scene.white_level - scene.black)) as u16;
+    let radius = 0.015 * f64::from(w);
+    for fy in [0.18, 0.4, 0.62, 0.84] {
+        for fx in [0.1, 0.26, 0.42, 0.58, 0.74, 0.9] {
+            let (cx, cy) = (fx * f64::from(w), fy * f64::from(h));
+            for y in 0..h {
+                for x in 0..w {
+                    let d = (f64::from(x) + 0.5 - cx).hypot(f64::from(y) + 0.5 - cy);
+                    if d <= radius {
+                        mosaic[(y * w + x) as usize] = code;
+                    }
+                }
+            }
+        }
+    }
+    let dir = tempfile::tempdir().expect("temp dir");
+    scene
+        .builder(model)
+        .write_to(&dir.path().join("DSC00001.ARW"), &mosaic)
+        .expect("write the synthetic ARW");
+    Developed::open(dir)
+}
+
 /// The mean of channel `c` (0 R, 1 G, 2 B) of an RGBA frame over the pixels of a rectangle.
 pub fn mean_rgba(
     frame: &ym_core::pipeline::RenderedFrame,
@@ -421,4 +449,52 @@ impl ThumbnailRenderer for GateThumbnails {
         }
         Ok(vec![0])
     }
+}
+
+/// A node-first settings document that holds the given fields (a JSON object of field names and
+/// values), each in the node it belongs to: the Input's, the Output's or Main's grade.
+#[allow(dead_code)]
+pub fn field_doc(fields: serde_json::Value) -> serde_json::Value {
+    let (mut input, mut output, mut grade) = (
+        serde_json::json!({ "id": "input" }),
+        serde_json::json!({ "id": "output" }),
+        serde_json::json!({}),
+    );
+    for (k, v) in fields.as_object().expect("a JSON object of fields") {
+        match k.as_str() {
+            "look" | "look_intensity" | "output_sharpening" => output[k] = v.clone(),
+            "contrast" | "brightness" | "highlights" | "shadows" | "white" | "black"
+            | "color_balance" | "saturation" | "color_warp" | "curve" => grade[k] = v.clone(),
+            _ => input[k] = v.clone(),
+        }
+    }
+    serde_json::json!({ "nodes": { "items": [input, { "id": 1, "grade": grade }, output] } })
+}
+
+/// A node patch that holds the given fields, each on the node it belongs to.
+#[allow(dead_code)]
+pub fn field_patch(fields: serde_json::Value) -> serde_json::Value {
+    let (mut input, mut output, mut grade) = (
+        serde_json::json!({}),
+        serde_json::json!({}),
+        serde_json::json!({}),
+    );
+    for (k, v) in fields.as_object().expect("a JSON object of fields") {
+        match k.as_str() {
+            "look" | "look_intensity" | "output_sharpening" => output[k] = v.clone(),
+            "contrast" | "brightness" | "highlights" | "shadows" | "white" | "black"
+            | "color_balance" | "saturation" | "color_warp" | "curve" => grade[k] = v.clone(),
+            _ => input[k] = v.clone(),
+        }
+    }
+    let mut nodes = serde_json::Map::new();
+    for (id, node) in [("input", input), ("output", output)] {
+        if node.as_object().is_some_and(|o| !o.is_empty()) {
+            nodes.insert(id.to_owned(), node);
+        }
+    }
+    if grade.as_object().is_some_and(|o| !o.is_empty()) {
+        nodes.insert("1".to_owned(), serde_json::json!({ "grade": grade }));
+    }
+    serde_json::json!({ "nodes": nodes })
 }

@@ -16,10 +16,11 @@ use ym_color::look::LookInput;
 use ym_color::lut::Lut3d;
 use ym_core::app::{Core, CoreOptions};
 use ym_core::export_queue::{ExportEstimate, ExportEvent, ExportJob, ExportProgress, ExportSink};
-use ym_core::looks::{DisplayLutEntry, LookEntry, LooksImportResult};
-use ym_core::preferences::{DisplayRendering, Preferences, PreferencesPatch};
+use ym_core::looks::{LookEntry, LooksImportResult};
+use ym_core::preferences::{Preferences, PreferencesPatch};
 use ym_core::session::{ApplyScope, OpenOptions, PhotoId};
 use ym_core::settings::SettingsPatch;
+use ym_core::settings::{GradePatch, NodeId, NodePatch};
 use ym_export::{ExportOptions, FormatKind};
 use ym_looks::library::LookId;
 use ym_raw::testgen::GpsSpec;
@@ -35,7 +36,11 @@ struct Rig {
 }
 
 fn rig() -> Rig {
-    let app = tempfile::tempdir().expect("app root");
+    rig_in(tempfile::tempdir().expect("app root"))
+}
+
+/// A core over an app folder that already holds something (an earlier version's files).
+fn rig_in(app: tempfile::TempDir) -> Rig {
     let home = tempfile::tempdir().expect("home");
     let (sink, events) = ExportSink::channel();
     let mut options = CoreOptions::new(data_root(), app.path().to_path_buf());
@@ -176,10 +181,16 @@ fn a_whole_open_edit_export_cycle_writes_only_the_export_file() {
         .session
         .update_settings(
             ids[0],
-            &SettingsPatch {
-                saturation: Some(ym_core::settings::PercentSetting::manual_value(25.0)),
-                ..SettingsPatch::exposure_ev(0.4)
-            },
+            &SettingsPatch::exposure_ev(0.4).and(
+                NodeId::MAIN,
+                NodePatch {
+                    grade: Some(GradePatch {
+                        saturation: Some(ym_core::settings::PercentSetting::manual_value(25.0)),
+                        ..GradePatch::default()
+                    }),
+                    ..NodePatch::default()
+                },
+            ),
         )
         .expect("edit");
     r.core.session.set_picked(ids[0], true).expect("pick");
@@ -249,16 +260,21 @@ fn choosing_a_destination_remembers_the_folder_in_the_preferences_and_nothing_el
     let keys: BTreeSet<_> = json.as_object().expect("object").keys().cloned().collect();
     let want: BTreeSet<String> = [
         "default_look",
-        "display_rendering",
         "export_defaults",
         "remove_location_from_exports",
         "check_for_updates_automatically",
         "watch_downloads_during_import",
         "last_used_folders",
-        // "Auto with Apple Intelligence", the eighth (the owner's agreement of 2026-10-19, docs/19).
-        "apple_auto",
-        // "Instructions for Apple Intelligence", the ninth (the owner's request of 2026-10-19).
+        // "Auto grading", the eighth and ninth: the provider and the consent to send photos through
+        // a program (the owner's decisions of 2026-10-26, docs/22 section 10); the old `apple_auto`
+        // switch is read for the migration and never written again.
+        "auto_provider",
+        "auto_consent",
+        // "Instructions", the tenth, one text for every provider (the owner's request of 2026-10-19).
         "apple_auto_instructions",
+        // "Single-key shortcuts", the eleventh (docs/28 A-P11; the owner took the default of
+        // question 1, docs/STATUS.md question 46 (1)).
+        "single_key_shortcuts",
     ]
     .into_iter()
     .map(str::to_owned)
@@ -312,7 +328,13 @@ fn the_default_look_preference_reaches_photos_opened_afterwards() {
     let (_root, folder) = shoot(1);
     let ids = open_all(&r.core, &folder);
     assert_eq!(
-        r.core.session.settings(ids[0]).expect("s").settings.look,
+        r.core
+            .session
+            .settings(ids[0])
+            .expect("s")
+            .settings
+            .output()
+            .look,
         warm
     );
 
@@ -334,6 +356,7 @@ fn the_default_look_preference_reaches_photos_opened_afterwards() {
             .settings(more[0])
             .expect("s")
             .settings
+            .output()
             .look
             .as_str(),
         "builtin:neutral"
@@ -414,8 +437,8 @@ fn a_new_session_gets_signature_and_neutral_is_still_the_identity() {
     let (_root, folder) = shoot(1);
     let ids = open_all(&r.core, &folder);
     let opened = r.core.session.settings(ids[0]).expect("settings").settings;
-    assert_eq!(opened.look.as_str(), "builtin:signature");
-    assert_eq!(opened.look_intensity, 100.0);
+    assert_eq!(opened.output().look.as_str(), "builtin:signature");
+    assert_eq!(opened.output().look_intensity, 100.0);
 
     // The export says which look made it, and Signature changes the picture.
     let (signature_dir, neutral_dir) = (
@@ -449,97 +472,99 @@ fn a_new_session_gets_signature_and_neutral_is_still_the_identity() {
     }
 }
 
+/// Owner's decision of 2026-10-29: ARRI's display LUT is no longer a rendering Yellowmoon offers
+/// ("Display LUT only", `docs/02-colour-pipeline.md` C12). A person who chose it, and imported
+/// ARRI's display LUTs, with an earlier version meets no error and no dialog: the choice is read as
+/// nothing, the LUTs are not listed, the picture is Yellowmoon's own, and what is on disk is left
+/// alone (the preference is dropped from `preferences.json` the next time one is saved).
 #[test]
-fn the_display_rendering_preference_chooses_the_transform_and_is_written_to_the_xmp() {
+fn an_older_choice_of_arris_display_rendering_and_its_imported_luts_are_ignored() {
+    let app = tempfile::tempdir().expect("app root");
+    let display_dir = app.path().join("looks").join("arri-display");
+    std::fs::create_dir_all(&display_dir).expect("folder");
+    let lut_file = write_cube(&display_dir, "Rec709.cube");
+    let lut_bytes = std::fs::read(&lut_file).expect("read");
+    let manifest = serde_json::json!({
+        "version": 1,
+        "looks": [],
+        "display_luts": [{
+            "id": "arri-display:logc4:rec709-g24", "input": "logc4", "target": "rec709-g24",
+            "file": "arri-display/Rec709.cube", "sha256": ym_looks::manifest::sha256_hex(&lut_bytes)
+        }]
+    });
+    let manifest_text = serde_json::to_string_pretty(&manifest).expect("json");
+    std::fs::write(
+        app.path().join("looks").join("manifest.json"),
+        &manifest_text,
+    )
+    .expect("manifest");
+    std::fs::write(
+        app.path().join("preferences.json"),
+        r#"{ "display_rendering": { "kind": "arri_display", "id": "arri-display:logc4:rec709-g24" },
+             "remove_location_from_exports": false }"#,
+    )
+    .expect("preferences");
+
+    let r = rig_in(app);
+    // No error, no warning to the person: the list is the built-in looks and the preferences are
+    // the defaults for what the file does not say.
+    assert!(
+        r.core
+            .looks_list()
+            .iter()
+            .all(|l| l.id.as_str().starts_with("builtin:")),
+        "{:?}",
+        r.core.looks_list()
+    );
+    assert_eq!(r.core.preferences_get(), Preferences::default());
+
+    // The picture is Yellowmoon's own, and an export says so.
+    let (_root, shoot_folder) = shoot(1);
+    open_all(&r.core, &shoot_folder);
+    let out = tempfile::tempdir().expect("out");
+    r.core
+        .export_start(&jpeg_job(ApplyScope::All, Some(out.path())))
+        .expect("queued");
+    wait_export(&r);
+    let bytes = std::fs::read(out.path().join("DSC00001_signature.jpg")).expect("export");
+    assert_eq!(
+        xmp_property(&xmp_of(&bytes).expect("xmp"), "ym:DisplayTransform").as_deref(),
+        Some("cine-rec709")
+    );
+
+    // Saving the export folder rewrote the preferences without the old choice; the LUT and the list
+    // that named it were not touched.
+    let saved: Value = serde_json::from_str(
+        &std::fs::read_to_string(r.app.path().join("preferences.json")).expect("read"),
+    )
+    .expect("json");
+    assert!(saved.get("display_rendering").is_none(), "{saved}");
+    assert_eq!(std::fs::read(&lut_file).expect("read"), lut_bytes);
+    assert_eq!(
+        std::fs::read_to_string(r.app.path().join("looks").join("manifest.json")).expect("read"),
+        manifest_text
+    );
+}
+
+/// ARRI's display LUTs cannot be imported any more: the person is told in one sentence, and
+/// nothing is written.
+#[test]
+fn a_folder_of_arris_display_luts_has_nothing_to_import_and_writes_nothing() {
     let r = rig();
     let src = tempfile::tempdir().expect("src");
     let folder = src.path().join("LogC4 Display LUTs");
     std::fs::create_dir_all(&folder).expect("folder");
     write_cube(&folder, "LogC4_to_Gamma24_Rec709.cube");
-    let imported = r
-        .core
-        .looks_import(&folder, None, &mut |_| {})
-        .expect("import display LUTs");
-    assert_eq!(imported.display_luts_added, 1);
-    let lut = r.core.looks_display_luts()[0].id.clone();
-
-    let (_root, shoot_folder) = shoot(1);
-    open_all(&r.core, &shoot_folder);
-    let (aces, arri) = (
-        tempfile::tempdir().expect("a"),
-        tempfile::tempdir().expect("b"),
-    );
-    r.core
-        .export_start(&jpeg_job(ApplyScope::All, Some(aces.path())))
-        .expect("queued");
-    wait_export(&r);
-
-    r.core
-        .preferences_set(&PreferencesPatch {
-            display_rendering: Some(DisplayRendering::ArriDisplay { id: lut.clone() }),
-            ..PreferencesPatch::default()
-        })
-        .expect("set");
-    assert_eq!(
-        r.core.renderer.display(),
-        ym_core::pipeline::DisplayChoice::ArriLut(lut.clone())
-    );
-    r.core
-        .export_start(&jpeg_job(ApplyScope::All, Some(arri.path())))
-        .expect("queued");
-    wait_export(&r);
-    let name = "DSC00001_signature.jpg";
-    let (bytes_aces, bytes_arri) = (
-        std::fs::read(aces.path().join(name)).expect("aces"),
-        std::fs::read(arri.path().join(name)).expect("arri"),
-    );
-    assert_ne!(
-        bytes_aces, bytes_arri,
-        "another display transform, another picture"
-    );
-    assert_eq!(
-        xmp_property(&xmp_of(&bytes_aces).expect("xmp"), "ym:DisplayTransform").as_deref(),
-        Some("aces2-sdr100-rec709lim")
-    );
-    assert_eq!(
-        xmp_property(&xmp_of(&bytes_arri).expect("xmp"), "ym:DisplayTransform").as_deref(),
-        Some(lut.as_str())
-    );
-    // Neutral is a built-in look with a description file: its hash is recorded.
-    let sha = xmp_property(&xmp_of(&bytes_aces).expect("xmp"), "ym:LookSHA256").expect("sha");
-    assert_eq!(sha.len(), 64);
-
-    // The LUT's file vanishes. Once the library notices (a verify, a reload), the export refuses
-    // instead of quietly using ACES 2 under a preference that says the LUT.
-    let stored = r.app.path().join("looks").join("arri-display");
-    for e in std::fs::read_dir(&stored).expect("dir").flatten() {
-        std::fs::remove_file(e.path()).expect("rm");
-    }
-    r.core.looks.verify().expect("verify");
-    let c = tempfile::tempdir().expect("c");
+    write_cube(&folder, "LogC4_to_P3_D65.cube");
     let err = r
         .core
-        .export_start(&jpeg_job(ApplyScope::All, Some(c.path())))
-        .expect_err("refused");
-    assert_eq!(err.scope(), "looks");
-    assert_eq!(err.to_string(), "File missing or changed. Import again.");
-    assert!(tree(c.path()).is_empty());
-    // The viewport meanwhile uses ACES 2, and choosing ACES 2 again makes exports work.
+        .looks_import(&folder, None, &mut |_| {})
+        .expect_err("nothing to import");
     assert_eq!(
-        r.core.renderer.display(),
-        ym_core::pipeline::DisplayChoice::Aces2
+        err.to_string(),
+        "This package has only display renderings. Yellowmoon uses its own rendering, so there is nothing to import."
     );
-    r.core
-        .preferences_set(&PreferencesPatch {
-            display_rendering: Some(DisplayRendering::Aces2),
-            ..PreferencesPatch::default()
-        })
-        .expect("set");
-    r.core
-        .export_start(&jpeg_job(ApplyScope::All, Some(c.path())))
-        .expect("queued");
-    wait_export(&r);
-    assert_eq!(names_in(c.path()).len(), 1);
+    assert!(tree(r.app.path()).is_empty(), "{:?}", tree(r.app.path()));
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -647,10 +672,16 @@ fn the_cli_preview_of_a_real_session() {
         .session
         .update_settings(
             ids[0],
-            &SettingsPatch {
-                contrast: Some(ym_core::settings::PercentSetting::manual_value(20.0)),
-                ..SettingsPatch::default()
-            },
+            &SettingsPatch::default().and(
+                NodeId::MAIN,
+                NodePatch {
+                    grade: Some(GradePatch {
+                        contrast: Some(ym_core::settings::PercentSetting::manual_value(20.0)),
+                        ..GradePatch::default()
+                    }),
+                    ..NodePatch::default()
+                },
+            ),
         )
         .expect("edit");
     let this = r.core.cli_preview_detail(&jpeg_job(ApplyScope::This, None));
@@ -806,6 +837,9 @@ fn the_export_preferences_and_looks_types_have_the_fields_of_the_typescript_inte
             seconds: 1.0,
             adjusted_photos: 0,
             dng_approximate: false,
+            free_bytes: Some(1),
+            folder: Some(String::new()),
+            low_space: false,
         })
         .expect("json"),
     );
@@ -819,12 +853,16 @@ fn the_export_preferences_and_looks_types_have_the_fields_of_the_typescript_inte
             file_percent: None,
             error: None,
             skipped: false,
+            stopped: false,
         })
         .expect("json"),
     );
     let prefs = Preferences::default();
-    // `apple_auto` (docs/19 section 2) is a field on both sides.
-    assert!(ts_interface_keys(&source, "Preferences").contains("apple_auto"));
+    // `auto_provider` and `auto_consent` (docs/22 section 10) are fields on both sides, and the
+    // old `apple_auto` is on neither.
+    let ts = ts_interface_keys(&source, "Preferences");
+    assert!(ts.contains("auto_provider") && ts.contains("auto_consent"));
+    assert!(!ts.contains("apple_auto"));
     check("Preferences", serde_json::to_value(&prefs).expect("json"));
     check(
         "LastUsedFolders",
@@ -846,38 +884,23 @@ fn the_export_preferences_and_looks_types_have_the_fields_of_the_typescript_inte
         .expect("json"),
     );
     check(
-        "DisplayLut",
-        serde_json::to_value(DisplayLutEntry {
-            id: LookId::parse("arri-display:logc4:rec709-g24").expect("id"),
-            name: "x".into(),
-            input: LookInput::LogC4,
-            target: "rec709-g24".into(),
-        })
-        .expect("json"),
-    );
-    check(
         "LooksImportResult",
         serde_json::to_value(LooksImportResult {
             added: vec![],
-            display_luts_added: 0,
             unchanged: 0,
             notes: vec![],
             refusals: vec![],
         })
         .expect("json"),
     );
-    // And the union members spelled the way the frontend spells them.
-    assert!(source.contains("\"aces2\"") && source.contains("\"arri_display\""));
-    assert_eq!(
-        serde_json::to_value(DisplayRendering::Aces2).expect("json"),
-        serde_json::json!({ "kind": "aces2" })
-    );
 }
 
 #[test]
 fn the_apple_auto_types_have_the_fields_of_the_typescript_interfaces() {
-    // `apple_auto_status` and the photo's Apple Auto state (`docs/19` sections 10 and 12) as the
-    // webview reads them.
+    // The photo's Apple Auto state (`docs/19` section 12) as the webview reads it. The status and
+    // the info are not checked here: since `docs/22` the app's wire types for them (`AutoStatus`,
+    // `ProviderStatus`, `AppleAutoInfo`) are the shell's own, flatter than the core's (`src-tauri`'s
+    // `wire.rs` and `src/api/contract.ts` check them).
     use ym_core::apple_auto::{AdvisorAnswer, AdvisorInfo, AppleAuto, AutoSteps};
     let path = repo_root().join("src/api/types.ts");
     let Ok(source) = std::fs::read_to_string(&path) else {
@@ -891,18 +914,12 @@ fn the_apple_auto_types_have_the_fields_of_the_typescript_interfaces() {
             "interface {name} against its Rust type"
         );
     };
-    let r = rig();
-    let status = r.core.apple_auto_status();
-    check(
-        "AppleAutoStatus",
-        serde_json::to_value(&status).expect("json"),
-    );
     let info = AdvisorInfo::new("AFM 3 Core", "27.0.1 (27A404)");
-    check("AppleAutoInfo", serde_json::to_value(&info).expect("json"));
     let answer = AdvisorAnswer {
         steps: AutoSteps::keep(),
         scene: "A street".into(),
         plan: "Soft and warm".into(),
+        served_model: None,
     };
     check(
         "AppleAutoAnswer",

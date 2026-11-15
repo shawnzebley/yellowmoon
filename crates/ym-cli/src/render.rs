@@ -6,10 +6,10 @@
 //! only code that makes a file). Results arrive as the queue finishes each photo; the command
 //! prints them in that order.
 //!
-//! Apple Auto (`docs/19`) is the app's too: the core gets this computer's advisor and the
-//! `apple_auto` preference decides unless `--apple-auto on|off` says otherwise. When it acts, the
+//! The Auto providers (`docs/19`, `docs/22`) are the app's too: the core gets this computer's advisors
+//! and the saved `auto_provider` decides unless `--auto-provider` says otherwise. When one acts, the
 //! photos are developed and answered before their settings are applied (`Session::wait_idle` waits
-//! for the answers), so the JSON and the files carry Apple's values.
+//! for the answers), so the JSON and the files carry the provider's values.
 //!
 //! stdout carries data only: the path of every file written, or one JSON object per photo with
 //! `--json`. Everything for a person (progress, warnings, the summary) goes to stderr.
@@ -20,29 +20,34 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::RecvTimeoutError;
 use std::time::{Duration, Instant};
 
+use ym_core::app::Core;
 use ym_core::app::gpu::{
-    CpuReason, GPU_ENV, GpuOutcome, GpuPolicy, GpuSlot, PolicyChoice, PolicySource, open_gpu,
+    CpuReason, GPU_ENV, GpuOutcome, GpuPolicy, GpuSlot, PolicyChoice, PolicySource,
 };
+use ym_core::export::{free_bytes_in, is_low_on_space, low_space_message, planned_destination};
 use ym_core::export_queue::{ExportEvent, ExportJob, FileDone, QueueError};
 use ym_core::looks::{LookService, LooksError};
-use ym_core::pipeline::{ComputeDevice, DisplayChoice};
-use ym_core::preferences::DisplayRendering;
+use ym_core::pipeline::ComputeDevice;
 use ym_core::session::{ApplyScope, OpenOptions, PhotoId, PhotoStatus};
+use ym_core::settings::{Crop, CropAspect, LensKind, SettingsPatch};
 use ym_export::{ExportOptions, FormatKind, IfExists, JpegQuality, Size};
 use ym_looks::library::LookId;
 use ym_looks::library::ResolveError;
-use ym_raw::layout::DecodeKind;
 
-use crate::cli::{AppleAutoArg, RenderArgs};
+use crate::cli::{RenderArgs, auto_choice};
 use crate::console::{Console, bar, duration_text, photos, shorten};
-use crate::develop::{LoadedSettings, Overrides, SettingsFile};
+use crate::develop::{LensChoice, LoadedSettings, Overrides, SettingsFile};
 use crate::exit::{self, Failure};
 use crate::inputs::{self, Expanded, Problem};
-use crate::report::{AppleAutoField, Object, develop_fields, render_error, render_ok};
+use crate::report::{
+    AppleAutoField, Object, develop_fields, render_error, render_low_space, render_ok,
+    render_stopped,
+};
 use crate::runtime::{
     BackgroundGpu, CoreSettings, Runtime, gpu_line, interrupted, read_instructions,
 };
 use crate::text::{data_path, line_text, lossy, path_text};
+use ym_core::settings::{NodeId, NodePatch};
 
 /// The longest file name the progress line shows. With the bar and the counts the line is then
 /// about 70 columns, which fits the 80 of a default terminal window; a longer line would wrap and
@@ -73,6 +78,34 @@ pub fn look_failure(error: &LooksError) -> Failure {
     }
 }
 
+/// Finds the lens `--lens` names in the lens library, with the Flares and Edges it starts at.
+///
+/// # Errors
+///
+/// A usage failure when the lens data could not be loaded: without them the starting amounts are
+/// not known.
+pub fn resolve_lens(core: &Core, kind: LensKind) -> Result<LensChoice, Failure> {
+    let library = core.lens_library().map_err(|why| {
+        Failure::usage(format!(
+            "--lens can't be used: {why}. Reinstall Yellowmoon, or set YELLOWMOON_DATA to a data folder that has them."
+        ))
+    })?;
+    let info = library
+        .lenses()
+        .iter()
+        .find(|l| l.kind == kind)
+        .ok_or_else(|| {
+            Failure::usage(format!(
+                "The lens data have no lens called {kind}. Run `ym lenses list` to see them."
+            ))
+        })?;
+    Ok(LensChoice {
+        kind,
+        start_flares: info.start_flares,
+        start_edges: info.start_edges,
+    })
+}
+
 /// Finds the look `--look` or `looks default` names, and checks that its file is there.
 ///
 /// # Errors
@@ -85,64 +118,16 @@ pub fn resolve_look(looks: &LookService, query: &str) -> Result<LookId, Failure>
     Ok(id)
 }
 
-/// `--display`: which display rendering this run uses.
-fn resolve_display(looks: &LookService, query: &str) -> Result<DisplayChoice, Failure> {
-    let word = query.trim();
-    if word.eq_ignore_ascii_case("aces2") {
-        return Ok(DisplayChoice::Aces2);
-    }
-    let luts = looks.display_luts();
-    let id = if word.eq_ignore_ascii_case("arri") {
-        let chosen = match looks.preferences().get().display_rendering {
-            DisplayRendering::ArriDisplay { id } => {
-                luts.iter().find(|l| l.id == id).map(|l| l.id.clone())
-            }
-            DisplayRendering::Aces2 => None,
-        };
-        match (chosen, luts.as_slice()) {
-            (Some(id), _) => id,
-            (None, [only]) => only.id.clone(),
-            (None, []) => {
-                return Err(Failure::new(
-                    exit::LOOK_MISSING,
-                    "No ARRI display LUTs are imported. Import ARRI's look package first (ym looks import <package>).",
-                ));
-            }
-            (None, many) => {
-                let list = many
-                    .iter()
-                    .map(|l| format!("{} ({})", l.id, l.name))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                return Err(Failure::usage(format!(
-                    "Several ARRI display LUTs are imported: {list}. Choose one in the app's Preferences, or name it: --display <id>."
-                )));
-            }
-        }
-    } else {
-        let id = LookId::parse(word).map_err(|_| {
-            Failure::usage(format!(
-                "`{word}` is not a display rendering. Use aces2, arri, or the id of an imported display LUT."
-            ))
-        })?;
-        if luts.iter().all(|l| l.id != id) {
-            return Err(Failure::new(
-                exit::LOOK_MISSING,
-                format!("There is no imported display LUT with the id {id}."),
-            ));
-        }
-        id
-    };
-    // The file must still be there and make a usable transform.
-    looks
-        .provider()
-        .display_transform(&id)
-        .map_err(|e| Failure::new(exit::LOOK_MISSING, e.to_string()))?;
-    Ok(DisplayChoice::ArriLut(id))
-}
+/// What `--display` says now. The option chose ARRI's display LUT as the rendering; Yellowmoon
+/// always uses its own (`docs/02-colour-pipeline.md`, C12), so it is a usage error (exit 2) that
+/// names the way out. `--look` is where a photo's look is chosen.
+pub const DISPLAY_REMOVED: &str = "--display was removed. Yellowmoon always uses its own display rendering, so there is nothing to choose. Leave the option out. To change how photos look, use --look.";
 
 /// The export options of a run: the table of `docs/09` as defaults, the user's format preference,
 /// then the options of the command line.
+/// How long reading the files may take before `ym` says how far it has got.
+const READING_LINE_AFTER: std::time::Duration = std::time::Duration::from_secs(1);
+
 fn export_options(
     args: &RenderArgs,
     preferred_format: FormatKind,
@@ -232,6 +217,43 @@ enum Outcome {
     Failed { kind: String },
 }
 
+/// Says "This export needs about {size} and {free} is free in {folder}. It may stop part way." on stderr
+/// (and as a `low_space` event with `--json`) when the free space of the destination is under 1.35 times
+/// the size estimate (`ym_core::export::is_low_on_space`). The run goes on either way. The folder is the
+/// first photo's destination, by its full path; nothing is said when the space cannot be read.
+fn warn_if_low_on_space(
+    core: &Core,
+    job: &ExportJob,
+    json: bool,
+    console: &mut Console,
+    stdout: &mut Stdout,
+) {
+    let Some(first) = core
+        .session
+        .scope_ids(job.scope)
+        .into_iter()
+        .find_map(|id| core.session.view(id).ok())
+    else {
+        return;
+    };
+    let Some(folder) = planned_destination(core.exports.context(), &first.path, &job.options)
+    else {
+        return;
+    };
+    let Some(free) = free_bytes_in(&folder) else {
+        return;
+    };
+    let needed = core.exports.estimate(&core.session, job).bytes;
+    if !is_low_on_space(needed, free) {
+        return;
+    }
+    let message = low_space_message(needed, free, &path_text(&folder));
+    console.warn(&message);
+    if json {
+        stdout.line(&render_low_space(needed, free, &path_text(&folder), &message).to_line());
+    }
+}
+
 /// A stdout that notices when its reader is gone and then stays quiet.
 struct Stdout {
     open: bool,
@@ -313,20 +335,38 @@ fn read_settings_text(path: &Path) -> Result<String, Failure> {
     }
 }
 
-fn decode_kind_unsupported(kind: DecodeKind) -> bool {
-    matches!(kind, DecodeKind::Arw6 | DecodeKind::Unknown { .. })
-}
-
-/// Why a photo the session skipped could not be developed, as a JSON `kind`.
-fn skip_kind(path: &Path) -> &'static str {
-    match ym_raw::metadata::probe(path) {
-        Err(error) => error.kind(),
-        Ok(meta) if decode_kind_unsupported(meta.decode) => "unsupported",
-        Ok(_) => "decode",
+/// Why a photo the session skipped could not be developed: the JSON `kind` and, when the file
+/// itself is the cause, the technical detail of the failure.
+///
+/// The session keeps only the sentence, so the file is decoded again (it is a failure, so this runs
+/// once per bad file) and the error of that decode gives the kind (`corrupt`, `io`, `not_arw`,
+/// `arq`, `unsupported`) and its detail. A file that decodes again was refused by a later stage of
+/// the session (the automatic estimates), which is not a file problem of the raw kinds: `analysis`.
+fn skip_kind(path: &Path, reason: &str) -> (&'static str, Option<String>) {
+    // A file that did not answer in time is not read again: that would wait for it a second time
+    // (`docs/26` H-15). It is an `io` failure whose detail says so.
+    if reason == ym_core::media::NO_ANSWER_MESSAGE {
+        return ("io", Some("the file did not answer in time".to_owned()));
+    }
+    // A file that changed after it was opened (`docs/26` H-04) decodes again as a different file:
+    // that is an `io` failure too, and it is not read a second time.
+    if reason == ym_core::media::CHANGED_MESSAGE {
+        return (
+            "io",
+            Some("the file changed after it was opened".to_owned()),
+        );
+    }
+    match ym_raw::decode::decode(path) {
+        Err(error) => (error.kind(), error.detail()),
+        Ok(_) => ("analysis", None),
     }
 }
 
 fn run_checked(args: &RenderArgs, console: &mut Console) -> Result<u8, Failure> {
+    // Before anything is read or opened: the option is gone, and saying so costs nothing.
+    if args.display.is_some() {
+        return Err(Failure::usage(DISPLAY_REMOVED));
+    }
     let inputs_from_stdin = args.inputs.iter().any(|p| p.as_os_str() == "-");
     let settings_from_stdin = args.settings.as_deref() == Some(Path::new("-"));
     if inputs_from_stdin && settings_from_stdin {
@@ -344,21 +384,21 @@ fn run_checked(args: &RenderArgs, console: &mut Console) -> Result<u8, Failure> 
         args.inputs.clone()
     };
 
-    // The data folder, the preferences, the look library and Apple Auto's advisor.
-    let apple_auto = AppleAutoArg::mode(args.apple_auto);
-    let apple_auto_instructions = args
-        .apple_auto_instructions
+    // The data folder, the preferences, the look library and the Auto providers' advisors.
+    let choice = auto_choice(args.auto_provider, args.apple_auto).map_err(Failure::usage)?;
+    let auto_instructions = args
+        .auto_instructions
         .as_deref()
         .map(read_instructions)
         .transpose()?;
     let rt = Runtime::open(&CoreSettings {
         jobs: args.jobs,
         forced_profile: args.profile.clone(),
-        apple_auto: Some(apple_auto),
-        apple_auto_instructions,
+        auto: Some(choice),
+        auto_instructions,
     })?;
     let core = &rt.core;
-    if let Some(notice) = rt.apple_auto_notice(apple_auto) {
+    for notice in rt.auto_notices() {
         console.warn(&notice);
     }
 
@@ -372,7 +412,7 @@ fn run_checked(args: &RenderArgs, console: &mut Console) -> Result<u8, Failure> 
     let budget = core.renderer.options().budget;
     let mut gpu_slot: Option<GpuSlot> = None;
     if choice.policy.is_strict() {
-        let slot = open_gpu(choice.policy, budget);
+        let slot = ym_apple::gpu_opener(choice.policy, budget).open();
         if let Some(reason) = slot.failure() {
             return Err(Failure::new(exit::NO_GPU, no_gpu_message(&choice, reason)));
         }
@@ -386,22 +426,17 @@ fn run_checked(args: &RenderArgs, console: &mut Console) -> Result<u8, Failure> 
         gpu_slot = Some(GpuSlot::off(budget));
     }
 
-    // Display rendering and look.
-    match args.display.as_deref() {
-        Some(query) => core
-            .renderer
-            .set_display(resolve_display(&core.looks, query)?),
-        None => core
-            .looks
-            .check_display_rendering()
-            .map_err(|e| look_failure(&e))?,
-    }
+    // The look.
     let look = args
         .look
         .as_deref()
         .map(|q| resolve_look(&core.looks, q))
         .transpose()?;
-    let overrides = Overrides::from_args(args, look);
+    let lens = args
+        .lens
+        .map(|arg| resolve_lens(core, arg.into()))
+        .transpose()?;
+    let overrides = Overrides::from_args(args, look, lens);
 
     // The settings file.
     let default_look = core.looks.effective_default();
@@ -450,10 +485,24 @@ fn run_checked(args: &RenderArgs, console: &mut Console) -> Result<u8, Failure> 
         message,
     } in &problems
     {
-        report_failure(console, &mut stdout, args.json, path, None, kind, message);
+        report_failure(
+            console,
+            &mut stdout,
+            args.json,
+            path,
+            None,
+            kind,
+            message,
+            None,
+        );
         counts.failed.push((*kind).to_owned());
     }
     if files.is_empty() {
+        // A folder that could not be read was reported above, and it is the reason nothing is left:
+        // a failure (1), not "no input" (5).
+        if problems.iter().any(|p| p.kind == "unreadable") {
+            return Ok(exit::SOME_FAILED);
+        }
         console.error(if ignored > 0 || !problems.is_empty() {
             "No ARW files were found. Give ARW files, or folders that hold them."
         } else {
@@ -476,7 +525,14 @@ fn run_checked(args: &RenderArgs, console: &mut Console) -> Result<u8, Failure> 
         .then(|| BackgroundGpu::start(choice.policy, budget));
 
     let mut plans: Vec<Plan> = Vec::with_capacity(files.len());
-    for file in &files {
+    let reading_started = std::time::Instant::now();
+    for (n, file) in files.iter().enumerate() {
+        // A slow volume: after the first second say how far the reading has got (`docs/26` P3-3).
+        // Each file has its own time limit, so one that does not answer ends the line with the
+        // photo's own sentence.
+        if reading_started.elapsed() > READING_LINE_AFTER {
+            console.progress(format!("Reading {n} of {} files…", files.len()));
+        }
         let outcome = core
             .session
             .open(std::slice::from_ref(file), OpenOptions::default());
@@ -487,11 +543,15 @@ fn run_checked(args: &RenderArgs, console: &mut Console) -> Result<u8, Failure> 
             result: None,
         });
     }
+    if reading_started.elapsed() > READING_LINE_AFTER {
+        console.finish_progress();
+    }
     let total = plans.len();
+    let asking = format!("Asking {}", rt.asking().name());
     let developed = rt.wait_developed(|w| {
-        // Apple Auto's answers come after the photos are developed (`docs/19` section 6).
+        // The provider's answers come after the photos are developed (`docs/19` section 6).
         let (label, done, n) = match w.answers {
-            Some((answered, n)) => ("Asking Apple Intelligence", answered, n),
+            Some((answered, n)) => (asking.as_str(), answered, n),
             None => ("Developing", w.ready, w.total),
         };
         console.progress(format!(
@@ -500,6 +560,9 @@ fn run_checked(args: &RenderArgs, console: &mut Console) -> Result<u8, Failure> 
         ));
     });
     console.finish_progress();
+    if let Some(notice) = rt.breaker_notice() {
+        console.warn(&notice);
+    }
     if !developed {
         core.close_session();
         console.info("Interrupted.");
@@ -523,18 +586,35 @@ fn run_checked(args: &RenderArgs, console: &mut Console) -> Result<u8, Failure> 
                 None,
                 "open",
                 "This file couldn't be opened. Check that it exists and try again.",
+                None,
             );
             continue;
         };
         if let Some(PhotoStatus::Skipped { reason }) = core.session.status(id) {
-            let kind = skip_kind(&plan.input);
+            let (kind, detail) = skip_kind(&plan.input, &reason);
             plan.result = Some(Outcome::Failed { kind: kind.into() });
             plan.photo = None;
             counts.failed.push(kind.into());
-            report_failure(console, &mut stdout, args.json, input, None, kind, &reason);
+            report_failure(
+                console,
+                &mut stdout,
+                args.json,
+                input,
+                None,
+                kind,
+                &reason,
+                detail.as_deref(),
+            );
             continue;
         }
-        match apply_settings(&rt, id, &plan.input, settings_file.as_ref(), &overrides) {
+        match apply_settings(
+            &rt,
+            id,
+            &plan.input,
+            settings_file.as_ref(),
+            &overrides,
+            args.auto_crop,
+        ) {
             Ok((known, warning)) => {
                 if let Some(warning) = warning {
                     console.warn(&format!("{}: {warning}", path_text(input)));
@@ -556,6 +636,7 @@ fn run_checked(args: &RenderArgs, console: &mut Console) -> Result<u8, Failure> 
                     None,
                     "settings",
                     &message,
+                    None,
                 );
             }
         }
@@ -593,12 +674,14 @@ fn run_checked(args: &RenderArgs, console: &mut Console) -> Result<u8, Failure> 
         scope: ApplyScope::Picked,
         options: options.clone(),
     };
-    // Apple Auto's availability is read again before the export starts, as the app's
-    // `Core::export_start` does (`docs/19` section 1); an Apple Auto the run wanted that has gone
+    // The provider's availability is read again before the export starts, as the app's
+    // `Core::export_start` does (`docs/19` section 1); a provider the run wanted that has gone
     // meanwhile is said once.
-    if let Some(notice) = rt.apple_auto_notice_before_export() {
+    if let Some(notice) = rt.auto_notice_before_export() {
         console.warn(&notice);
     }
+    // The free space is read now, as the job starts (`docs/26-hardening.md` P2-3): a warning, never a stop.
+    warn_if_low_on_space(core, &job, args.json, console, &mut stdout);
     let started = Instant::now();
     if let Err(error) = core.exports.start(&core.session, &job, remove_location) {
         return Err(match error {
@@ -660,8 +743,9 @@ fn run_checked(args: &RenderArgs, console: &mut Console) -> Result<u8, Failure> 
     }
     console.finish_progress();
 
-    // A photo with no result: the job stopped (Ctrl-C) or something went wrong below us.
-    if !cancelled {
+    // A photo with no result: the job stopped (Ctrl-C) or something went wrong below us. (A job that
+    // stopped at a failure of the destination left the photos after it untried, which is no surprise.)
+    if !cancelled && summary.stopped.is_none() {
         for plan in plans
             .iter_mut()
             .filter(|p| p.photo.is_some() && p.result.is_none())
@@ -676,6 +760,7 @@ fn run_checked(args: &RenderArgs, console: &mut Console) -> Result<u8, Failure> 
                 plan.known.as_ref(),
                 "render",
                 message,
+                None,
             );
             plan.result = Some(Outcome::Failed {
                 kind: "render".into(),
@@ -684,6 +769,13 @@ fn run_checked(args: &RenderArgs, console: &mut Console) -> Result<u8, Failure> 
     }
     summary.elapsed = started.elapsed().as_secs_f64();
     summarise(console, args.json, &counts, &summary, total, cancelled);
+    // The same number as `ym doctor --bench` calls `host_ledger_peak_bytes`; the memory gate of CI
+    // (`docs/26` H-12) compares it with the process's peak resident memory.
+    let ledger_peak = core.renderer.ledger().peak();
+    console.detail(&format!(
+        "Ledger peak: {ledger_peak} bytes ({:.0} MiB).",
+        ledger_peak as f64 / 1_048_576.0
+    ));
     if !args.json || console.is_verbose() {
         for note in &notes {
             console.info(&format!("Note: {note}"));
@@ -692,16 +784,18 @@ fn run_checked(args: &RenderArgs, console: &mut Console) -> Result<u8, Failure> 
     Ok(final_code(&counts, cancelled))
 }
 
-/// Gives a photo its settings: the file's, then the options'. Returns what `--json` knows of it
-/// and, when an option asked for more than the settings allow, a sentence saying what was done
-/// instead (the options are checked against their ranges before anything runs, but
-/// `--exposure-offset` depends on the photo: its automatic exposure plus the offset can pass 4).
+/// Gives a photo its settings: the file's, then the options', then `--auto-crop`'s crop. Returns
+/// what `--json` knows of it and, when an option asked for more than the settings allow, a
+/// sentence saying what was done instead (the options are checked against their ranges before
+/// anything runs, but `--exposure-offset` depends on the photo: its automatic exposure plus the
+/// offset can pass 4; and Auto crop may have no answer for a photo).
 fn apply_settings(
     rt: &Runtime,
     id: PhotoId,
     path: &Path,
     file: Option<&SettingsFile>,
     overrides: &Overrides,
+    auto_crop: Option<CropAspect>,
 ) -> Result<(Object, Option<String>), String> {
     let session = &rt.core.session;
     let mut resolved = session.settings(id).map_err(|e| e.to_string())?;
@@ -712,7 +806,7 @@ fn apply_settings(
     }
     let mut warning = None;
     if !overrides.is_empty() {
-        let auto_ev = resolved.estimates.exposure_ev;
+        let auto_ev = resolved.estimates.input.exposure_ev;
         let patch = overrides.patch(auto_ev);
         if !patch.is_empty() {
             resolved = session
@@ -721,7 +815,7 @@ fn apply_settings(
         }
         if let (Some(offset), None) = (overrides.exposure_offset, overrides.exposure) {
             let wanted = auto_ev + offset;
-            let got = resolved.values.exposure_ev;
+            let got = resolved.values.input.exposure_ev;
             if (got - wanted).abs() > 1e-9 {
                 warning = Some(format!(
                     "the exposure is limited to {got:+.2} EV (automatic {auto_ev:+.2} plus {offset:+.2} would be {wanted:+.2})."
@@ -729,11 +823,51 @@ fn apply_settings(
             }
         }
     }
+    // Auto crop, as the Crop panel's Auto gives it (`docs/20-auto-crop.md` section 8): the
+    // proposal's angle and first frame at the photo's orientation; the whole photo at 0° is no crop,
+    // as the panel's Done sends it.
+    let mut auto_crop_field = None;
+    if let Some(aspect) = auto_crop {
+        match session.suggest_crop(id, aspect, resolved.settings.input().orientation) {
+            Ok(suggestion) => {
+                let crop = suggestion.frames.first().and_then(|frame| {
+                    let whole = frame.rect.width > 1.0 - 1e-6 && frame.rect.height > 1.0 - 1e-6;
+                    (!(whole && suggestion.angle_deg.abs() < 1e-9)).then_some(Crop {
+                        rect: frame.rect,
+                        angle_deg: suggestion.angle_deg,
+                        aspect,
+                        auto: true,
+                    })
+                });
+                let patch = SettingsPatch::default().and(
+                    NodeId::Input,
+                    NodePatch {
+                        crop: Some(crop),
+                        ..NodePatch::default()
+                    },
+                );
+                resolved = session
+                    .update_settings(id, &patch)
+                    .map_err(|e| e.to_string())?;
+                auto_crop_field =
+                    Some(serde_json::to_value(&suggestion).unwrap_or(serde_json::Value::Null));
+            }
+            Err(error) => {
+                let reason = error.to_string();
+                warning = Some(match warning {
+                    Some(w) => format!("{w} {reason} Auto crop was not applied."),
+                    None => format!("{reason} Auto crop was not applied."),
+                });
+                auto_crop_field = Some(serde_json::json!({ "error": reason }));
+            }
+        }
+    }
     let view = session.view(id).map_err(|e| e.to_string())?;
-    Ok((
-        develop_fields(&view, &resolved, AppleAutoField::WhenActive),
-        warning,
-    ))
+    let mut known = develop_fields(&view, &resolved, AppleAutoField::WhenActive);
+    if let Some(field) = auto_crop_field {
+        known.insert("auto_crop", field);
+    }
+    Ok((known, warning))
 }
 
 #[derive(Debug, Default)]
@@ -748,9 +882,23 @@ struct Summary {
     skipped: usize,
     folders: Vec<PathBuf>,
     elapsed: f64,
+    /// The export stopped at a failure of the destination (`docs/26` P2-2).
+    stopped: Option<Stopped>,
 }
 
-/// Prints one failure: a JSON object with `--json`, else a line on stderr.
+/// Where the export stopped.
+#[derive(Debug, Clone, Copy)]
+struct Stopped {
+    /// Photos in the job.
+    total: usize,
+}
+
+/// Prints one failure: a JSON object with `--json` (with `error.detail` when there is one), else a
+/// line on stderr, and the detail on a second line with `--verbose`.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one failure's fields, passed once per file"
+)]
 fn report_failure(
     console: &mut Console,
     stdout: &mut Stdout,
@@ -759,11 +907,15 @@ fn report_failure(
     known: Option<&Object>,
     kind: &str,
     message: &str,
+    detail: Option<&str>,
 ) {
     if json {
-        stdout.line(&render_error(&lossy(input), known, kind, message).to_line());
+        stdout.line(&render_error(&lossy(input), known, kind, message, detail).to_line());
     } else {
         console.error(&format!("{}: {message}", path_text(input)));
+    }
+    if let Some(detail) = detail {
+        console.detail(&format!("{}: {detail}", path_text(input)));
     }
 }
 
@@ -862,8 +1014,23 @@ fn handle_file(
                 input,
                 plan.known.as_ref(),
                 failure.kind,
-                &failure.message,
+                &failure.cli_message,
+                failure.detail.as_deref(),
             );
+            if failure.stopped {
+                // The queue stopped here: nothing after this photo was decoded or rendered.
+                summary.stopped = Some(Stopped { total: done.total });
+                if json {
+                    stdout.line(
+                        &render_stopped(
+                            failure.kind,
+                            summary.written + summary.skipped,
+                            done.not_tried,
+                        )
+                        .to_line(),
+                    );
+                }
+            }
         }
     }
 }
@@ -878,7 +1045,16 @@ fn summarise(
     interrupted: bool,
 ) {
     let mut parts: Vec<String> = Vec::new();
-    if interrupted {
+    if let Some(stopped) = summary.stopped {
+        // The error line above says why; this says how far it got. Photos written before the stop
+        // stay, so they are counted in `k`.
+        let done = summary.written + summary.skipped;
+        parts.push(format!(
+            "Stopped after {done} of {}. {} not exported.",
+            stopped.total,
+            stopped.total.saturating_sub(done)
+        ));
+    } else if interrupted {
         parts.push(format!(
             "Interrupted: {} of {} exported. Nothing half-written is left behind.",
             summary.written + summary.skipped,
@@ -896,7 +1072,7 @@ fn summarise(
             duration_text(summary.elapsed)
         ));
     }
-    if summary.skipped > 0 {
+    if summary.skipped > 0 && summary.stopped.is_none() {
         parts.push(if summary.skipped == 1 {
             "1 photo already existed and was skipped.".to_owned()
         } else {
@@ -906,7 +1082,7 @@ fn summarise(
             )
         });
     }
-    if !counts.failed.is_empty() {
+    if !counts.failed.is_empty() && summary.stopped.is_none() {
         parts.push(format!("{} failed.", photos(counts.failed.len())));
     }
     if parts.is_empty() {
@@ -1012,7 +1188,7 @@ mod tests {
         assert_eq!(o.format, FormatKind::Tiff, "the preferred format");
         assert_eq!(o.jpeg_quality.get(), 92);
         assert_eq!(o.bit_depth, BitDepth::Sixteen);
-        assert_eq!(o.tiff_compression, TiffCompression::Lzw);
+        assert_eq!(o.tiff_compression, TiffCompression::Zip);
         assert_eq!(o.color_space, ColorSpace::Srgb);
         assert_eq!(o.size, Size::Full);
         assert_eq!(o.if_exists, IfExists::KeepBoth);

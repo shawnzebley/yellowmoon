@@ -8,7 +8,7 @@
  * Nothing here is colour science. It exists so that screenshots of the app can be compared with
  * the mockups' screenshots, and so that a change in a control is visible in a browser.
  */
-import type { ColorWarpPin } from "../api/types";
+import type { ColorWarpPin, NodeGrade, NodeTrim, PercentSetting } from "../api/types";
 import { sceneBody, SVG_HEIGHT, SVG_WIDTH, SUN_FRACTION_PHOTO } from "./scenes";
 import type { Scene } from "./scenes";
 import { warpScene } from "./warp";
@@ -142,6 +142,76 @@ export function developScene(scene: Scene, look: DevelopLook, adjustment: Adjust
   return gradeScene(adjusted, grade as LookGrade, Math.max(0, Math.min(100, look.intensity)) / 100);
 }
 
+/** What a corrector does to a picture (`docs/23` §1.3): its bypass, its trims and its grade. */
+export interface NodeLook {
+  bypass: boolean;
+  trim: NodeTrim;
+  grade: NodeGrade;
+  /** A node that is not a corrector (a Film node) says what it does to a scene itself; its trims and grade are then neutral. */
+  apply?: (scene: Scene) => Scene;
+  /** What `apply` depends on, for a cache key. */
+  key?: unknown;
+}
+
+const manualValue = (setting: PercentSetting): number => (setting.kind === "manual" ? setting.value : 0);
+
+/** One corrector's change to a scene, as far as the flat shapes show it: the trims and Brightness as light and warmth, Saturation and Contrast on the colours, the colour warp's pins. A node at its identity, or bypassed, returns the scene. */
+export function adjustForNode(scene: Scene, node: NodeLook): Scene {
+  if (node.bypass) return scene;
+  if (node.apply) return node.apply(scene);
+  const { trim, grade } = node;
+  // The trims and Brightness are the Input's adjustments again: a stop of exposure, a step of warmth, a step of tint, then the pins.
+  let out = adjustScene(scene, {
+    ev: trim.exposure_ev + grade.brightness / 50,
+    autoEv: 0,
+    kelvin: 6500 + 40 * trim.temperature,
+    autoKelvin: 6500,
+    tint: trim.tint,
+    autoTint: 0,
+    warp: grade.color_warp.pins,
+  });
+  const saturation = manualValue(grade.saturation);
+  if (saturation !== 0) {
+    const next: Scene = { ...out };
+    for (const key of KEYS) next[key] = mix(out[key], gray(out[key]), (-saturation / 100) * 0.7);
+    out = next;
+  }
+  const contrast = manualValue(grade.contrast);
+  if (contrast !== 0) {
+    const next: Scene = { ...out };
+    for (const key of KEYS) next[key] = toHex(hx(out[key]).map((x) => 128 + (x - 128) * (1 + (contrast / 100) * 0.6)));
+    out = next;
+  }
+  return out;
+}
+
+/**
+ * The scene after a node: the photo adjusted at the Input (`input`, without the colour warp, which is Main's), through the
+ * correctors on the path from the Input to the node in order, then through the Output's look. A node thumbnail of the mock
+ * (`docs/23` §5.7); with Main alone it is `developScene`'s picture.
+ */
+export function nodeScene(scene: Scene, input: Adjustment, chain: readonly NodeLook[], look: DevelopLook): Scene {
+  let out = adjustScene(scene, { ...input, warp: undefined });
+  for (const node of chain) out = adjustForNode(out, node);
+  return developScene(out, look, null);
+}
+
+/**
+ * The scene as a panel reads it at a node (`docs/01`, the `at` and `tap` arguments): the photo adjusted at the Input, through the
+ * correctors on the path to the node in order, the last one only as far as the panel looks into it: `curve` is the input of its curve
+ * (the node's trims, grade and pins), `warp` the input of its colour warp (without its pins), `input` the picture the node reads (the
+ * node itself left out: what a Colour range selects on). The mock's histogram, scatter and Pick colour.
+ */
+export function signalScene(scene: Scene, input: Adjustment, chain: readonly NodeLook[], stage: "curve" | "warp" | "input"): Scene {
+  let out = adjustScene(scene, { ...input, warp: undefined });
+  chain.forEach((node, i) => {
+    const last = i === chain.length - 1;
+    if (last && stage === "input") return;
+    out = adjustForNode(out, last && stage === "warp" ? { ...node, grade: { ...node.grade, color_warp: { pins: [] } } } : node);
+  });
+  return out;
+}
+
 /** A crop for `previewSvg`: a rectangle of the oriented frame in [0, 1]², and a straighten angle. */
 export interface PreviewCrop {
   x: number;
@@ -160,6 +230,8 @@ export interface PreviewOptions {
   crop?: PreviewCrop | null;
   /** Sun size as a fraction of the frame width. */
   sunFraction?: number;
+  /** Drawn over the picture, in its own pixels, last: the mask view of the mock (`fixtures/maskView.ts`), given the picture's rectangle. */
+  over?: (box: { x: number; y: number; width: number; height: number }) => string;
 }
 
 /**
@@ -167,7 +239,7 @@ export interface PreviewOptions {
  * orientation, straightened, and cropped. The `<img>` letterboxes it on paper.
  */
 export function previewSvg(scene: Scene, options: PreviewOptions = {}): string {
-  const { orientation = 0, angle_deg = 0, crop = null, sunFraction = SUN_FRACTION_PHOTO } = options;
+  const { orientation = 0, angle_deg = 0, crop = null, sunFraction = SUN_FRACTION_PHOTO, over } = options;
   const turned = orientation % 180 !== 0;
   const cw = turned ? SVG_HEIGHT : SVG_WIDTH;
   const ch = turned ? SVG_WIDTH : SVG_HEIGHT;
@@ -191,6 +263,7 @@ export function previewSvg(scene: Scene, options: PreviewOptions = {}): string {
     `<g transform="${straighten}"><g transform="${place}">`,
     ...sceneBody(scene, sunFraction),
     `</g></g>`,
+    over ? over({ x: vx, y: vy, width: vw, height: vh }) : "",
     `</svg>`,
   ].join("");
 }

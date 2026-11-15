@@ -89,33 +89,44 @@ UNDISCLOSED.
    https://github.com/AcademySoftwareFoundation/rawtoaces-data,
    Apache License 2.0 (data/cameras/sony/LICENSE-rawtoaces-data).
 
-4. ACES 2.0 output transform
-   Rust port of the CTL reference in https://github.com/aces-aswf/aces-core
-   (commit 069b0bc) with the output presets of
-   https://github.com/aces-aswf/aces-output (commit 6d8f907).
-   Apache License 2.0. Copyright Contributors to the ACES Project.
-
-5. Figtree typeface
+4. Figtree typeface
    Copyright 2022 The Figtree Project Authors
    (https://github.com/erikdkennedy/figtree). SIL Open Font License 1.1; the
    licence text is in THIRD-PARTY.md inside the app (design/fonts/OFL.txt in
    the repository).
 
-6. Training data for shipped model weights
-   The weights that ship (data/models/illum, the illuminant estimators) are
-   fitted on synthetic scenes only: reflectances from rawtoaces-data (see 3),
-   illuminant spectra from the CIE (CC BY-SA 4.0) and spectra we generate,
-   seen through the published camera curves. No shipped weights are trained
-   on photographs.
+5. Training data for shipped model weights
+   The illuminant estimators (data/models/illum) are fitted on synthetic
+   scenes only: reflectances from rawtoaces-data (see 3), illuminant spectra
+   from the CIE (CC BY-SA 4.0) and spectra we generate, seen through the
+   published camera curves.
+   Auto crop's crop model (data/models/crop) is trained on 107,999 photos of
+   the Open Images Dataset V7 (Google; https://storage.googleapis.com/
+   openimages/web/index.html), each listed by its Flickr author as licensed
+   under Creative Commons Attribution 2.0
+   (https://creativecommons.org/licenses/by/2.0/), and on Open Images' boxes
+   and class hierarchy, licensed under Creative Commons Attribution 4.0
+   (https://creativecommons.org/licenses/by/4.0/). Every photo is credited
+   with its author, title and page in training/crop/CREDITS.tsv.gz of the
+   source repository (https://github.com/ngriaznov/yellowmoon). Its crop
+   labels are the answers of FrameLite (https://huggingface.co/zlab-sjtu/
+   FrameLite, Apache-2.0), built on Qwen3.5-0.8B (Apache-2.0), run offline.
+   The bokeh map network of lens character (data/models/bokeh) is trained
+   from scratch on synthetic defocus made from 16,091 photos of the same
+   Open Images Dataset V7, each listed by its Flickr author as licensed under
+   Creative Commons Attribution 2.0, and on Open Images' instance masks of
+   those photos, licensed under Creative Commons Attribution 4.0. Every photo
+   is credited with its author, title and page in training/bokeh/
+   CREDITS.tsv.gz of the source repository. No pretrained weights were used.
    See data/models/*/MODEL_CARD.md for per-model provenance. Datasets such as
    PixelShift200 and Cube++ (both CC BY 4.0) are credited here when weights
    trained on them ship.
 
-7. Independent JPEG Group
+6. Independent JPEG Group
    This software is based in part on the work of the Independent JPEG Group.
    (The jpeg-encoder crate's forward DCT derives from IJG/mozjpeg code.)
 
-8. Colour-demosaicing (Menon 2007 demosaic)
+7. Colour-demosaicing (Menon 2007 demosaic)
    The Menon DDFAPD demosaic in crates/ym-gpu/src/cpu/demosaic.rs is ported
    from colour-demosaicing (https://github.com/colour-science/colour-demosaicing),
    distributed under the following licence:
@@ -148,12 +159,12 @@ UNDISCLOSED.
    ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
    POSSIBILITY OF SUCH DAMAGE.
 
-9. Rust and JavaScript dependencies and the Figtree font
+8. Rust and JavaScript dependencies and the Figtree font
    Listed, each with its licence text, in THIRD-PARTY.md inside the app. The
    file is generated for every release from Cargo.lock and package-lock.json
    (tools/licences/generate.py: cargo-about and license-checker).
 
-10. glasscn (src/components/glass/)
+9. glasscn (src/components/glass/)
     The interface's controls are glasscn components, installed from the
     glasscn shadcn registry (https://glasscn.app/r/, source
     https://github.com/TimMikeladze/glasscn) and changed for Yellowmoon:
@@ -185,3 +196,73 @@ UNDISCLOSED.
     LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
     OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
     SOFTWARE.
+
+10. SAM 2.1 small weights (data/models/sam2/)
+    Object masks are found by SAM 2.1 (the "small" size, sam2.1_hiera_small)
+    from Segment Anything Model 2:
+    Copyright (c) Meta Platforms, Inc. and affiliates.
+    Licensed under the Apache License, Version 2.0, the text of which is in
+    LICENSE (https://www.apache.org/licenses/LICENSE-2.0). Source:
+    https://github.com/facebookresearch/sam2; paper: N. Ravi et al., "SAM 2:
+    Segment Anything in Images and Videos", arXiv:2408.00714.
+    The weights in this product are Meta's checkpoint, converted to f16
+    safetensors and cut down to the image path (the video parts are left out).
+    They are not trained or fine-tuned further; the program that runs them is
+    ours (crates/ym-ml). Meta's training data are not part of this product.
+    The model card is data/models/sam2/MODEL_CARD.md.
+
+11. Film profiles (data/film/spektrafilm/)
+    spektrafilm by Andrea Volpato
+    https://github.com/andreavolpato/spektrafilm
+    Licensed CC BY-SA 4.0 (https://creativecommons.org/licenses/by-sa/4.0/;
+    the text is in data/film/spektrafilm/LICENSE, a byte copy of the author's
+    SPEKTRAFILM_LICENSE.txt).
+    Used by the Film node: 28 film and paper profiles (profile version 0.3.2),
+    taken from commit 3bb2c2d2801ff68b92019cf1dbcbb133d60832bc (2026-06-07).
+    Not modified: the files are byte for byte as published, and their SHA-256
+    sums are in data/film/spektrafilm/SHA256SUMS. Modified by: nobody.
+    The profiles were made by the author from Kodak and Fujifilm data sheets and
+    other published material. The original data belong to their holders.
+    They are plain data files read at run time; Yellowmoon's own code
+    (Apache-2.0) does not contain them. No LUT is made from them, shipped or
+    sold, and none of our models is trained on them or on their output.
+    Film profiles by Andrea Volpato (spektrafilm), CC BY-SA 4.0. Yellowmoon is
+    not affiliated with Andrea Volpato, Kodak or Fujifilm. Kodak, Portra,
+    Ektar, Vision3, Ektachrome, Kodachrome, Fujifilm, Velvia and the other
+    film and paper names shown are trademarks of their owners; the names are
+    used only to say which published data a profile models.
+
+12. CIE colour tables (data/film/cie/) and a table computed from it
+    The CIE 1931 colour-matching functions (2 degree observer), CIE standard
+    illuminant D50 and CIE illuminant D55, as published by the
+    International Commission on Illumination (CIE), Vienna, in its data
+    tables (https://cie.co.at/data-tables):
+      CIE 2019, Colour-matching functions of CIE 1931 standard colorimetric
+      observer, DOI: 10.25039/CIE.DS.xvudnb9b
+      CIE 2022, CIE standard illuminant D50, DOI: 10.25039/CIE.DS.etgmuqt5
+      CIE 2018, Relative spectral power distributions of CIE illuminant D55,
+      DOI: 10.25039/CIE.DS.qewfb3kp
+    Licensed CC BY-SA 4.0 (https://creativecommons.org/licenses/by-sa/4.0/;
+    the text is in data/film/cie/LICENSE); each dataset's metadata file, kept
+    in that folder, states this licence. Used by the Film node. Not modified:
+    the files are byte for byte as published; sums in data/film/cie/SHA256SUMS.
+    The table computed from the observer is the Film node's spectral
+    upsampling table (data/film/upsampling/; licence text in
+    data/film/upsampling/LICENSE, sums in data/film/upsampling/SHA256SUMS):
+    "Computed by Yellowmoon from CIE 1931 2 degree colour-matching functions
+    (CIE, CC BY-SA 4.0)". Modified by: Yellowmoon (computed, not copied). It
+    is Adapted Material and is shared under CC BY-SA 4.0 as well.
+
+13. Depth Anything V2-Small weights (data/models/depth/)
+    Depth masks are cut from a depth map that Depth Anything V2 (the "Small"
+    size, depth_anything_v2_vits) makes from the photo:
+    by Lihe Yang, Bingyi Kang, Zilong Huang, Zhen Zhao, Xiaogang Xu,
+    Jiashi Feng and Hengshuang Zhao.
+    Licensed under the Apache License, Version 2.0, the text of which is in
+    LICENSE (https://www.apache.org/licenses/LICENSE-2.0). Source:
+    https://github.com/DepthAnything/Depth-Anything-V2; paper: L. Yang et al.,
+    "Depth Anything V2", arXiv:2406.09414.
+    The weights in this product are the authors' Small checkpoint, converted to
+    f16 safetensors. They are not trained or fine-tuned further; the program
+    that runs them is ours (crates/ym-ml). The authors' training data are not
+    part of this product. The model card is data/models/depth/MODEL_CARD.md.

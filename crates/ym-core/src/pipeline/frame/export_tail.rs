@@ -42,9 +42,11 @@ use ym_gpu::cpu::RgbImage;
 use ym_gpu::cpu::output_sharpen::{OutputSharpen, scale_for_edges};
 use ym_gpu::cpu::tiling::Rect;
 use ym_gpu::device::{Gpu, GpuError};
+use ym_gpu::kernels::mask_raster::fit_tile;
 use ym_gpu::queue::{CancelToken, JobError, JobHandle, JobSpec, Priority};
 use ym_gpu::tail::{Band, BandData, BandFormat, ExportTail, TailRoute, TailSharpen, TailSpec};
 
+use super::film_pass::FilmRender;
 use super::{FullImage, FullRequest, FullTarget};
 use crate::app::gpu::GpuStages;
 use crate::pipeline::color::PhotoSource;
@@ -485,13 +487,30 @@ impl Renderer {
         }
         let tile = opts.full_tile_px.max(64);
         let plan = job.plan()?;
-        let baked = job.geometry().at_full_resolution();
+        let baked = job.geometry()?.at_full_resolution();
         let (fw, fh) = baked.output_size(plan.out_w, plan.out_h);
         let (ow, oh) = request.size.output_dimensions(fw as u32, fh as u32);
         let out = (ow as usize, oh as usize);
         // The reservation is the working set of one tile, not the picture: the frame is on the
         // device, a slab at a time (the CPU path reserves `fw * fh * 12` bytes for its host frame).
-        let halo_allowance = 160usize;
+        // The raw stages' halo, and the lens's (0 without a lens), and the lens's bend: a tile's source
+        // rectangle is the box of its bent edge, a fraction of the tile larger.
+        let bend = if baked.warp.is_some() {
+            tile / 4 + 8
+        } else {
+            0
+        };
+        let grade = job.grade(request.target, false)?;
+        // The Film nodes of the chain, as the device runs them: each tile is read that much wider on every side.
+        let films = FilmRender::build(
+            &job,
+            &grade.chain,
+            ym_color::mask_raster::Area::whole(fw, fh),
+            request.target,
+        )?
+        .map(|f| Arc::new(f.device_stack()));
+        let film_halo = films.as_ref().map_or(0, |f| f.schedule().total_reach());
+        let halo_allowance = 160usize + job.lens_halo()? + bend + film_halo;
         let per_px = 12u64 * 12; // twelve f32 planes of working set per tile pixel, a generous bound
         let working = ((tile + halo_allowance) as u64).pow(2) * per_px;
         let frame_extra = job.frame()?.extra_bytes() as u64;
@@ -502,10 +521,19 @@ impl Renderer {
         };
         let _reservation = self
             .ledger()
-            .try_reserve(working + frame_extra + sigma_map)
+            .reserve_reclaiming(working + frame_extra + sigma_map, Some(src.id))
             .map_err(|_| RenderError::Memory)?;
-        let grade = job.grade(request.target, false)?;
         let grid = baked.grid((plan.out_w, plan.out_h), (fw, fh));
+        // The raster masks of the nodes are made over each tile grown by their receptive field, and the Film nodes read
+        // their halos beyond it; tiles equal the whole frame, so a tile whose grown window would pass the design binding
+        // is made smaller.
+        let schedule = ym_gpu::kernels::film_stack::FilmStack::schedule_of(
+            &grade.chain,
+            &grid.sampler_grid(),
+            films.as_deref(),
+        );
+        let tile = fit_tile(&schedule, (fw, fh), tile);
+        let frame_area = ym_color::mask_raster::Area::whole(fw, fh);
         let sharpen = (request.output_sharpening_pct > 0.0).then(|| TailSharpen {
             params: OutputSharpen::screen().with_amount_pct(request.output_sharpening_pct),
             scale: scale_for_edges(out.0.max(out.1), fw.max(fh)),
@@ -525,6 +553,7 @@ impl Renderer {
                 sharpen,
                 space: request.space.output_space(),
                 format: request.format(),
+                films,
             },
         )
         .map_err(|e| self.tail_error(&e))?;
@@ -544,9 +573,21 @@ impl Renderer {
                 job.check()?;
                 gate()?;
                 let tw = tile.min(fw - ox);
-                if let Some((x0, y0, x1, y1)) = grid.source_bounds(ox, oy, tw, th, 3) {
+                // The tile's source is that of the tile grown by the raster halo; a tile that reads nothing of
+                // the photo is black whatever its halo reads.
+                let tile_area = ym_color::mask_raster::Area {
+                    x: ox as i64,
+                    y: oy as i64,
+                    w: tw,
+                    h: th,
+                };
+                let grown = schedule.infer(tile_area, &frame_area).source;
+                if grid.source_bounds(ox, oy, tw, th, 3).is_some()
+                    && let Some((x0, y0, x1, y1)) =
+                        grid.source_bounds(grown.x as usize, grown.y as usize, grown.w, grown.h, 3)
+                {
                     let rect = Rect::new(x0, y0, x1 - x0, y1 - y0);
-                    let region = match job.region_resident(rect) {
+                    let region = match job.lens_region_resident(rect) {
                         Ok(region) => region,
                         Err(RenderError::Gpu(reason)) => {
                             // The raw chain failed on the device; the photo goes to the CPU, all of

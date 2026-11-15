@@ -33,16 +33,21 @@ pub struct YmInfo {
     pub look_sha256: Option<String>,
     /// `ym:LookIntensity`, 0 to 100.
     pub look_intensity_pct: Option<u32>,
-    /// `ym:DisplayTransform` (`aces2-sdr100-p3lim`, `arri-display:…`).
+    /// `ym:DisplayTransform` (`cine-p3`).
     pub display_transform: Option<String>,
     /// `ym:Models`, the networks used (`jdd 1.2.0 (sha256…)`).
     pub models: Option<String>,
-    /// `ym:Auto`, which Auto made the photo's automatic values: `rule` or `apple` (`docs/19`
-    /// section 9).
+    /// `ym:Auto`, which Auto made the photo's automatic values: `rule`, `apple`, `claude` or `agy`
+    /// (`docs/19` section 9, `docs/22` section 14.2).
     pub auto: Option<String>,
-    /// `ym:AppleAuto`, what Apple Auto said about the photo: compact JSON with sorted keys, only when
-    /// Apple Auto was on for it (`docs/19` section 9).
-    pub apple_auto: Option<String>,
+    /// `ym:AutoAdvisor`, what the provider said about the photo: compact JSON with sorted keys, only
+    /// when a provider acted on it (`docs/22` section 14.2). Replaces `ym:AppleAuto`, which is no
+    /// longer written.
+    pub auto_advisor: Option<String>,
+    /// `ym:FilmData`, which film data made the picture: for each live Film node its stock and paper, the version of the
+    /// profile data and the engine's version, with the credit (`docs/24` section 6.2). Left out for a photo without one.
+    #[serde(default)]
+    pub film_data: Option<String>,
     /// `ym:Settings`, the resolved develop settings; written as compact JSON.
     pub settings: Option<serde_json::Value>,
 }
@@ -123,7 +128,7 @@ pub fn build_xmp(info: &XmpInfo, mime: &str) -> Result<Vec<u8>, ExportError> {
     let ym = &info.ym;
     let intensity = ym.look_intensity_pct.map(|pct| pct.to_string());
     // Fixed order, as in docs/09.
-    let fields: [(&str, Option<&str>); 11] = [
+    let fields: [(&str, Option<&str>); 12] = [
         ("ym:PipelineVersion", ym.pipeline_version.as_deref()),
         ("ym:Profile", ym.profile.as_deref()),
         ("ym:ProfileVersion", ym.profile_version.as_deref()),
@@ -134,7 +139,8 @@ pub fn build_xmp(info: &XmpInfo, mime: &str) -> Result<Vec<u8>, ExportError> {
         ("ym:DisplayTransform", ym.display_transform.as_deref()),
         ("ym:Models", ym.models.as_deref()),
         ("ym:Auto", ym.auto.as_deref()),
-        ("ym:AppleAuto", ym.apple_auto.as_deref()),
+        ("ym:AutoAdvisor", ym.auto_advisor.as_deref()),
+        ("ym:FilmData", ym.film_data.as_deref()),
     ];
     for (name, value) in fields {
         if let Some(v) = value {
@@ -179,10 +185,13 @@ mod tests {
                 look: Some("arri:3000:film <warm> & \"cool\"".into()),
                 look_sha256: Some("ab".repeat(32)),
                 look_intensity_pct: Some(100),
-                display_transform: Some("aces2-sdr100-p3lim".into()),
+                display_transform: Some("cine-p3".into()),
                 models: Some("jdd 1.2.0 (sha256:ff)".into()),
                 auto: Some("apple".into()),
-                apple_auto: Some(r#"{"model":"AFM 3 Core","result":"answered"}"#.into()),
+                auto_advisor: Some(
+                    r#"{"model":"AFM 3 Core","provider":"apple","result":"answered"}"#.into(),
+                ),
+                film_data: Some("kodak_portra_400 on kodak_portra_endura; profiles 0.3.2".into()),
                 settings: Some(
                     serde_json::json!({ "exposure": { "manual_ev": 0.3 }, "look": "x" }),
                 ),
@@ -208,18 +217,21 @@ mod tests {
             "DisplayTransform",
             "Models",
             "Auto",
-            "AppleAuto",
+            "AutoAdvisor",
+            "FilmData",
             "Settings",
         ] {
             assert!(xmp.contains(&format!("<ym:{name}>")), "{name}");
         }
-        // In the order of docs/09: ym:Auto and ym:AppleAuto after ym:Models, ym:Settings last.
+        // In the order of docs/09: ym:Auto and ym:AutoAdvisor after ym:Models, ym:Settings last;
+        // ym:AppleAuto is no longer written (docs/22 section 14.2).
         let at = |name: &str| xmp.find(&format!("<ym:{name}>")).unwrap();
-        assert!(at("Models") < at("Auto") && at("Auto") < at("AppleAuto"));
-        assert!(at("AppleAuto") < at("Settings"));
+        assert!(at("Models") < at("Auto") && at("Auto") < at("AutoAdvisor"));
+        assert!(at("AutoAdvisor") < at("FilmData") && at("FilmData") < at("Settings"));
+        assert!(!xmp.contains("AppleAuto"));
         assert!(xmp.contains("<ym:Auto>apple</ym:Auto>"));
         assert!(xmp.contains(
-            "<ym:AppleAuto>{&quot;model&quot;:&quot;AFM 3 Core&quot;,&quot;result&quot;:&quot;answered&quot;}</ym:AppleAuto>"
+            "<ym:AutoAdvisor>{&quot;model&quot;:&quot;AFM 3 Core&quot;,&quot;provider&quot;:&quot;apple&quot;,&quot;result&quot;:&quot;answered&quot;}</ym:AutoAdvisor>"
         ));
         assert!(xmp.contains("<ym:LookIntensity>100</ym:LookIntensity>"));
         // Compact JSON with sorted keys, escaped for XML.

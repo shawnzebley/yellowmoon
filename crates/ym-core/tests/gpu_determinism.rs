@@ -34,6 +34,7 @@ use ym_core::pipeline::{
     ViewportRect, ViewportState,
 };
 use ym_core::settings::{Crop, CropAspect, NormRect, SettingsPatch};
+use ym_core::settings::{NodeId, NodePatch};
 use ym_export::{BitDepth, ExportOptions, FormatKind, IfExists, Size, TiffCompression};
 use ym_gpu::device::{Gpu, GpuConfig, gpu_required_by_env};
 use ym_gpu::queue::{CancelToken, JobSpec, Priority};
@@ -248,20 +249,31 @@ fn a_then_b_then_a(gpu: &Arc<Gpu>, resident: bool) {
     b.session
         .update_settings(
             b.id,
-            &SettingsPatch {
-                output_sharpening: Some(0.0),
-                crop: Some(Some(Crop {
-                    rect: NormRect {
-                        x: 0.05,
-                        y: 0.05,
-                        width: 0.9,
-                        height: 0.9,
+            &SettingsPatch::default()
+                .and(
+                    NodeId::Input,
+                    NodePatch {
+                        crop: Some(Some(Crop {
+                            rect: NormRect {
+                                x: 0.05,
+                                y: 0.05,
+                                width: 0.9,
+                                height: 0.9,
+                            },
+                            angle_deg: 4.0,
+                            aspect: CropAspect::Free,
+                            auto: false,
+                        })),
+                        ..NodePatch::default()
                     },
-                    angle_deg: 4.0,
-                    aspect: CropAspect::Free,
-                })),
-                ..SettingsPatch::default()
-            },
+                )
+                .and(
+                    NodeId::Output,
+                    NodePatch {
+                        output_sharpening: Some(0.0),
+                        ..NodePatch::default()
+                    },
+                ),
         )
         .expect("settings of B");
     let (pa, pb) = (export_photo_of(&a), export_photo_of(&b));
@@ -356,6 +368,9 @@ fn a_cancel_part_way_leaves_nothing_and_the_next_export_is_the_uninterrupted_one
                 baseline,
                 "{label} at {share}: a cancelled export hands the device buffers back"
             );
+            // What is left is what the caches hold (raw groups, sigma planes: `Renderer::release_caches`); a leak
+            // would stay after they are let go.
+            ctx.renderer().release_caches();
             assert_eq!(ctx.renderer().ledger().used(), 0, "{label} at {share}");
             let again = bytes_of(&ctx, &p, opts.clone());
             assert!(
@@ -455,6 +470,9 @@ fn one_two_and_four_exports_in_flight_give_the_bytes_of_one() {
         }
     }
     assert_eq!(pool_in_use(&gpu), baseline);
+    // What is left is what the caches hold (raw groups, sigma planes: `Renderer::release_caches`); a leak
+    // would stay after they are let go.
+    ctx.renderer().release_caches();
     assert_eq!(ctx.renderer().ledger().used(), 0);
 }
 

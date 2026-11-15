@@ -33,6 +33,18 @@
 //! sharpened picture with the same Catmull-Rom filter, so the stage always sees the pixel grid it
 //! was made for (`ViewSharpening::frame_geometry`, private).
 //!
+//! # Raster masks
+//!
+//! A chain with raster rows (Brush now) makes u16 planes for them before the colour pass
+//! (`docs/algorithms/06` section 5): Grow, Feather and Refine edges are spatial, so a pixel depends on
+//! the photo around it by the masks' receptive field `H`. A pass therefore makes its planes the way an
+//! export tile is made: from the picture the colour pass makes **grown by `H` and cut to the photo's
+//! extent** (`RasterRead`, private), sampled again over that wider area (the device sampler, or the CPU's),
+//! with the window sums clipped to the extent and not to the view. A zoomed or panned view sees the
+//! photo go on past its edge, equals the export of its size within the plane bound, and a band of a cut
+//! view makes its planes from the band grown by `H`, so the bands are the view in one piece and stay on
+//! the device. The paper around the photo has no plane.
+//!
 //! Because geometry is applied *before* the pointwise colour chain, a crop or a rotation never
 //! re-runs a raw or colour group, and the colour chain only touches the pixels that are shown.
 //!
@@ -63,6 +75,8 @@
 
 mod device;
 mod export_tail;
+mod film_pass;
+pub mod level;
 
 use std::borrow::Cow;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -71,29 +85,42 @@ use std::sync::{Arc, Weak};
 use rayon::prelude::*;
 use ym_color::consts::Vec3;
 use ym_color::display::{ColorChain, Frame, Layout, OutputTarget, View};
+use ym_color::mask::{
+    PhotoFrame, PhotoMap, PhotoSpot, PixelAt, RasterPlanes, accent_display_linear,
+};
+use ym_color::mask_raster::{Area, CpuPlanes, PlaneJob};
 use ym_color::warp::chroma_of;
 use ym_gpu::cpu::magnify::{MagnifyMap, magnify_with};
 use ym_gpu::cpu::output_sharpen::{OutputSharpen, scale_for_edges};
+use ym_gpu::cpu::sampler::{GridPositions, SamplerGrid, photo_positions};
+use ym_gpu::cpu::tint::overlay_interleaved;
 use ym_gpu::cpu::{Rect, RgbImage};
 use ym_gpu::device::{Gpu, GpuError};
 use ym_gpu::kernels::copy::Piece;
+use ym_gpu::kernels::mask_raster::{PlaneKey, RasterTile, fit_tile, max_binding_bytes};
 use ym_gpu::pool::PooledBuffer;
 use ym_gpu::queue::{CancelToken, JobSpec, Priority};
 use ym_gpu::tail::{TailRoute, colour_device_tile_to_host, colour_tile_to_host};
 
 use self::device::{
-    Bounds, CameraSource, DeviceDisplay, DeviceInput, DisplayJob, GatherJob, PlainJob, Rgba8,
-    TailJob, TailWork, Upload, ViewRoute,
+    Bounds, CameraSource, DeviceDisplay, DeviceInput, DisplayJob, GatherJob, GrownInput,
+    GrownSource, PlainJob, PlaneTile, Rgba8, TailJob, TailWork, Upload, ViewRoute,
 };
 pub use self::export_tail::{BAND_DEPTH, GpuBands, TailRequest};
-use super::color::{GradePlan, PhotoSource};
-use super::geometry::{Affine, Grid, oriented_to_sensor, sensor_to_oriented};
+use self::film_pass::{Cover, FilmRender, OwnedPlanes};
+use super::color::{GradePlan, PhotoSource, color_key};
+use super::geometry::{Affine, Geometry, Grid, oriented_to_sensor, sensor_to_oriented};
 use super::graph::{
     Backing, ComputeDevice, Job, PartSource, Pixels, RenderReport, Renderer, ResidentPart,
     TileImage,
 };
-use super::viewport::ViewportState;
+use super::schedule::{
+    NO_TILES, Shape, Tile, area_bytes, camera_bytes, picture_bytes, search_cut, tiles_of,
+};
+use super::thumbs::{Tap, signal_source};
+use super::viewport::{MapFrom, MaskStyle, ViewportState};
 use super::{FrameZoom, RenderError};
+use crate::settings::NodeId;
 
 /// A finished 8-bit frame: RGBA, Display P3 for the viewport, sRGB for thumbnails.
 #[derive(Debug, Clone, PartialEq)]
@@ -278,14 +305,31 @@ pub struct PixelSample {
     pub b: u8,
 }
 
-/// The chroma of the colour under a point at the input of the colour warp (`sample_chroma`): the
-/// point of the warp's plane, `(e1·v, e2·v)` of the C9 output (`ym_color::warp::chroma_of`).
+/// The chroma of the colour under a point (`sample_chroma`): the point of the chroma plane,
+/// `(e1·v, e2·v)` of a LogC4 value (`ym_color::warp::chroma_of`), read at the place [`ChromaTap`] names.
+/// The Colour warp's plane and the Colour range's centre are the same plane (the axes of C9,
+/// `ym_color::grade::E1` and `E2`).
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ChromaSample {
     /// Along `e1`, red against cyan.
     pub a: f64,
     /// Along `e2`, green against blue.
     pub b: f64,
+}
+
+/// Where in a node [`Renderer::sample_chroma_at`] reads the chroma (`docs/23` section 9).
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum ChromaTap {
+    /// At the input of the node's colour warp, after the node's own trim and grade: the colours the
+    /// warp's pins take hold of (Pick colour of the Colour warp).
+    #[default]
+    WarpInput,
+    /// At the node's own input, the picture it reads before its trim and its grade: the colours a
+    /// Colour range on the node selects on (Pick colour of a Colour range).
+    NodeInput,
 }
 
 /// What a full-resolution render produces.
@@ -306,8 +350,8 @@ pub enum FullTarget {
     /// angle, cropped: the user's crop is then [`FullImage::window`] for the writer to put in the
     /// default crop tags. With a straighten angle the angle and the crop are baked in (a DNG has no
     /// rotated crop), still unturned, and `window` is `None`. Made without R8 capture sharpening (a
-    /// DNG carries none). With a look that includes its own display rendering, or an imported display
-    /// LUT, the pixels are instead the scene values that ACES 2 turns into that picture
+    /// DNG carries none). With a look that includes its own display rendering, the pixels are instead
+    /// the scene values that the cine rendering turns into that picture
     /// ([`ym_color::display::ColorChain::apply_dng_pixel`]).
     DngLinearAwg4,
     /// The DNG's preview: the exact render in sRGB (display-linear, Rec.709 primaries) in the
@@ -371,6 +415,9 @@ pub struct FullImage {
     /// a fallen-back one runs on the CPU too, and one that fell back after the first went on the
     /// device is made again on the CPU.
     pub fell_back_to_cpu: bool,
+    /// The picture's bytes in the memory ledger, for as long as the image (or a clone) lives: the
+    /// render's working set is released when it returns, the picture is not (`docs/26` H-13).
+    pub held: crate::scheduler::Held,
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -400,6 +447,10 @@ pub(crate) fn sample_to_camera(
 }
 
 /// Where the pixels of a view come from once the raw group is there.
+// One of these lives for the length of a frame, and a `Grid` carries the lens's bend now (a few more
+// numbers, kept `Copy` on purpose), so the image variant is a little over the lint's size: boxing it
+// would only add an allocation per frame.
+#[allow(clippy::large_enum_variant)]
 enum ViewSource {
     /// Camera RGB: `pixels` is a window of the raw group whose pixel (0, 0) is buffer pixel `origin`
     /// (on the device, the images that cover the rectangle that starts there), sampled through `grid`.
@@ -423,6 +474,9 @@ pub(crate) struct PreparedView {
     pub sharp: bool,
     width: usize,
     height: usize,
+    /// The device's position tables are snapped ([`SamplerGrid::snapped_positions`]): a view of the viewport (a window
+    /// or a band of a level) gives a pixel of the picture the same source position whichever window or band is rendered.
+    snap_positions: bool,
 }
 
 impl PreparedView {
@@ -488,11 +542,23 @@ impl PreparedView {
         Some((if want.is_empty() { whole } else { want }, whole))
     }
 
+    /// The geometry of the view as plain data, when it has pixels: what places a pixel of the view in the photo
+    /// frame ([`SamplerGrid::photo_position`]) for the mask shapes of the nodes.
+    fn photo_grid(&self) -> Option<SamplerGrid> {
+        match &self.source {
+            ViewSource::Image { grid, .. } => Some(grid.sampler_grid()),
+            ViewSource::Empty => None,
+        }
+    }
+
     /// What a device job starts from for this view, and the bounding box of the pixels inside the
     /// photo in the sampled picture. With the sampler on the device the window of the pixels is the
     /// job's input: uploaded as camera RGB when it is on the host, gathered in place when it is on
     /// the device `route` runs on; otherwise (no sampler on the device, or the pixels are on another
     /// device) the CPU samples and the sampled pixels are uploaded.
+    ///
+    /// With `positions` the pixels' places in the photo come with them (six planes): the sampler writes them,
+    /// or the host computes them for the picture it sampled.
     ///
     /// # Errors
     ///
@@ -501,7 +567,9 @@ impl PreparedView {
         &self,
         job: &mut Job<'_>,
         route: &ViewRoute,
+        positions: bool,
     ) -> Result<(DeviceInput, Option<Bounds>), RenderError> {
+        let _span = ym_gpu::perf::span(ym_gpu::perf::Stage::DeviceInput);
         let (w, h) = (self.width, self.height);
         if route.stages.sampler
             && let ViewSource::Image {
@@ -550,9 +618,13 @@ impl PreparedView {
                     DeviceInput::Camera {
                         source,
                         origin,
-                        grid: grid.sampler_grid(),
+                        grid: Box::new(
+                            grid.sampler_grid()
+                                .with_snapped_positions(self.snap_positions),
+                        ),
                         width: w,
                         height: h,
+                        positions,
                     },
                     self.inside_bounds(),
                 ));
@@ -560,7 +632,12 @@ impl PreparedView {
         }
         let sampled = self.sample_host(job)?;
         let bounds = inside_bounds(sampled.outside.as_deref(), w, h);
-        Ok((DeviceInput::Sampled(Upload::of(&sampled)), bounds))
+        let planes = positions.then(|| match self.photo_grid() {
+            Some(g) => (photo_positions(&g, (0, 0), w, h), g.photo_frame()),
+            // Nothing of the photo is in view: every pixel is outside and none is computed.
+            None => (vec![0.0; 2 * w * h], PhotoFrame::new(1.0, 1.0, 1.0)),
+        });
+        Ok((DeviceInput::Sampled(Upload::of(&sampled, planes)), bounds))
     }
 
     /// The bounding box `(x0, y0, x1, y1)` (exclusive ends) of the pixels of the view that are inside
@@ -580,7 +657,7 @@ impl PreparedView {
     /// view has pixels to sample.
     fn source_window_bytes(&self) -> Option<u64> {
         let (want, _) = self.window_rect()?;
-        Some(12 * want.w.next_multiple_of(2) as u64 * want.h as u64)
+        Some(camera_bytes(want.w, want.h))
     }
 }
 
@@ -603,20 +680,603 @@ fn paint_letterbox(rgba: &mut [u8], outside: Option<&[u8]>, background: [u8; 3])
         });
 }
 
+/// The positions in the photo of the pixels of a window of `grid` for a chain whose mask shapes read them, and
+/// the render's photo frame: what [`Frame::with_photo`] takes. `None` for a chain with no shape or a view with
+/// nothing of the photo in it.
+struct PhotoPositions<'a> {
+    map: GridPositions<'a>,
+    frame: PhotoFrame,
+}
+
+fn photo_positions_of<'a>(
+    chain: &ColorChain,
+    grid: Option<&'a SamplerGrid>,
+    off: (usize, usize),
+) -> Option<PhotoPositions<'a>> {
+    let grid = grid.filter(|_| chain.uses_photo_position())?;
+    Some(PhotoPositions {
+        map: GridPositions::new(grid, off),
+        frame: grid.photo_frame(),
+    })
+}
+
+/// `frame` with the positions in the photo of its pixels, when there are any.
+fn with_photo<'a>(frame: Frame<'a>, positions: &'a Option<PhotoPositions<'a>>) -> Frame<'a> {
+    match positions {
+        Some(p) => frame.with_photo(&p.map, p.frame),
+        None => frame,
+    }
+}
+
+/// The edge of the tiles of an export that has a Film node (`film_pass`), in pixels.
+const FILM_TILE_PX: usize = 1536;
+/// The tile edge from which an export with a Film node takes [`FILM_TILE_PX`] instead (the default, 1024; a
+/// smaller tile was asked for on purpose, as the tests do to cut a frame into many).
+const FILM_TILE_FROM_PX: usize = 1024;
+
+/// What the colour pass of a chain reads besides its camera RGB: the raster planes of its mask rows, or, for a
+/// chain with a Film node, those and the pictures the Film nodes made (`film_pass`).
+pub(crate) enum Planes {
+    /// Raster planes over the picture, as ever.
+    Raster(CpuPlanes),
+    /// Raster planes over their window and the Film nodes' pictures, in absolute pixels.
+    Film(OwnedPlanes),
+}
+
+impl RasterPlanes for Planes {
+    fn value(&self, plane: usize, x: usize, y: usize) -> f64 {
+        match self {
+            Self::Raster(p) => p.value(plane, x, y),
+            Self::Film(p) => p.value(plane, x, y),
+        }
+    }
+
+    fn film(&self, node: u32, x: usize, y: usize) -> Option<[f32; 3]> {
+        match self {
+            Self::Raster(_) => None,
+            Self::Film(p) => p.film(node, x, y),
+        }
+    }
+}
+
+/// `frame` with the planes of its window, when the chain has any.
+fn with_rasters<'a>(frame: Frame<'a>, planes: &'a Option<Planes>) -> Frame<'a> {
+    match planes {
+        Some(p) => frame.with_rasters(p),
+        None => frame,
+    }
+}
+
+/// The raster planes (`docs/algorithms/06` section 5) of a window of a view or an export on the CPU reference
+/// path, or `None` for a chain with no raster row or a view with nothing of the photo in it.
+///
+/// `sampled` is the camera RGB of `grown`, an area of the output (absolute pixels; its first pixel is the pixel
+/// `off` of the grid `grid`), `frame` the whole output image the window sums are clipped to, and `window` the
+/// part of `grown` the planes are returned for (a tile of an export, or the part of a view that has the photo in
+/// it). The guide is the Input's luma of every pixel of `grown` ([`ColorChain::guide_pixel`]), found only when a
+/// row refines its edges.
+fn cpu_rasters(
+    chain: &ColorChain,
+    sampled: &Sampled,
+    grid: Option<&SamplerGrid>,
+    off: (usize, usize),
+    areas: (Area, Area, Area),
+) -> Option<CpuPlanes> {
+    let (frame, grown, window) = areas;
+    let grid = grid.filter(|_| chain.uses_rasters())?;
+    let photo = grid.photo_frame();
+    let u_px = 1.0 / photo.pixel;
+    let (w, h) = (sampled.img.width, sampled.img.height);
+    let guide: Option<Vec<f64>> = chain.rasters().needs_guide(u_px).then(|| {
+        let plane = w * h;
+        (0..plane)
+            .into_par_iter()
+            .map(|i| {
+                let d = &sampled.img.data;
+                chain.guide_pixel([
+                    f64::from(d[i]),
+                    f64::from(d[plane + i]),
+                    f64::from(d[2 * plane + i]),
+                ])
+            })
+            .collect()
+    });
+    let map = GridPositions::new(grid, off);
+    let outside = sampled.outside.as_deref();
+    let position = |x: usize, y: usize| {
+        if outside.is_some_and(|o| o[y * w + x] != 0) {
+            None
+        } else {
+            Some(map.position(x, y))
+        }
+    };
+    Some(chain.rasters().planes(&PlaneJob {
+        photo,
+        grown,
+        frame,
+        window,
+        position: &position,
+        guide: guide.as_deref(),
+    }))
+}
+
+/// The `w x h` pixels at `(x, y)` of a sampled picture, with their part of the mask of the pixels outside the photo.
+fn crop_sampled(s: &Sampled, x: usize, y: usize, w: usize, h: usize) -> Sampled {
+    let outside = s.outside.as_ref().map(|o| {
+        let width = s.img.width;
+        (0..h)
+            .flat_map(|j| {
+                o[(y + j) * width + x..(y + j) * width + x + w]
+                    .iter()
+                    .copied()
+            })
+            .collect::<Vec<u8>>()
+    });
+    Sampled {
+        img: s.img.extract(Rect::new(x, y, w, h)),
+        outside,
+    }
+}
+
+/// The photo's extent in the pixels of a view: the pixels whose centres are inside the final image (`fw x fh`),
+/// which `view_to_final` maps the view onto. It is the frame the raster masks' window sums are clipped to, the
+/// whole output image of an export at the view's scale: the same pixels of the photo whatever part of it the view
+/// shows. Empty for a map that cannot be inverted.
+fn view_frame(view_to_final: &Affine, (fw, fh): (usize, usize)) -> Area {
+    let Some(inverse) = view_to_final.inverse() else {
+        return Area::default();
+    };
+    let (ax, ay) = inverse.apply(0.0, 0.0);
+    let (bx, by) = inverse.apply(fw as f64, fh as f64);
+    // A pixel whose centre is on the edge of the image is inside it. The edge lands on a centre exactly when the zoom
+    // makes the photo a whole number of pixels, and then the last digits of the map decide: the rows of a band of the
+    // view, mapped by a map moved by a whole row, found a different extent (315 or 316 rows at 75 %), which moved the Film
+    // grain between bands. A tolerance of a millionth of a pixel makes the extent the same for every part of a view.
+    const EDGE: f64 = 1e-6;
+    let span = |a: f64, b: f64| {
+        let (lo, hi) = (
+            (a.min(b) - 0.5 - EDGE).ceil(),
+            (a.max(b) - 0.5 + EDGE).floor(),
+        );
+        if lo.is_finite() && hi.is_finite() && hi >= lo {
+            (lo as i64, (hi - lo + 1.0) as usize)
+        } else {
+            (0, 0)
+        }
+    };
+    let ((x, w), (y, h)) = (span(ax, bx), span(ay, by));
+    Area { x, y, w, h }
+}
+
+/// Where the raster masks of a pass look: the picture the colour pass makes (`read`, the view, or the view grown by
+/// the stage's border) is **grown by the masks' receptive field** and cut to the photo's extent, so that a pixel
+/// near the edge of the picture sees the photo go on, as it does in an export at the view's scale
+/// (`docs/algorithms/06` section 5.2). All the areas are in pixels of the photo's extent (its first pixel is
+/// `(0, 0)`), which is the coordinate system of an export of the same size.
+#[derive(Clone)]
+pub(crate) struct RasterRead {
+    /// The view the planes are made from: `read` grown by the receptive field and cut to the photo's extent.
+    pub spec: ViewSpec,
+    /// The photo's extent: the planes' window sums are clipped to it.
+    pub frame: Area,
+    /// The area the sampled picture of `spec` covers.
+    pub grown: Area,
+    /// The part of `grown` that has planes: the picture the colour pass makes, where the photo is.
+    pub window: Area,
+    /// The picture the colour pass makes. Its pixels outside `window` are paper and have no plane.
+    pub extent: Area,
+    /// The view of the picture the colour pass makes, before it is grown: a tile of the planes samples its own grown window
+    /// from it.
+    pub read: ViewSpec,
+    /// Where the photo's extent starts in the view's pixels: the areas above are counted from it.
+    pub origin: (i64, i64),
+}
+
+/// The raster read of the picture `read` makes for `chains`, or `None` when no chain has a raster row or none
+/// of the photo is in the picture.
+fn raster_read(
+    job: &mut Job<'_>,
+    read: &ViewSpec,
+    chains: &[&ColorChain],
+    grid: Option<&SamplerGrid>,
+) -> Result<Option<RasterRead>, RenderError> {
+    // The Before view runs no node, so its chain has no spatial step: nothing is read beyond the view and no plane or
+    // Film picture is made (`docs/23` section 5.12).
+    if read.before {
+        return Ok(None);
+    }
+    let films = chains.iter().any(|c| c.has_films());
+    let Some(grid) = grid.filter(|_| films || chains.iter().any(|c| c.uses_rasters())) else {
+        return Ok(None);
+    };
+    let frame = view_frame(&read.view_to_final, job.final_size()?);
+    // The picture the colour pass makes is read as wide as the scheduler infers for the chain's spatial steps: the masks'
+    // receptive field and the Film nodes' halos (`ym_color::schedule`). The Film nodes are those of the first chain that
+    // has any; the chains share their nodes.
+    let film = if films {
+        let extent = Area::whole(frame.w, frame.h);
+        let mut found = None;
+        for chain in chains {
+            if let Some(film) = FilmRender::build(job, chain, extent, read.target)? {
+                found = Some(film);
+                break;
+            }
+        }
+        found
+    } else {
+        None
+    };
+    let picture = Area::whole(read.out_w, read.out_h);
+    let window = picture.intersect(&frame);
+    if window.is_empty() {
+        return Ok(None);
+    }
+    let u_px = 1.0 / grid.photo_frame().pixel;
+    let grown = chains
+        .iter()
+        .map(|c| {
+            c.schedule(u_px, &|id| film.as_ref().and_then(|f| f.reach_of(id)))
+                .infer(picture, &frame)
+                .source
+        })
+        .fold(Area::default(), ym_color::schedule::union_area);
+    let spec = ViewSpec {
+        out_w: grown.w,
+        out_h: grown.h,
+        view_to_final: Affine::scale_translate(1.0, 1.0, grown.x as f64, grown.y as f64)
+            .then(&read.view_to_final),
+        ..read.clone()
+    };
+    let in_frame = |a: Area| Area {
+        x: a.x - frame.x,
+        y: a.y - frame.y,
+        ..a
+    };
+    Ok(Some(RasterRead {
+        spec,
+        frame: Area::whole(frame.w, frame.h),
+        grown: in_frame(grown),
+        window: in_frame(window),
+        extent: in_frame(picture),
+        read: read.clone(),
+        origin: (frame.x, frame.y),
+    }))
+}
+
+/// What a CPU colour pass needs for the raster masks of its chain: where they look, and the device route (the
+/// sampler of the wider picture runs on the device when the route has it).
+#[derive(Clone, Copy, Default)]
+struct RasterCtx<'a> {
+    read: Option<&'a RasterRead>,
+    route: Option<&'a ViewRoute>,
+}
+
+/// The wider picture a device job makes the raster planes of `read` from, as a device input, or the tiles of it when it does
+/// not fit one binding and no chain in `chains` has a Film node (the Film nodes read the wider picture whole). The planes
+/// are the same bytes either way: a plane does not depend on the window it is made in (`docs/17` D4 and D5).
+fn grown_input(
+    job: &mut Job<'_>,
+    route: &ViewRoute,
+    read: Option<&RasterRead>,
+    chains: &[&ColorChain],
+) -> Result<Option<GrownInput>, RenderError> {
+    let Some(read) = read else { return Ok(None) };
+    let key = plane_key(job, &read.spec)?;
+    let tileable = chains.iter().all(|c| !c.has_films());
+    // The wider picture in one piece, unless it cannot fit (its four planes are over the bindings before its camera
+    // window is looked at) and the planes can be made in tiles.
+    let frame_fits = picture_bytes(read.spec.out_w, read.spec.out_h) <= route.band_bytes;
+    let mut whole = None;
+    if frame_fits || !tileable {
+        let prepared = prepare_view(job, &read.spec)?;
+        let (input, _) = prepared.device_input(job, route, true)?;
+        if input.fits(route) || !tileable {
+            return Ok(Some(GrownInput {
+                source: GrownSource::Whole(input),
+                read: read.clone(),
+                key,
+            }));
+        }
+        whole = Some(input);
+    }
+    if let Some(tiles) = plane_tiles(job, route, read, chains)? {
+        return Ok(Some(GrownInput {
+            source: GrownSource::Tiles(tiles),
+            read: read.clone(),
+            key,
+        }));
+    }
+    // Not even the smallest tile fits: the one piece goes on, to be refused for its size.
+    let input = match whole {
+        Some(input) => input,
+        None => {
+            let prepared = prepare_view(job, &read.spec)?;
+            prepared.device_input(job, route, true)?.0
+        }
+    };
+    Ok(Some(GrownInput {
+        source: GrownSource::Whole(input),
+        read: read.clone(),
+        key,
+    }))
+}
+
+/// The raster planes of a view in tiles: the picture the colour pass makes is cut by [`search_cut`] (the fewest, the largest
+/// sides halved in turn) into tiles whose wider pictures, each the tile's window grown by the masks' receptive field and cut
+/// to the photo's extent as the scheduler infers it, fit the route's bindings. A tile's first column is an even distance
+/// from the picture's (two codes share a word). `None` when not even the smallest tile fits (a resource limit of the device:
+/// the CPU answers, with its reason).
+fn plane_tiles(
+    job: &mut Job<'_>,
+    route: &ViewRoute,
+    rr: &RasterRead,
+    chains: &[&ColorChain],
+) -> Result<Option<Vec<PlaneTile>>, RenderError> {
+    let prepared = prepare_view_with(job, &rr.spec, false)?;
+    let Some(grid) = prepared.photo_grid() else {
+        return Ok(None);
+    };
+    let u_px = 1.0 / grid.photo_frame().pixel;
+    let schedules: Vec<_> = chains.iter().map(|c| c.schedule(u_px, &|_| None)).collect();
+    let grown_of = |window: Area| {
+        schedules
+            .iter()
+            .map(|s| s.infer(window, &rr.frame).source)
+            .fold(Area::default(), ym_color::schedule::union_area)
+    };
+    // Where to start the rows: what the wider picture of one full-width row allows, from its area. A start only.
+    let probe = Area {
+        x: rr.extent.x,
+        y: rr.extent.y + (rr.extent.h / 2) as i64,
+        w: rr.extent.w,
+        h: 1,
+    }
+    .intersect(&rr.window);
+    let rows_guess = (!probe.is_empty()).then(|| {
+        let grown = grown_of(probe);
+        let fit_rows = (route.band_bytes / picture_bytes(grown.w, 1).max(1)) as usize;
+        fit_rows.saturating_sub(grown.h.saturating_sub(1)).max(1)
+    });
+    // The tiles of a shape, each with the extent it writes and the wider picture it reads; `None` when a tile's does not fit.
+    // The areas first (they are arithmetic).
+    let layout_of = |tiles: &[Tile]| -> Option<Vec<(Area, Area)>> {
+        let mut layout: Vec<(Area, Area)> = Vec::new();
+        for &(tx, ty, tw, th) in tiles {
+            let extent = Area {
+                x: rr.extent.x + tx as i64,
+                y: rr.extent.y + ty as i64,
+                w: tw,
+                h: th,
+            };
+            let window = extent.intersect(&rr.window);
+            // A tile with no photo in it has no sampled picture and reads 0 (the planes are cleared first).
+            if window.is_empty() {
+                continue;
+            }
+            let grown = grown_of(window);
+            if area_bytes(&grown) > route.band_bytes
+                || max_binding_bytes(grown.w, grown.h) > route.limits.binding_bytes
+            {
+                return None;
+            }
+            layout.push((extent, grown));
+        }
+        Some(layout)
+    };
+    let tile_spec = |grown: &Area| ViewSpec {
+        out_w: grown.w,
+        out_h: grown.h,
+        view_to_final: Affine::scale_translate(
+            1.0,
+            1.0,
+            (grown.x + rr.origin.0) as f64,
+            (grown.y + rr.origin.1) as f64,
+        )
+        .then(&rr.read.view_to_final),
+        ..rr.read.clone()
+    };
+    let shape = search_cut(
+        rr.extent.w,
+        rr.extent.h,
+        rows_guess,
+        true,
+        0,
+        &mut |_, tiles| {
+            let Some(layout) = layout_of(tiles) else {
+                return Ok(None);
+            };
+            // The camera windows (they prepare a view each).
+            let mut pixels = 0u64;
+            for (_, grown) in &layout {
+                let tile_view = prepare_view(job, &tile_spec(grown))?;
+                if tile_view
+                    .source_window_bytes()
+                    .is_some_and(|b| b > route.source_bytes)
+                {
+                    return Ok(None);
+                }
+                pixels += area_bytes(grown) / 16;
+            }
+            Ok::<Option<u64>, RenderError>(Some(pixels))
+        },
+    )?;
+    let Some(shape) = shape else { return Ok(None) };
+    // The chosen shape's tiles, each with the sampled picture of its own.
+    let Some(layout) = layout_of(&shape.tiles(rr.extent.w, rr.extent.h)) else {
+        return Ok(None);
+    };
+    let mut made: Vec<PlaneTile> = Vec::new();
+    for (extent, grown) in layout {
+        let tile_view = prepare_view(job, &tile_spec(&grown))?;
+        let (input, _) = tile_view.device_input(job, route, true)?;
+        if !input.fits(route) {
+            return Ok(None);
+        }
+        made.push(PlaneTile {
+            tile: RasterTile { extent, grown },
+            input,
+        });
+    }
+    Ok(Some(made))
+}
+
+/// What names the raster planes of a view's rows besides the rows themselves (`ym_gpu::kernels::mask_raster::PlaneKey`,
+/// `docs/23` section 5.6): the photo; where every pixel of the wider picture is in the photo (the geometry, the lens,
+/// the view's map to the final image, its size and scale); and what the guide of Refine edges is made of (the raw
+/// group's parameters and the colour group, the Input's). A node's grade, Opacity, Mode, Invert, eye and Bypass are
+/// not in it: they act in the colour pass, after the planes.
+fn plane_key(job: &mut Job<'_>, spec: &ViewSpec) -> Result<PlaneKey, RenderError> {
+    let params = job.params()?;
+    let geometry = job.geometry()?;
+    let lens = job.lens_key()?;
+    Ok(PlaneKey {
+        owner: job.g.uid(),
+        place: format!(
+            "{geometry:?}|{:?}|{}x{}|{:?}|{}|{}|{lens:?}",
+            spec.view_to_final, spec.out_w, spec.out_h, spec.k, spec.before, spec.coarse_only
+        ),
+        guide: format!("{:?}|{:?}", params.key(), color_key(job.src)),
+    })
+}
+
+/// A device job whose buffers do not fit one binding goes to the CPU, and says so: the reason is logged (once per change
+/// at warn, then at debug), shown as the CPU note, and carried in the frame's report (`RenderReport::cpu_reason`, the
+/// `route=cpu(...)` field of the `ym::perf` line). Nothing is quiet: a CPU frame always has a reason
+/// (`docs/23` section 5.12, *Limits*).
+fn refuse_size(
+    job: &mut Job<'_>,
+    input: &DeviceInput,
+    grown: Option<&GrownInput>,
+    route: &ViewRoute,
+) -> Result<(), RenderError> {
+    let (requested, limit) = input
+        .overflow(route)
+        .or_else(|| grown.and_then(|g| g.overflow(route)))
+        .unwrap_or((0, route.band_bytes));
+    job.view_gpu_failed(&GpuError::BufferTooLarge { requested, limit })
+}
+
+/// Whether the wider picture of the raster masks (when there is one) fits the route's bindings: the picture of
+/// six planes and the f32 scratch of the masks' pass over it.
+fn grown_fits(grown: Option<&GrownInput>, route: &ViewRoute) -> bool {
+    grown.is_none_or(|g| g.fits(route))
+}
+
+/// The Film nodes of `chain` as the device runs them over the wider picture `rr` describes, or `None` for a chain with no
+/// live Film node or a view with nothing of the photo in it (`docs/24` section 3.9c).
+///
+/// # Errors
+///
+/// [`RenderError::Color`] when the film data is missing or damaged.
+fn device_film(
+    job: &Job<'_>,
+    chain: &ColorChain,
+    rr: Option<&RasterRead>,
+) -> Result<Option<Arc<ym_gpu::kernels::film_stack::FilmStack>>, RenderError> {
+    let Some(rr) = rr.filter(|_| chain.has_films()) else {
+        return Ok(None);
+    };
+    Ok(FilmRender::build(job, chain, rr.frame, rr.spec.target)?
+        .map(|film| Arc::new(film.device_stack().fast(true))))
+}
+
+/// The raster planes of a CPU colour pass, over the picture it makes: sampled over the area the masks look at
+/// ([`RasterRead`]), made over the part that has the photo, and placed in the picture with 0 around them.
+fn cpu_view_rasters(
+    job: &mut Job<'_>,
+    chain: &ColorChain,
+    ctx: RasterCtx<'_>,
+) -> Result<Option<CpuPlanes>, RenderError> {
+    let Some(rr) = ctx.read.filter(|_| chain.uses_rasters()) else {
+        return Ok(None);
+    };
+    let prepared = prepare_view(job, &rr.spec)?;
+    let grid = prepared.photo_grid();
+    let sampled = sample_routed(job, &prepared, ctx.route)?;
+    let planes = {
+        let _span = ym_gpu::perf::span(ym_gpu::perf::Stage::CpuRaster);
+        cpu_rasters(
+            chain,
+            &sampled,
+            grid.as_ref(),
+            (0, 0),
+            (rr.frame, rr.grown, rr.window),
+        )
+    };
+    let at = (
+        (rr.window.x - rr.extent.x) as usize,
+        (rr.window.y - rr.extent.y) as usize,
+    );
+    Ok(planes.map(|p| p.placed(at, rr.extent.w, rr.extent.h)))
+}
+
+/// The planes of a CPU colour pass: the raster planes, and for a chain with a Film node the pictures the Film nodes
+/// make over the picture (`film_pass`), from the wider picture `ctx.read` holds.
+fn cpu_view_planes(
+    job: &mut Job<'_>,
+    chain: &ColorChain,
+    ctx: RasterCtx<'_>,
+) -> Result<Option<Planes>, RenderError> {
+    if chain.has_films()
+        && let Some(rr) = ctx.read
+        && let Some(film) = FilmRender::build(job, chain, rr.frame, rr.spec.target)?
+    {
+        let prepared = prepare_view(job, &rr.spec)?;
+        let grid = prepared.photo_grid();
+        let sampled = sample_routed(job, &prepared, ctx.route)?;
+        let need = rr.window;
+        let wide = film.read_area(need);
+        let rasters = {
+            let _span = ym_gpu::perf::span(ym_gpu::perf::Stage::CpuRaster);
+            cpu_rasters(
+                chain,
+                &sampled,
+                grid.as_ref(),
+                (0, 0),
+                (rr.frame, rr.grown, wide),
+            )
+        }
+        .map(|p| (p, wide));
+        let cover = Cover {
+            sampled: &sampled,
+            area: rr.grown,
+            grid: grid.as_ref(),
+            grid_off: (0, 0),
+        };
+        let films = film.planes(job, need, &cover, rasters.as_ref().map(|(p, a)| (p, *a)))?;
+        return Ok(Some(Planes::Film(OwnedPlanes {
+            rasters,
+            films,
+            origin: (rr.extent.x, rr.extent.y),
+        })));
+    }
+    Ok(cpu_view_rasters(job, chain, ctx)?.map(Planes::Raster))
+}
+
 /// The colour chain C1 to C13 over `sampled` on the CPU reference path: RGBA8 with the letterbox
 /// painted (a frame that is not sharpened: amount 0, or the Before view).
 fn color_pass_cpu(
     job: &mut Job<'_>,
     sampled: &Sampled,
     grade: &GradePlan,
+    photo: Option<&SamplerGrid>,
     before: bool,
     background: [u8; 3],
+    ctx: RasterCtx<'_>,
 ) -> Result<Vec<u8>, RenderError> {
     job.check()?;
     let (w, h) = (sampled.img.width, sampled.img.height);
     let n = w * h;
-    let frame =
-        Frame::planar(w, h, &sampled.img.data).map_err(|e| RenderError::Color(e.to_string()))?;
+    let positions = photo_positions_of(&grade.chain, photo, (0, 0));
+    let rasters = cpu_view_planes(job, &grade.chain, ctx)?;
+    let frame = with_rasters(
+        with_photo(
+            Frame::planar(w, h, &sampled.img.data)
+                .map_err(|e| RenderError::Color(e.to_string()))?,
+            &positions,
+        ),
+        &rasters,
+    );
     let mut rgb = vec![0u8; 3 * n];
     let view = if before { View::Before } else { View::Final };
     grade
@@ -642,11 +1302,21 @@ fn display_linear_cpu(
     job: &mut Job<'_>,
     sampled: &Sampled,
     grade: &GradePlan,
+    photo: Option<&SamplerGrid>,
+    ctx: RasterCtx<'_>,
 ) -> Result<(Vec<f32>, Option<Vec<u8>>), RenderError> {
     job.check()?;
     let (w, h) = (sampled.img.width, sampled.img.height);
-    let frame =
-        Frame::planar(w, h, &sampled.img.data).map_err(|e| RenderError::Color(e.to_string()))?;
+    let positions = photo_positions_of(&grade.chain, photo, (0, 0));
+    let rasters = cpu_view_planes(job, &grade.chain, ctx)?;
+    let frame = with_rasters(
+        with_photo(
+            Frame::planar(w, h, &sampled.img.data)
+                .map_err(|e| RenderError::Color(e.to_string()))?,
+            &positions,
+        ),
+        &rasters,
+    );
     let mut rgb = vec![0.0f32; 3 * w * h];
     grade
         .chain
@@ -664,6 +1334,43 @@ fn display_linear_cpu(
     Ok((rgb, sampled.outside.clone()))
 }
 
+/// The mask view's `m` for every pixel of `sampled` on the CPU reference path: the chain compiled to the
+/// node's mask (`ColorChain::shows_mask`) run over the sampled camera RGB, one `f32` a pixel, planar order.
+fn mask_plane_cpu(
+    job: &mut Job<'_>,
+    sampled: &Sampled,
+    mask_grade: &GradePlan,
+    photo: Option<&SamplerGrid>,
+    ctx: RasterCtx<'_>,
+) -> Result<Vec<f32>, RenderError> {
+    job.check()?;
+    let (w, h) = (sampled.img.width, sampled.img.height);
+    let positions = photo_positions_of(&mask_grade.chain, photo, (0, 0));
+    let rasters = cpu_view_planes(job, &mask_grade.chain, ctx)?;
+    let frame = with_rasters(
+        with_photo(
+            Frame::planar(w, h, &sampled.img.data)
+                .map_err(|e| RenderError::Color(e.to_string()))?,
+            &positions,
+        ),
+        &rasters,
+    );
+    // The chain makes `[m, m, m]` for every pixel: the first plane is the mask.
+    let mut planes = vec![0.0f32; 3 * w * h];
+    mask_grade
+        .chain
+        .render_encoded_f32(
+            View::Final,
+            &frame,
+            Layout::Planar,
+            &mut planes,
+            job.options().threads,
+        )
+        .map_err(|e| RenderError::Color(e.to_string()))?;
+    planes.truncate(w * h);
+    Ok(planes)
+}
+
 // ---------------------------------------------------------------------------------------------
 // Output sharpening
 // ---------------------------------------------------------------------------------------------
@@ -678,9 +1385,23 @@ pub(crate) struct ViewSharpening {
     pub scale: f32,
     /// The receptive field at that scale, in pixels of the view.
     pub halo: usize,
+    /// No stage at all: the road of a sharpened view with nothing to sharpen, which the mask view's overlay
+    /// takes when the photo has no output sharpening (the overlay is made on the display-linear frame, after
+    /// the stage's place and before C13). The frame is the view itself, with no border and no magnification.
+    pub identity: bool,
 }
 
 impl ViewSharpening {
+    /// The stage that does nothing ([`ViewSharpening::identity`]).
+    pub(crate) fn none() -> Self {
+        Self {
+            stage: OutputSharpen::screen().with_amount_pct(0.0),
+            scale: 1.0,
+            halo: 0,
+            identity: true,
+        }
+    }
+
     /// The stage for a view that maps device pixels to the final image with `view_to_final`
     /// (`fw x fh` pixels at full resolution), `None` when it creates no stage: the amount is 0 (or
     /// below 0.1 %), or the view is the Before view.
@@ -719,6 +1440,7 @@ impl ViewSharpening {
             stage,
             scale,
             halo: plan.halo_px(),
+            identity: false,
         }))
     }
 
@@ -739,6 +1461,15 @@ impl ViewSharpening {
         (w, h): (usize, usize),
         (fw, fh): (usize, usize),
     ) -> Option<FrameGeometry> {
+        if self.identity {
+            // The view as it is: the plain road's pixels.
+            return Some(FrameGeometry {
+                view_to_final: *view_to_final,
+                width: w,
+                height: h,
+                origin: None,
+            });
+        }
         let step = view_to_final.m[0][0];
         if step.is_finite() && step < 1.0 - 1e-9 {
             let (ax, ay) = view_to_final.apply(0.0, 0.0);
@@ -1003,11 +1734,15 @@ fn encode_view(
 /// The output-sharpening stage and C13 over a display-linear frame of the grown view: sharpens
 /// the photo's pixels, cuts the border off and encodes the view to RGBA8 with the letterbox
 /// painted.
+///
+/// With `mask` (the mask view's overlay: one `m` for every pixel of `display`) the sharpened pixels are tinted
+/// with the mask accent between the stage and C13 (`docs/23` section 5.8).
 fn sharpen_and_encode(
     job: &mut Job<'_>,
     display: &HostDisplay<'_>,
     sharpening: &ViewSharpening,
     grade: &GradePlan,
+    mask: Option<&[f32]>,
     (w, h): (usize, usize),
     (background, origin): ([u8; 3], (usize, usize)),
 ) -> Result<Vec<u8>, RenderError> {
@@ -1029,7 +1764,12 @@ fn sharpen_and_encode(
         });
     let cancel = job.cancel;
     let check = move || cancel.check().map_err(|_| RenderError::Cancelled);
-    if let Some(s) = sharpen_photo(&check, display, sharpening)? {
+    let sharpened = if sharpening.identity {
+        None
+    } else {
+        sharpen_photo(&check, display, sharpening)?
+    };
+    if let Some(s) = sharpened {
         // Put the sharpened pixels back where they fall inside the view.
         let (vx0, vx1) = (s.x0.max(halo), (s.x0 + s.w).min(halo + w));
         if vx0 < vx1 {
@@ -1046,6 +1786,14 @@ fn sharpen_and_encode(
                     row[dst..dst + len].copy_from_slice(&s.rgb[src..src + len]);
                 });
         }
+    }
+    if let Some(m) = mask {
+        // The mask over the view's own rows (the display frame is the view grown by the border).
+        let mut own = vec![0.0f32; w * h];
+        own.par_chunks_mut(w.max(1))
+            .enumerate()
+            .for_each(|(y, row)| row.copy_from_slice(&m[(y + halo) * ew + halo..][..w]));
+        overlay_interleaved(&mut view, &own, accent_display_linear(grade.chain.space()));
     }
     let letterbox = display.outside.map(|outside| {
         let mut mask = vec![0u8; w * h];
@@ -1074,12 +1822,17 @@ fn sharpen_and_encode(
 /// magnification is the CPU reference of the device's (`ym_gpu::cpu::magnify`, the taps made per
 /// pixel from this view's map); the device runs it from the same taps ([`magnify_map`],
 /// `frame::device`'s magnified tail).
+///
+/// With `mask` (the mask view's overlay: one `m` for every pixel of `display`, the 100 % picture) the sharpened
+/// 100 % picture is tinted with the mask accent before it is magnified.
+#[allow(clippy::too_many_arguments)] // the natural argument list; a struct would only move them
 fn magnify_and_encode(
     job: &mut Job<'_>,
     display: &HostDisplay<'_>,
     origin: (usize, usize),
     sharpening: &ViewSharpening,
     grade: &GradePlan,
+    mask: Option<&[f32]>,
     spec: &ViewSpec,
     (fw, fh): (usize, usize),
 ) -> Result<Vec<u8>, RenderError> {
@@ -1097,6 +1850,9 @@ fn magnify_and_encode(
             let dst = ((s.y0 + y) * nw + s.x0) * 3;
             native[dst..dst + 3 * s.w].copy_from_slice(&s.rgb[y * s.w * 3..(y + 1) * s.w * 3]);
         }
+    }
+    if let Some(m) = mask {
+        overlay_interleaved(&mut native, m, accent_display_linear(grade.chain.space()));
     }
     let mut planes = RgbImage::new(nw, nh);
     {
@@ -1217,7 +1973,7 @@ fn sample_routed(
     if let Some(r) = route.filter(|r| r.stages.sampler)
         && matches!(prepared.source, ViewSource::Image { .. })
     {
-        let (input, _) = prepared.device_input(job, r)?;
+        let (input, _) = prepared.device_input(job, r, false)?;
         if input.fits(r) {
             let t = std::time::Instant::now();
             if let Some((w, h, planar)) = attempt(job, r.run(input, device::sample_job))? {
@@ -1242,11 +1998,14 @@ fn plain_pass(
     job.check()?;
     let (scale, sharp) = (prepared.scale, prepared.sharp);
     let started = std::time::Instant::now();
+    let rr = raster_read(job, spec, &[&grade.chain], prepared.photo_grid().as_ref())?;
     if let Some(r) = route.filter(|r| r.stages.color) {
-        let (input, _) = prepared.device_input(job, r)?;
+        let (input, _) = prepared.device_input(job, r, grade.chain.uses_photo_position())?;
+        let rasters = grown_input(job, r, rr.as_ref(), &[&grade.chain])?;
         // A frame that does not fit one binding is made on the CPU, quietly (a view cut into bands
         // never gets here: `banded`).
-        if input.fits(r) {
+        if input.fits(r) && grown_fits(rasters.as_ref(), r) {
+            let film = device_film(job, &grade.chain, rr.as_ref())?;
             let data = PlainJob {
                 input,
                 chain: Arc::clone(&grade.chain),
@@ -1254,6 +2013,8 @@ fn plain_pass(
                 background: spec.background,
                 origin: spec.dither_origin,
                 output: spec.output,
+                rasters,
+                film,
             };
             let Some(rgba) = attempt(job, r.run(data, device::plain_job))? else {
                 return Ok(Flow::Cpu);
@@ -1268,10 +2029,22 @@ fn plain_pass(
                 paper: false,
             }));
         }
+        refuse_size(job, &input, rasters.as_ref(), r)?;
     }
     let sampled = sample_routed(job, &prepared, route)?;
     let started = std::time::Instant::now();
-    let rgba = color_pass_cpu(job, &sampled, grade, spec.before, spec.background)?;
+    let rgba = color_pass_cpu(
+        job,
+        &sampled,
+        grade,
+        prepared.photo_grid().as_ref(),
+        spec.before,
+        spec.background,
+        RasterCtx {
+            read: rr.as_ref(),
+            route,
+        },
+    )?;
     job.runs.color_passes += 1;
     job.timings.pass_ms += millis(started);
     Ok(Flow::Done(Done {
@@ -1311,6 +2084,8 @@ impl StageWindow {
 /// RGBA8 frame when the tail ran in the same job, and where things ran.
 struct Built {
     display: Option<DisplayFrame>,
+    /// The mask view's `m` for every pixel of a host display (the overlay, on the CPU).
+    mask: Option<Vec<f32>>,
     rgba: Option<Rgba8>,
     scale: usize,
     sharp: bool,
@@ -1327,6 +2102,8 @@ struct TailPlan<'a> {
     keep: bool,
     /// The window the stage works on.
     window: StageWindow,
+    /// The mask view's overlay: the chain compiled to the node's mask, run beside the colour pass.
+    mask: Option<&'a GradePlan>,
 }
 
 /// The display-linear frame of `read` (the view grown by the stage's receptive field): the sampler
@@ -1343,18 +2120,33 @@ fn build_display(
 ) -> Result<Option<Built>, RenderError> {
     let (scale, sharp) = (prepared.scale, prepared.sharp);
     let started = std::time::Instant::now();
+    let mut chains: Vec<&ColorChain> = vec![&grade.chain];
+    chains.extend(plan.mask.map(|g| &*g.chain));
+    let rr = raster_read(job, read, &chains, prepared.photo_grid().as_ref())?;
     if let Some(r) = route.filter(|r| r.stages.color) {
-        let (input, own) = prepared.device_input(job, r)?;
+        let positions = grade.chain.uses_photo_position()
+            || plan.mask.is_some_and(|g| g.chain.uses_photo_position());
+        let (input, own) = prepared.device_input(job, r, positions)?;
         let bounds = plan.window.or(own);
-        if input.fits(r) {
+        let rasters = grown_input(job, r, rr.as_ref(), &chains)?;
+        if input.fits(r) && grown_fits(rasters.as_ref(), r) {
+            let film = device_film(job, &grade.chain, rr.as_ref())?;
+            let mask_film = match plan.mask {
+                Some(g) => device_film(job, &g.chain, rr.as_ref())?,
+                None => None,
+            };
             let data = DisplayJob {
                 input,
                 bounds,
                 chain: Arc::clone(&grade.chain),
+                mask: plan.mask.map(|g| Arc::clone(&g.chain)),
                 tail: plan.work.cloned(),
                 keep: plan.keep && plan.work.is_some(),
                 gpu: r.gpu_ref(),
                 output: read.output,
+                rasters,
+                film,
+                mask_film,
             };
             let Some(out) = attempt(job, r.run(data, device::display_job))? else {
                 return Ok(None);
@@ -1384,16 +2176,27 @@ fn build_display(
             };
             return Ok(Some(Built {
                 display,
+                mask: out.mask,
                 rgba: out.rgba,
                 scale,
                 sharp,
                 device: ComputeDevice::Gpu,
             }));
         }
+        refuse_size(job, &input, rasters.as_ref(), r)?;
     }
     let sampled = sample_routed(job, prepared, route)?;
     let started = std::time::Instant::now();
-    let (rgb, outside) = display_linear_cpu(job, &sampled, grade)?;
+    let ctx = RasterCtx {
+        read: rr.as_ref(),
+        route,
+    };
+    let (rgb, outside) =
+        display_linear_cpu(job, &sampled, grade, prepared.photo_grid().as_ref(), ctx)?;
+    let mask = plan
+        .mask
+        .map(|g| mask_plane_cpu(job, &sampled, g, prepared.photo_grid().as_ref(), ctx))
+        .transpose()?;
     job.runs.color_passes += 1;
     job.timings.pass_ms += millis(started);
     Ok(Some(Built {
@@ -1405,6 +2208,7 @@ fn build_display(
             sharp,
             device: ComputeDevice::Cpu,
         }),
+        mask,
         rgba: None,
         scale,
         sharp,
@@ -1412,47 +2216,60 @@ fn build_display(
     }))
 }
 
-/// The display-linear frame of `read` made by the device in bands of `rows` rows: for a frame that
-/// does not fit one storage binding and whose tail the CPU runs (the colour pass alone is on, as under
-/// `Auto`). The colour chain is pointwise, so a band is a view of its own and the bands put together
-/// are the frame in one piece, which the CPU stage then works on whole. `None` after a device error
+/// The display-linear frame of `read` made by the device in tiles of `shape` (columns, rows): bands of rows when the
+/// columns are the whole width, for a frame that does not fit one storage binding and whose tail the CPU runs (the colour
+/// pass alone is on, as under `Auto`; or a chain with a Film node, cut in columns too when one row of its wider picture
+/// passes the bindings). The colour chain is pointwise and the Film and raster passes are tile-exact, so a tile is a view of
+/// its own and the tiles put together are the frame in one piece, which the CPU stage then works on whole. The mask view's
+/// overlay (`mask`) is made beside the colour pass in every tile and put together the same way. `None` after a device error
 /// (answered on the CPU by the caller).
 fn build_display_in_bands(
     job: &mut Job<'_>,
     route: &ViewRoute,
     read: &ViewSpec,
     grade: &GradePlan,
-    rows: usize,
+    mask: Option<&GradePlan>,
+    shape: (usize, usize),
 ) -> Result<Option<Built>, RenderError> {
     let started = std::time::Instant::now();
     let (w, h) = (read.out_w, read.out_h);
-    let mut rgb: Vec<f32> = Vec::with_capacity(3 * w * h);
+    let mut chains: Vec<&ColorChain> = vec![&grade.chain];
+    chains.extend(mask.map(|g| &*g.chain));
+    let positions =
+        grade.chain.uses_photo_position() || mask.is_some_and(|g| g.chain.uses_photo_position());
+    let mut rgb: Vec<f32> = vec![0.0; 3 * w * h];
+    let mut mask_all: Option<Vec<f32>> = mask.map(|_| vec![0.0; w * h]);
     let mut outside: Option<Vec<u8>> = None;
     let (mut scale, mut sharp) = (1, true);
-    let mut done_rows = 0;
-    for band in device::bands_of(read, rows) {
+    for (x, y, tw, th) in tiles_of(w, h, shape.0, shape.1) {
         job.check()?;
-        let prepared = prepare_view(job, &band)?;
-        let (input, _) = prepared.device_input(job, route)?;
-        if !input.fits(route) {
-            // The cut is made so that every band fits (`band_split`): a band that does not is the
+        let tile = tile_of(read, x, y, tw, th);
+        let prepared = prepare_view(job, &tile)?;
+        let (input, _) = prepared.device_input(job, route, positions)?;
+        let rr = raster_read(job, &tile, &chains, prepared.photo_grid().as_ref())?;
+        let rasters = grown_input(job, route, rr.as_ref(), &chains)?;
+        if !(input.fits(route) && grown_fits(rasters.as_ref(), route)) {
+            // The cut is made so that every tile fits (`band_split`): one that does not is the
             // frame's buffers not fitting, answered as such.
-            let requested = 16 * band.out_w.next_multiple_of(2) as u64 * band.out_h as u64;
-            job.view_gpu_failed(&GpuError::BufferTooLarge {
-                requested,
-                limit: route.band_bytes,
-            })?;
+            refuse_size(job, &input, rasters.as_ref(), route)?;
             return Ok(None);
         }
         let data = DisplayJob {
             input,
             bounds: None,
             chain: Arc::clone(&grade.chain),
+            mask: mask.map(|g| Arc::clone(&g.chain)),
             tail: None,
             keep: false,
             gpu: route.gpu_ref(),
             // No tail: the job reads the display-linear frame back for the CPU, and makes no RGBA8.
             output: FrameOutput::Host,
+            rasters,
+            film: device_film(job, &grade.chain, rr.as_ref())?,
+            mask_film: match mask {
+                Some(g) => device_film(job, &g.chain, rr.as_ref())?,
+                None => None,
+            },
         };
         let Some(out) = attempt(job, route.run(data, device::display_job))? else {
             return Ok(None);
@@ -1462,22 +2279,27 @@ fn build_display_in_bands(
         let Some((planes, planar)) = out.planar else {
             return Ok(None);
         };
-        let (band_rgb, band_outside) =
-            device::interleave_display(band.out_w, band.out_h, planes, &planar);
-        let band_px = band.out_w * band.out_h;
-        match (band_outside, outside.as_mut()) {
-            (Some(mask), Some(all)) => all.extend_from_slice(&mask),
-            (Some(mask), None) => {
-                let mut all = vec![0u8; w * done_rows];
-                all.extend_from_slice(&mask);
-                outside = Some(all);
-            }
-            (None, Some(all)) => all.resize(all.len() + band_px, 0),
-            (None, None) => {}
+        let (tile_rgb, tile_outside) = device::interleave_display(tw, th, planes, &planar);
+        for row in 0..th {
+            let to = 3 * ((y + row) * w + x);
+            rgb[to..to + 3 * tw].copy_from_slice(&tile_rgb[3 * row * tw..3 * (row + 1) * tw]);
         }
-        rgb.extend_from_slice(&band_rgb);
-        done_rows += band.out_h;
-        (scale, sharp) = (prepared.scale, sharp && prepared.sharp);
+        if let (Some(all), Some(tile_mask)) = (mask_all.as_mut(), out.mask.as_deref()) {
+            for row in 0..th {
+                let to = (y + row) * w + x;
+                all[to..to + tw].copy_from_slice(&tile_mask[row * tw..(row + 1) * tw]);
+            }
+        } else if mask.is_some() {
+            return Ok(None);
+        }
+        if let Some(tile_mask) = tile_outside {
+            let all = outside.get_or_insert_with(|| vec![0u8; w * h]);
+            for row in 0..th {
+                let to = (y + row) * w + x;
+                all[to..to + tw].copy_from_slice(&tile_mask[row * tw..(row + 1) * tw]);
+            }
+        }
+        (scale, sharp) = (scale.max(prepared.scale), sharp && prepared.sharp);
     }
     job.timings.pass_ms += millis(started);
     Ok(Some(Built {
@@ -1489,10 +2311,57 @@ fn build_display_in_bands(
             sharp,
             device: ComputeDevice::Gpu,
         }),
+        mask: mask_all,
         rgba: None,
         scale,
         sharp,
         device: ComputeDevice::Gpu,
+    }))
+}
+
+/// A frame without output sharpening made by the device a tile at a time (`Cut::Tiles`): each tile is a view of its own
+/// (`plain_pass`) read back as RGBA8 and put in its place in the frame. A tile that the device could not make, or made on
+/// the CPU, makes the whole frame on the CPU: never a frame of both.
+fn plain_in_tiles(
+    job: &mut Job<'_>,
+    spec: &ViewSpec,
+    grade: &GradePlan,
+    route: &ViewRoute,
+    shape: (usize, usize),
+) -> Result<Flow, RenderError> {
+    let (w, h) = (spec.out_w, spec.out_h);
+    let mut rgba = vec![0u8; 4 * w * h];
+    let (mut scale, mut sharp, mut paper) = (1, true, true);
+    for (x, y, tw, th) in tiles_of(w, h, shape.0, shape.1) {
+        job.check()?;
+        let tile = ViewSpec {
+            output: FrameOutput::Host,
+            ..tile_of(spec, x, y, tw, th)
+        };
+        match plain_pass(job, &tile, grade, Some(route))? {
+            Flow::Done(done) if done.device == ComputeDevice::Gpu || done.paper => {
+                let Rgba8::Host(bytes) = done.rgba else {
+                    return Ok(Flow::Cpu);
+                };
+                for row in 0..th {
+                    let to = 4 * ((y + row) * w + x);
+                    rgba[to..to + 4 * tw].copy_from_slice(&bytes[4 * row * tw..4 * (row + 1) * tw]);
+                }
+                if !done.paper {
+                    paper = false;
+                    scale = scale.max(done.scale);
+                    sharp &= done.sharp;
+                }
+            }
+            Flow::Done(_) | Flow::Cpu => return Ok(Flow::Cpu),
+        }
+    }
+    Ok(Flow::Done(Done {
+        rgba: Rgba8::Host(rgba),
+        device: ComputeDevice::Gpu,
+        scale,
+        sharp,
+        paper,
     }))
 }
 
@@ -1503,6 +2372,7 @@ fn tail_work(
     sharpening: &ViewSharpening,
     spec: &ViewSpec,
     magnify: Option<Arc<MagnifyMap>>,
+    overlay: bool,
 ) -> TailWork {
     TailWork {
         sharpen: sharpening.stage.clone(),
@@ -1514,6 +2384,8 @@ fn tail_work(
         background: spec.background,
         origin: spec.dither_origin,
         magnify,
+        identity: sharpening.identity,
+        overlay: overlay.then(|| accent_display_linear(grade.chain.space()).map(|c| c as f32)),
     }
 }
 
@@ -1530,7 +2402,7 @@ fn device_magnify(
     image: (usize, usize),
 ) -> Option<Arc<MagnifyMap>> {
     let origin = geometry.origin?;
-    let frame = 16 * geometry.width.next_multiple_of(2) as u64 * geometry.height as u64;
+    let frame = picture_bytes(geometry.width, geometry.height);
     let view = 4 * spec.out_w as u64 * spec.out_h as u64;
     if frame > route.band_bytes || view > route.band_bytes {
         return None;
@@ -1573,8 +2445,11 @@ fn sharpened_pass(
         view_to_final: geometry.view_to_final,
         ..spec.clone()
     };
-    let key = spec
-        .cache
+    // The mask view's overlay: the chain that ends at the node's mask runs beside the colour pass, and the
+    // tint is made on the sharpened frame. Its display-linear frame is not kept (it is a diagnostic view; a
+    // move of any slider changes the mask or the photo under it anyway).
+    let mask_grade = job.overlay_grade();
+    let key = (spec.cache && mask_grade.is_none())
         .then(|| display_key(job, &read, grade, sharpening, window))
         .transpose()?;
     // The tail runs on the device when the route has it: over the view grown by the halo, or, for a
@@ -1586,7 +2461,7 @@ fn sharpened_pass(
         .and_then(|r| device_magnify(r, spec, &geometry, image));
     let tail = route
         .filter(|r| r.stages.tail && (geometry.origin.is_none() || magnify.is_some()))
-        .map(|_| tail_work(grade, sharpening, spec, magnify));
+        .map(|_| tail_work(grade, sharpening, spec, magnify, mask_grade.is_some()));
     let tail_gpu = tail.as_ref().and(route).map(ViewRoute::gpu_ref);
     let cached = key
         .as_ref()
@@ -1597,6 +2472,7 @@ fn sharpened_pass(
         .filter(|d| d.usable(tail_gpu.as_ref()));
     let (scale, sharp, device);
     let mut rgba: Option<Rgba8> = None;
+    let mut mask_plane: Option<Vec<f32>> = None;
     let display: Option<Arc<DisplayFrame>>;
     match cached {
         Some(d) => {
@@ -1605,21 +2481,45 @@ fn sharpened_pass(
             display = Some(d);
         }
         None => {
-            // A frame the device colours that does not fit one binding, and whose tail the CPU runs
-            // (the colour pass alone is on, as under `Auto`): the colour pass is pointwise, so the
-            // device makes it in bands of rows and the CPU gets the whole frame to sharpen.
-            let in_bands = match route {
-                Some(r) if r.stages.color && tail.is_none() => band_split(job, &read, None, r)?,
-                _ => None,
+            // A frame the device colours that does not fit one binding is cut by the scheduler's areas (`band_split`):
+            // the colour pass is pointwise, the Film and raster passes are tile-exact, so the device makes it in bands
+            // of rows, or in tiles when one row of its wider picture passes the bindings, and the CPU gets the whole
+            // frame to sharpen. A frame whose tail the device runs was cut by `banded` already, in pieces that fit.
+            // The mask view's overlay is cut with the frame: its mask plane is made beside the colour pass in every
+            // tile, and tinted by the CPU's tail.
+            let cut = match route {
+                Some(r) if r.stages.color => {
+                    let mut chains: Vec<&ColorChain> = vec![&grade.chain];
+                    chains.extend(mask_grade.as_deref().map(|g| &*g.chain));
+                    match band_split(job, &read, None, r, &chains)? {
+                        Some(cut) => cut,
+                        None => return Ok(Flow::Cpu),
+                    }
+                }
+                _ => Shape::Whole,
             };
-            let built = match (in_bands, route) {
-                (Some(rows), Some(r)) => build_display_in_bands(job, r, &read, grade, rows)?,
+
+            let built = match (cut, route) {
+                (Shape::Rows(rows), Some(r)) if tail.is_none() || grade.chain.has_films() => {
+                    build_display_in_bands(
+                        job,
+                        r,
+                        &read,
+                        grade,
+                        mask_grade.as_deref(),
+                        (read.out_w, rows),
+                    )?
+                }
+                (Shape::Tiles(tw, th), Some(r)) => {
+                    build_display_in_bands(job, r, &read, grade, mask_grade.as_deref(), (tw, th))?
+                }
                 _ => {
                     let prepared = prepare_view(job, &read)?;
                     let plan = TailPlan {
                         work: tail.as_ref(),
                         keep: key.is_some(),
                         window,
+                        mask: mask_grade.as_deref(),
                     };
                     build_display(job, route, &prepared, &read, grade, &plan)?
                 }
@@ -1629,6 +2529,7 @@ fn sharpened_pass(
             };
             (scale, sharp, device) = (built.scale, built.sharp, built.device);
             rgba = built.rgba;
+            mask_plane = built.mask;
             display = built.display.map(|d| {
                 let d = Arc::new(d);
                 if let Some(k) = key {
@@ -1663,18 +2564,20 @@ fn sharpened_pass(
                 let Some(host) = display.host() else {
                     return Ok(Flow::Cpu);
                 };
+                let mask = mask_plane.as_deref();
                 Rgba8::Host(match geometry.origin {
                     None => sharpen_and_encode(
                         job,
                         &host,
                         sharpening,
                         grade,
+                        mask,
                         (spec.out_w, spec.out_h),
                         (spec.background, spec.dither_origin),
                     )?,
-                    Some(origin) => {
-                        magnify_and_encode(job, &host, origin, sharpening, grade, spec, image)?
-                    }
+                    Some(origin) => magnify_and_encode(
+                        job, &host, origin, sharpening, grade, mask, spec, image,
+                    )?,
                 })
             }
         },
@@ -1804,8 +2707,23 @@ fn banded(
     sharpening: Option<&ViewSharpening>,
     route: &ViewRoute,
 ) -> Result<Flow, RenderError> {
-    let Some(rows) = band_split(job, spec, sharpening, route)? else {
-        return whole(job, spec, grade, sharpening, Some(route), StageWindow::Own);
+    // The raster masks of the nodes look at the photo beyond the picture a pass makes by their receptive field: a band
+    // is a view of its own, so each band makes its planes from the band grown by it (`raster_read`).
+    let overlay = job.overlay_grade();
+    let mut chains: Vec<&ColorChain> = vec![&grade.chain];
+    chains.extend(overlay.as_deref().map(|g| &*g.chain));
+    let rows = match band_split(job, spec, sharpening, route, &chains)? {
+        Some(Shape::Rows(rows)) => rows,
+        // A view whose wider picture passes the bindings in any rows: a frame without the stage is made a tile at a time;
+        // a sharpened one by `sharpened_pass`, which cuts its display-linear frame the same way.
+        Some(Shape::Tiles(tw, th)) if sharpening.is_none() => {
+            return plain_in_tiles(job, spec, grade, route, (tw, th));
+        }
+        Some(Shape::Whole | Shape::Tiles(..)) => {
+            return whole(job, spec, grade, sharpening, Some(route), StageWindow::Own);
+        }
+        // Not even the smallest tile fits the device's bindings: the reason is recorded, the CPU makes the frame.
+        None => return Ok(Flow::Cpu),
     };
     // The stage works on the bounding box of the photo in the view's frame: every band is given
     // the box of the view in one piece, cut to its rows (a band's own box is narrower where the
@@ -1888,109 +2806,221 @@ fn banded(
     }))
 }
 
-/// How many rows per band a view is cut into, or `None` for one pass: only a view the device makes
-/// whole, from the sampler to the RGBA8 frame, is cut, and only when its frame (four planes of f32
-/// over the view grown by the stage's receptive field) or the camera RGB it reads does not fit one
-/// storage binding of [`RenderOptions::view_band_bytes`] ([`device::band_rows`]; a constant of the
-/// renderer, so the cut is the same on every machine). A sharpened view magnified above 100 % reads
-/// the 100 % picture under it: it is cut when that picture (four planes of f32) or its RGBA8 frame
-/// does not fit, each band reading the 100 % picture under its own rows (`device_magnify`). The
-/// bands give the view in one piece: the stage's window is the whole view's, the dither counts from
-/// the band's row, and a row's taps come from the band's map, which is the view's with the band's
-/// offset folded in (one `f64` rounding, as for the sampler's bands; the tests find the bands
+/// How a view is cut for the device (`docs/23` section 5.12, *Limits*): the coarsest cut into bands of rows, or into tiles
+/// when one row of the wider picture is more than a binding, for which **every binding of every piece fits**, found by
+/// [`search_cut`] from the areas the scheduler infers for each candidate piece (`tile_overflow`). `Shape::Whole` is one
+/// pass. `None` when not even the smallest tile fits, which is a resource limit (the reach of the spatial steps alone fills
+/// a binding): the reason has been recorded (the CPU note, `RenderReport::cpu_reason`) and the CPU makes the frame.
+///
+/// Only a view the device makes whole, from the sampler to the RGBA8 frame, is cut, and with output sharpening only when
+/// the device also runs the stage (the CPU stage takes the whole frame: `build_display_in_bands`). The pieces give the view
+/// in one piece: every device stage is tile-exact, the stage's window is the whole view's, the dither counts from the
+/// piece's place, and a magnified view's piece reads the 100 % picture under it (`device_magnify`; the tests find the bands
 /// identical to the view in one piece).
-///
-/// The camera RGB a view reads can be larger than its frame (the whole group at 1/2 is 150 MB for a
-/// 50 MP photo; full-resolution tiles under a view between 50 and 100 % hold up to four pixels per
-/// pixel shown): the bands share it out, and the cut is made finer until the window of every band,
-/// grown by the stage's receptive field, fits. The window of full-resolution tiles is found from the
-/// geometry alone, without computing a tile.
-///
-/// [`RenderOptions::view_band_bytes`]: crate::pipeline::RenderOptions::view_band_bytes
 fn band_split(
     job: &mut Job<'_>,
     spec: &ViewSpec,
     sharpening: Option<&ViewSharpening>,
     route: &ViewRoute,
-) -> Result<Option<usize>, RenderError> {
+    chains: &[&ColorChain],
+) -> Result<Option<Shape>, RenderError> {
     let stages = route.stages;
-    // Only a view the device colours is cut, and with output sharpening only when the device also
-    // runs the stage (the CPU stage takes the whole frame: `build_display_in_bands`).
     if !(stages.color && (sharpening.is_none() || stages.tail)) {
-        return Ok(None);
+        return Ok(Some(Shape::Whole));
     }
     let step = spec.view_to_final.m[0][0];
     let magnified = sharpening.is_some() && step.is_finite() && step < 1.0 - 1e-9;
-    let halo = sharpening.map_or(0, |s| s.halo);
-    // A magnified view's bands are sized by the loop below, from the pictures each one reads.
-    let by_frame = if magnified {
+    let image = job.final_size()?;
+    let plan = job.plan()?;
+    let geometry = job.geometry()?.at_full_resolution();
+    // The picture a piece's colour pass makes: the piece, or with output sharpening the piece grown by the stage's
+    // receptive field.
+    let frame_of = |v: &ViewSpec| {
+        let g = sharpening
+            .and_then(|sh| sh.frame_geometry(&v.view_to_final, (v.out_w, v.out_h), image))?;
+        Some(g)
+    };
+    // What a piece costs, or the first binding of it that does not fit, as `Err((bytes needed, bytes allowed))`: the pictures its
+    // areas make (the colour pass's frame, the wider picture of the Film nodes), the 100 % picture and RGBA8 frame under a
+    // magnified piece, and the camera RGB each of them reads. The cost is the pixels the piece processes: its frame and its
+    // wider picture (`Shape::cost` adds the fixed cost of a piece).
+    let measure =
+        |job: &mut Job<'_>, piece: &ViewSpec| -> Result<Result<u64, (u64, u64)>, RenderError> {
+            let frame = frame_of(piece);
+            if magnified && let Some(g) = &frame {
+                let planes = picture_bytes(g.width, g.height);
+                let rgba8 = 4 * piece.out_w as u64 * piece.out_h as u64;
+                if planes > route.band_bytes {
+                    return Ok(Err((planes, route.band_bytes)));
+                }
+                if rgba8 > route.band_bytes {
+                    return Ok(Err((rgba8, route.band_bytes)));
+                }
+            }
+            let read = match frame {
+                Some(g) => ViewSpec {
+                    out_w: g.width,
+                    out_h: g.height,
+                    view_to_final: g.view_to_final,
+                    ..piece.clone()
+                },
+                None => piece.clone(),
+            };
+            let own = picture_bytes(read.out_w, read.out_h);
+            if own > route.band_bytes {
+                return Ok(Err((own, route.band_bytes)));
+            }
+            let mut pixels = own / 16;
+            // The wider picture of the Film nodes: the piece grown by the reach the scheduler infers. (The raster masks'
+            // planes are made in tiles of their own when theirs does not fit: `grown_input`.)
+            let wide = raster_grown(job, &read, chains)?;
+            if let Some(w) = &wide {
+                let need = picture_bytes(w.out_w, w.out_h);
+                if need > route.band_bytes {
+                    return Ok(Err((need, route.band_bytes)));
+                }
+                pixels += need / 16;
+            }
+            // The CPU samples: what goes up is the piece's frame, which the cut already holds.
+            if !stages.sampler {
+                return Ok(Ok(pixels));
+            }
+            let mut reads = vec![read];
+            reads.extend(wide);
+            for read in &reads {
+                let bytes = if !plan.reduced && plan.effective_scale(read.k) == 1 {
+                    // Full-resolution tiles: the region `prepare_view` would read (a coarse frame reads less, the 1/2 image,
+                    // which this bounds too).
+                    geometry
+                        .grid_from((plan.out_w, plan.out_h), read.view_to_final)
+                        .source_bounds(0, 0, read.out_w, read.out_h, 3)
+                        .map(|(x0, y0, x1, y1)| camera_bytes(x1 - x0, y1 - y0))
+                } else {
+                    prepare_view(job, read)?.source_window_bytes()
+                };
+                if let Some(b) = bytes.filter(|b| *b > route.source_bytes) {
+                    return Ok(Err((b, route.source_bytes)));
+                }
+            }
+            Ok(Ok(pixels))
+        };
+    // Where to start the rows: what the widest picture of one row of the view allows, from its areas. A start only.
+    let rows_guess = if magnified {
         None
     } else {
-        device::band_rows(spec.out_w, spec.out_h, halo, route.band_bytes, 1)
-    };
-    let plan = job.plan()?;
-    let image = job.final_size()?;
-    let geometry = job.geometry().at_full_resolution();
-    // The camera RGB one band reads: the view's own rows, or with output sharpening the band grown
-    // by the stage's receptive field (the frame the band's colour pass makes), or the 100 % picture
-    // under a magnified band, which must fit one binding itself, with the band's RGBA8.
-    let source_fits = |job: &mut Job<'_>, band: &ViewSpec| -> Result<bool, RenderError> {
-        let frame = sharpening
-            .and_then(|sh| sh.frame_geometry(&band.view_to_final, (band.out_w, band.out_h), image));
-        if magnified && let Some(g) = &frame {
-            let planes = 16 * g.width.next_multiple_of(2) as u64 * g.height as u64;
-            let rgba8 = 4 * band.out_w as u64 * band.out_h as u64;
-            if planes > route.band_bytes || rgba8 > route.band_bytes {
-                return Ok(false);
-            }
-        }
-        // The CPU samples: what goes up is the band's frame, which the cut already holds.
-        if !stages.sampler {
-            return Ok(true);
-        }
-        let read = match frame {
-            Some(g) => ViewSpec {
-                out_w: g.width,
-                out_h: g.height,
-                view_to_final: g.view_to_final,
-                ..band.clone()
-            },
-            None => band.clone(),
+        let probe = tile_of(spec, 0, spec.out_h / 2, spec.out_w, 1);
+        let read = match frame_of(&probe) {
+            Some(g) => (g.width, g.height),
+            None => (probe.out_w, probe.out_h),
         };
-        let bytes = if !plan.reduced && plan.effective_scale(read.k) == 1 {
-            // Full-resolution tiles: the region `prepare_view` would read (a coarse frame reads
-            // less, the 1/2 image, which this bounds too).
-            geometry
-                .grid_from((plan.out_w, plan.out_h), read.view_to_final)
-                .source_bounds(0, 0, read.out_w, read.out_h, 3)
-                .map(|(x0, y0, x1, y1)| {
-                    12 * (x1 - x0).next_multiple_of(2) as u64 * (y1 - y0) as u64
-                })
-        } else {
-            prepare_view(job, &read)?.source_window_bytes()
-        };
-        Ok(bytes.is_none_or(|b| b <= route.source_bytes))
+        let wide = raster_grown(job, &probe, chains)?.map_or((0, 0), |w| (w.out_w, w.out_h));
+        let widest = read.0.max(wide.0);
+        let reach_rows = read.1.max(wide.1).saturating_sub(1);
+        let fit_rows = (route.band_bytes / picture_bytes(widest, 1).max(1)) as usize;
+        Some(fit_rows.saturating_sub(reach_rows).max(1))
     };
-    let mut rows = by_frame.unwrap_or(spec.out_h).max(1);
-    loop {
-        let bands = device::bands_of(spec, rows);
-        let mut fits = true;
-        for band in &bands {
-            if !source_fits(job, band)? {
-                fits = false;
-                break;
+    let mut last = None;
+    let shape = search_cut(
+        spec.out_w,
+        spec.out_h,
+        rows_guess,
+        true,
+        // A view with a Film node is cut by cost, bands and tiles: thin bands each read nearly the whole wider picture, and
+        // tiles of a sharpened view cost the CPU stage over the display frame (about 150 ms at 2080 x 1387), far less than
+        // the work they save. A sharpened view without one is cut in bands (the device's fused tail, and the pixels of the
+        // view in one piece bit for bit) before the ladder tries tiles; an unsharpened one tries tiles when no band fits.
+        match (sharpening.is_some(), chains.iter().any(|c| c.has_films())) {
+            // Tiles of a sharpened view leave the stage to the CPU (the pixels of the view in one piece to a code, not bit
+            // for bit, where its bands are bit for bit: `device_bands_of_a_magnified_film_view_equal_the_view_in_one_piece`):
+            // a sharpened view is cut in bands when 16 fit, and with a Film node in tiles when they do not.
+            (true, true) => 0,
+            (true, false) => NO_TILES,
+            (false, true) => 100,
+            (false, false) => 0,
+        },
+        &mut |shape, tiles| {
+            // The photo's edge cuts the pieces differently, so every piece of a cut into at most 16 is tested; of more
+            // tiles the four corners and the middle one are (the escaped buffer of G-12: the middle tile alone was not the
+            // largest at the photo's corner).
+            let tested: Vec<(usize, usize, usize, usize)> = match shape {
+                Shape::Tiles(..) if tiles.len() > 16 => {
+                    let cols = tiles.iter().take_while(|t| t.1 == tiles[0].1).count();
+                    let n = tiles.len();
+                    let mut picks = vec![0, cols - 1, n / 2, n - cols, n - 1];
+                    picks.dedup();
+                    picks.into_iter().map(|i| tiles[i]).collect()
+                }
+                _ => tiles.to_vec(),
+            };
+            let mut pixels = 0u64;
+            for &(x, y, w, h) in &tested {
+                match measure(job, &tile_of(spec, x, y, w, h))? {
+                    Ok(px) => pixels += px,
+                    Err(over) => {
+                        last = Some(over);
+                        return Ok(None);
+                    }
+                }
             }
-        }
-        if fits {
-            return Ok((rows < spec.out_h).then_some(rows));
-        }
-        if rows == 1 {
-            // Not even one row fits: the device cannot take the view, the CPU makes it.
-            return Ok(None);
-        }
-        // One more band each time: the same rows for every machine and the fewest bands that fit.
-        rows = spec.out_h.div_ceil(bands.len() + 1).min(rows - 1);
+            // Of a sample of tiles, their mean cost stands for every tile.
+            let scaled = pixels * tiles.len() as u64 / tested.len().max(1) as u64;
+            Ok::<Option<u64>, RenderError>(Some(scaled))
+        },
+    )?;
+    tracing::debug!(
+        view = %format!("{}x{}", spec.out_w, spec.out_h),
+        sharpened = sharpening.is_some(),
+        magnified,
+        band_bytes = route.band_bytes,
+        ?shape,
+        ?last,
+        "the cut of a view"
+    );
+    if shape.is_none() {
+        let (requested, limit) = last.unwrap_or((0, route.band_bytes));
+        job.view_gpu_failed(&GpuError::BufferTooLarge { requested, limit })?;
     }
+    Ok(shape)
+}
+
+/// The view `spec` of the tile of `w x h` pixels at `(x, y)` of it: a view of its own, with the dither counted from its
+/// place in the view.
+fn tile_of(spec: &ViewSpec, x: usize, y: usize, w: usize, h: usize) -> ViewSpec {
+    ViewSpec {
+        out_w: w,
+        out_h: h,
+        view_to_final: Affine::scale_translate(1.0, 1.0, x as f64, y as f64)
+            .then(&spec.view_to_final),
+        dither_origin: (spec.dither_origin.0 + x, spec.dither_origin.1 + y),
+        ..spec.clone()
+    }
+}
+
+/// The wider picture a Film node reads for the picture `read`, as a view of its own, or `None` when no chain has a Film node
+/// (the raster planes are made in tiles and need no whole wider picture), none of the photo is in `read`, or nothing is read
+/// beyond it. **The same area the render reads** ([`raster_read`]: the scheduler's inference cut to the photo's extent), not an
+/// estimate of it: the cut's invariant is that every buffer of every piece fits, and a buffer is sized by this area (G-12:
+/// a symmetrical bound of the reach could be smaller than the area, for a view at the photo's edge or with several
+/// spatial steps, and a piece judged to fit then did not).
+fn raster_grown(
+    job: &mut Job<'_>,
+    read: &ViewSpec,
+    chains: &[&ColorChain],
+) -> Result<Option<ViewSpec>, RenderError> {
+    // Only a chain with a Film node needs the wider picture whole: the planes of the others are made in tiles when it does
+    // not fit (`grown_input`), so it does not decide the cut.
+    if read.before || !chains.iter().any(|c| c.has_films()) {
+        return Ok(None);
+    }
+    let prepared = prepare_view_with(job, read, false)?;
+    let Some(grid) = prepared.photo_grid() else {
+        return Ok(None);
+    };
+    let Some(rr) = raster_read(job, read, chains, Some(&grid))? else {
+        return Ok(None);
+    };
+    let grown = (rr.spec.out_w, rr.spec.out_h) != (read.out_w, read.out_h);
+    Ok(grown.then_some(rr.spec))
 }
 
 fn display_key(
@@ -2003,11 +3033,12 @@ fn display_key(
     let params = job.params()?;
     // The sharpening amount is not part of it: the frame is what the amount is applied to. The
     // halo is (it is what the view was grown by).
+    let geometry = job.geometry()?;
     let mut key = format!(
         "display|{:?}|{:?}|{:?}|{:?}|{}x{}|{:?}|{}|{}",
         params.key(),
         grade.key,
-        job.geometry(),
+        geometry,
         grown.view_to_final,
         grown.out_w,
         grown.out_h,
@@ -2019,6 +3050,10 @@ fn display_key(
     // frame of another view have another box, and a frame resident with one must not serve the other.
     if let StageWindow::Of(b) = window {
         key.push_str(&format!("|window{b:?}"));
+    }
+    // The lens moves every pixel the frame holds: a move of one of its sliders is a new frame.
+    if let Some(lens) = job.lens_key()? {
+        key.push_str(&format!("|{lens}"));
     }
     Ok(key)
 }
@@ -2070,6 +3105,19 @@ pub(crate) struct ViewSpec {
 pub(crate) struct SampledView {
     pub sampled: Arc<Sampled>,
     pub scale: usize,
+    /// The view's geometry as plain data, when it has pixels: where its pixels are in the photo frame.
+    pub grid: Option<SamplerGrid>,
+}
+
+impl SampledView {
+    /// The place in the photo frame of pixel (0, 0) of the view, for the readout of a one-pixel view.
+    pub(crate) fn spot(&self) -> PixelAt<'static> {
+        let grid = self.grid.as_ref()?;
+        Some(PhotoSpot::new(
+            GridPositions::new(grid, (0, 0)).position(0, 0),
+            grid.photo_frame(),
+        ))
+    }
 }
 
 /// Steps 1 and 2 of the module documentation: the raw group's pixels (the reduced image, or the
@@ -2078,6 +3126,7 @@ pub(crate) fn prepare_view(
     job: &mut Job<'_>,
     spec: &ViewSpec,
 ) -> Result<PreparedView, RenderError> {
+    let _span = ym_gpu::perf::span(ym_gpu::perf::Stage::Prepare);
     prepare_view_with(job, spec, true)
 }
 
@@ -2090,7 +3139,7 @@ fn prepare_view_with(
     pixels: bool,
 ) -> Result<PreparedView, RenderError> {
     let plan = job.plan()?;
-    let geom = job.geometry();
+    let geom = job.geometry()?;
     let (w, h) = (spec.out_w, spec.out_h);
     // A camera-processed file has no mosaic, so any scale works; the limit that keeps a reduced
     // image at least a few pixels across applies to both.
@@ -2103,12 +3152,12 @@ fn prepare_view_with(
             .grid_from((plan.out_w, plan.out_h), spec.view_to_final);
         if let Some((x0, y0, x1, y1)) = grid.source_bounds(0, 0, w, h, 3) {
             let rect = Rect::new(x0, y0, x1 - x0, y1 - y0);
-            if spec.coarse_only && !job.tiles_ready(rect)? {
+            if spec.coarse_only && !job.lens_tiles_ready(rect)? {
                 k = plan.effective_scale(2).max(2);
                 sharp = false;
             } else {
                 let region = if pixels {
-                    job.region_pixels(rect)?
+                    job.lens_region_pixels(rect)?
                 } else {
                     Pixels::Host(Arc::new(RgbImage::new(0, 0)))
                 };
@@ -2122,6 +3171,7 @@ fn prepare_view_with(
                     sharp,
                     width: w,
                     height: h,
+                    snap_positions: spec.target == OutputTarget::Viewport,
                 });
             }
         } else {
@@ -2132,18 +3182,26 @@ fn prepare_view_with(
                 sharp,
                 width: w,
                 height: h,
+                snap_positions: false,
             });
         }
     }
-    let backing = job.group_backing(k)?;
+    let backing = job.lens_group_backing(k)?;
     let (group_w, group_h) = backing.size();
+    // A group after the lens is not the raw group: a read-back that has to make it again makes the lens
+    // too.
+    let source = if job.lens_ctx()?.is_some() {
+        PartSource::LensGroup(k)
+    } else {
+        PartSource::Group(k)
+    };
     let pixels = match backing {
         Backing::Cpu(image) => Pixels::Host(image),
         Backing::Gpu(image) => Pixels::Resident {
             parts: vec![ResidentPart {
                 image,
                 at: (0, 0),
-                source: PartSource::Group(k),
+                source,
             }],
             rect: Rect::new(0, 0, group_w, group_h),
         },
@@ -2163,6 +3221,7 @@ fn prepare_view_with(
         sharp,
         width: w,
         height: h,
+        snap_positions: spec.target == OutputTarget::Viewport,
     })
 }
 
@@ -2181,6 +3240,7 @@ pub(crate) fn sample_view_routed(
     Ok(SampledView {
         sampled,
         scale: prepared.scale,
+        grid: prepared.photo_grid(),
     })
 }
 
@@ -2216,6 +3276,7 @@ pub(crate) fn sample_view_in_place(
     Ok(SampledView {
         sampled,
         scale: prepared.scale,
+        grid: prepared.photo_grid(),
     })
 }
 
@@ -2227,8 +3288,29 @@ pub(crate) fn render_view(mut job: Job<'_>, spec: &ViewSpec) -> Result<RenderedF
         job.src.before_view, spec.before,
         "a Before view is rendered from the source made for it, and only that"
     );
-    let grade = job.grade(spec.target, true)?;
-    let sharpening = view_sharpening(&mut job, spec)?;
+    // The mask view (`docs/23` section 5.8; only a viewport frame has one): Mask only is the chain compiled to
+    // the node's mask, unsharpened, as the frame's own plan; Overlay is the photo as it is, with that chain run
+    // beside it for the tint, which goes on the sharpened frame (an unsharpened photo takes the sharpened road
+    // with a stage that does nothing, so that the tint has the same place on every view).
+    job.prepare_mask_view(spec.target)?;
+    let mask_only = job
+        .mask_view()
+        .is_some_and(|v| v.style == MaskStyle::MaskOnly);
+    let grade = match job.mask_grade().filter(|_| mask_only) {
+        Some(mask) => mask,
+        None => job.grade(spec.target, true)?,
+    };
+    let overlay = job.overlay_grade().is_some();
+    let sharpening = if mask_only {
+        None
+    } else {
+        let stage = view_sharpening(&mut job, spec)?;
+        if overlay {
+            Some(stage.unwrap_or_else(ViewSharpening::none))
+        } else {
+            stage
+        }
+    };
     let cache_key = spec
         .cache
         .then(|| frame_key(&mut job, spec, &grade, sharpening.as_ref()))
@@ -2248,9 +3330,14 @@ pub(crate) fn render_view(mut job: Job<'_>, spec: &ViewSpec) -> Result<RenderedF
         frame.report = job.finish(scale, device, spec.target);
         return Ok(frame);
     }
+    // The overlay is made whole on the device (sampler or upload, colour pass, the mask chain, the stage, the
+    // tint and C13 in one job) or whole on the CPU; a device whose stages do not cover that leaves it to the CPU.
+    // A Film node runs on the device: its pictures are made before the colour pass, in the same job (`film_pass`,
+    // `ym_gpu::kernels::film_stack`); a device error on the frame is answered on the CPU as for any other kernel.
     let route = job
         .view_gpu()?
-        .map(|gpu| ViewRoute::new(&job, gpu, spec.gpu_priority));
+        .map(|gpu| ViewRoute::new(&job, gpu, spec.gpu_priority))
+        .filter(|r| !overlay || (r.stages.color && r.stages.tail));
     let gpu = route.as_ref().map(ViewRoute::gpu_ref);
     let done = render_pass(&mut job, spec, &grade, sharpening.as_ref(), route)?;
     let (rgba, on_device) = match (done.rgba, gpu) {
@@ -2293,7 +3380,7 @@ fn view_sharpening(
     job: &mut Job<'_>,
     spec: &ViewSpec,
 ) -> Result<Option<ViewSharpening>, RenderError> {
-    let amount = job.src.settings.output_sharpening;
+    let amount = job.src.settings.output().output_sharpening;
     if spec.before || amount.is_nan() || amount <= 0.0 {
         return Ok(None);
     }
@@ -2308,11 +3395,12 @@ fn frame_key(
     sharpening: Option<&ViewSharpening>,
 ) -> Result<String, RenderError> {
     let params = job.params()?;
+    let geometry = job.geometry()?;
     let mut key = format!(
         "{:?}|{:?}|{:?}|{:?}|{}x{}|{:?}|{}|{}",
         params.key(),
         grade.key,
-        job.geometry(),
+        geometry,
         spec.view_to_final,
         spec.out_w,
         spec.out_h,
@@ -2322,12 +3410,23 @@ fn frame_key(
     );
     // The amount belongs to the finished frame, not to the display-linear one under it.
     if sharpening.is_some() {
-        key.push_str(&format!("|os{:?}", job.src.settings.output_sharpening));
+        key.push_str(&format!(
+            "|os{:?}",
+            job.src.settings.output().output_sharpening
+        ));
     }
     // A frame kept on the device and one read back are the same pixels in different places; each
     // request is served the kind it asked for.
     if spec.output == FrameOutput::Device {
         key.push_str("|device");
+    }
+    // The mask view shows another picture of the same photo.
+    if let Some(mask) = job.mask_key() {
+        key.push_str(&format!("|{mask}"));
+    }
+    // The lens moves every pixel the frame holds: a move of one of its sliders is a new frame.
+    if let Some(lens) = job.lens_key()? {
+        key.push_str(&format!("|{lens}"));
     }
     Ok(key)
 }
@@ -2349,6 +3448,43 @@ impl Renderer {
         cancel: &CancelToken,
     ) -> Result<(usize, usize), RenderError> {
         Job::new(self, src, cancel)?.final_size()
+    }
+
+    /// The photo's blur map as a Background row reads it (`docs/23` section 4.6): `P`, the probability that a cell
+    /// is out of focus, over the photo frame (the photo as the camera oriented it), made from the raw group's
+    /// lens plane by the learned model (the classical detector when the model cannot run) and kept for the photo.
+    /// It is the map the lens's Anamorphic uses, made once for both, and it does not move with the lens sliders. For
+    /// checks and diagnostics, like [`Renderer::geometry`].
+    ///
+    /// # Errors
+    ///
+    /// [`RenderError`] when the photo's data cannot be prepared or the request is cancelled.
+    pub fn blur_map(
+        &self,
+        src: &PhotoSource,
+        cancel: &CancelToken,
+    ) -> Result<Arc<ym_color::mask_raster::BlurMap>, RenderError> {
+        let mut job = Job::new(self, src, cancel)?;
+        let map = Arc::clone(&job.blur_entry()?.photo);
+        job.finish(1, ComputeDevice::Cpu, OutputTarget::Srgb);
+        Ok(map)
+    }
+
+    /// The geometry the photo is sampled with: the camera's orientation, the user's turns, the
+    /// straighten angle and the crop, through the lens's bend when the photo has one (L4, `docs/21`
+    /// section 4; [`Geometry::warp`]). The bend is the one every view and export of the photo uses:
+    /// made once on the full-resolution canvas, so a reduced canvas takes the same zoom. For checks and
+    /// diagnostics, like [`Renderer::camera_region`].
+    ///
+    /// # Errors
+    ///
+    /// [`RenderError`] when the photo's data or its lens cannot be prepared.
+    pub fn geometry(
+        &self,
+        src: &PhotoSource,
+        cancel: &CancelToken,
+    ) -> Result<Geometry, RenderError> {
+        Job::new(self, src, cancel)?.geometry()
     }
 
     /// The frame of a viewport state: the photo in the cell at the zoom and pan of `state`, in
@@ -2390,25 +3526,84 @@ impl Renderer {
         } else {
             src
         };
-        let mut job = Job::new(self, src, cancel)?;
+        // The mask view is a view of the node view: never part of the Before view.
+        let mask_view = state.mask_view.filter(|_| !state.before);
+        let mut job = Job::new(self, src, cancel)?.with_mask_view(mask_view);
         let image = job.final_size()?;
-        let (dw, dh) = state.device_size();
-        let zoom = state.zoom(image);
-        let spec = ViewSpec {
-            out_w: dw,
-            out_h: dh,
-            view_to_final: state.view_to_final(image),
-            k: scale_for_zoom(zoom),
-            target: OutputTarget::Viewport,
-            before: state.before,
-            coarse_only: options.coarse_only,
-            cache: !options.no_cache,
-            background: self.options().background,
-            gpu_priority: Priority::Viewport,
-            dither_origin: (0, 0),
-            output,
+        let (spec, zoom, geometry) = self.viewport_spec(&job, state, image, options, output);
+        let ask = level::ask(&mut job, &spec, geometry, mask_view.is_some())?;
+        // The `ym::perf` line of the frame (`crate::perf`); `None`, and nothing measured, unless `YM_PERF` is on.
+        let probe = crate::perf::FrameProbe::start(
+            self.options().gpu.clone(),
+            super::color::uses_rasters(&job.src.settings),
+            match mask_view {
+                None => "none",
+                Some(v) if v.row.is_some() => "row",
+                Some(v) if v.style == MaskStyle::MaskOnly => "mask_only",
+                Some(_) => "overlay",
+            },
+            zoom,
+        );
+        // A level of this zoom that has the window's rows serves it as a rectangle copied out of the strips; else the window is
+        // rendered as ever (`frame::level`).
+        let served = match &ask {
+            Some(ask) => level::crop(&mut job, &spec, ask),
+            None => Ok(None),
         };
-        let mut frame = render_view(job, &spec)?;
+        // Else, for the first request of a round at a zoom that has no picture of its own yet, the picture of a nearby zoom's level
+        // resampled stands in at once, marked not sharp: the shell then asks for the exact frame (`frame.sharp`).
+        let (served, drafted) = match served {
+            Ok(None) => match level::draft(&mut job, &spec, image, mask_view.is_some()) {
+                Ok(Some(draft)) => (Ok(Some(draft)), true),
+                Ok(None) => (Ok(None), false),
+                Err(e) => (Err(e), false),
+            },
+            other => (other, false),
+        };
+        let result = match served {
+            Ok(Some((buffer, gpu))) => {
+                let report = job.finish(1, ComputeDevice::Gpu, spec.target);
+                Ok(RenderedFrame {
+                    width: spec.out_w,
+                    height: spec.out_h,
+                    rgba: Vec::new(),
+                    on_device: Some(DeviceFrame {
+                        buffer,
+                        width: spec.out_w,
+                        height: spec.out_h,
+                        gpu,
+                    }),
+                    sharp: !drafted,
+                    report,
+                })
+            }
+            Ok(None) => render_view(job, &spec),
+            Err(e) => Err(e),
+        };
+        if let Some(probe) = probe {
+            probe.finish(&result);
+        }
+        let mut frame = result?;
+        // A window rendered with no level to serve it: the level is wanted (made in the background once the settings and the
+        // zoom have held still).
+        if let Some(ask) = ask
+            && frame.report.runs.level_hits == 0
+            && frame.sharp
+            && frame.report.device == ComputeDevice::Gpu
+        {
+            self.want_level(src, ask);
+        }
+        // What the next round of the viewport is told at its start (`Renderer::views_on_cpu`): a frame the device refused is
+        // the CPU's, and so is the next until the device makes one. A frame from the cache says nothing new.
+        if frame.report.runs.frame_hits == 0
+            && frame.report.runs.level_hits == 0
+            && let Some(graph) = self.existing_graph(src.id)
+        {
+            graph.note_view_frame(
+                frame.report.device_refused,
+                frame.report.device == ComputeDevice::Gpu,
+            );
+        }
         // The zoom belongs to the request, not to the pixels (a cached frame is served for the
         // same view): say what this request asked for.
         frame.report.zoom = Some(FrameZoom {
@@ -2419,6 +3614,102 @@ impl Renderer {
         // readout or an export of the same photo must not replace it.
         self.note_stats(src.id, frame.report.stats());
         Ok(frame)
+    }
+
+    /// The view of a viewport state: the spec of its frame, the zoom, and where the window lies in the level of that zoom
+    /// when the zoom has levels ([`level::geometry_of`]). With levels on, the dither of the frame is counted from the
+    /// window's place in the level, whether or not the level is made yet, so that the frame looks the same on either road.
+    fn viewport_spec(
+        &self,
+        job: &Job<'_>,
+        state: &ViewportState,
+        image: (usize, usize),
+        options: &FrameOptions,
+        output: FrameOutput,
+    ) -> (ViewSpec, f64, Option<level::LevelGeometry>) {
+        let (dw, dh) = state.device_size();
+        let zoom = state.zoom(image);
+        let view_to_final = state.view_to_final(image);
+        let geometry = job
+            .options()
+            .levels
+            .then(|| level::geometry_of(&view_to_final, zoom, image, (dw, dh), state.is_fit(image)))
+            .flatten();
+        let spec = ViewSpec {
+            out_w: dw,
+            out_h: dh,
+            view_to_final,
+            k: scale_for_zoom(zoom),
+            target: OutputTarget::Viewport,
+            before: state.before,
+            coarse_only: options.coarse_only,
+            cache: !options.no_cache,
+            background: self.options().background,
+            gpu_priority: Priority::Viewport,
+            dither_origin: geometry.map_or((0, 0), |g| g.origin),
+            output,
+        };
+        (spec, zoom, geometry)
+    }
+
+    /// Makes the whole-image level of the zoom `state` shows, now, on the calling thread (the background fill does the same
+    /// band by band after the settings have held still, [`level`]): tests, and a caller that wants a pan to be free at once.
+    /// Returns how the level stands: [`level::LevelStatus::Ready`] when it is made, [`level::LevelStatus::None`] when the
+    /// state has no level (Fit, above 150 %, a letterbox window, a renderer with `levels` off or no device) or the device
+    /// cannot make it.
+    ///
+    /// # Errors
+    ///
+    /// [`RenderError`] for unusable data or a cancelled job.
+    pub fn fill_level(
+        &self,
+        src: &PhotoSource,
+        state: &ViewportState,
+        cancel: &CancelToken,
+    ) -> Result<level::LevelStatus, RenderError> {
+        self.fill_level_bands(src, state, usize::MAX, cancel)
+    }
+
+    /// [`Renderer::fill_level`] for at most `bands` bands of the level: what a part-made level serves, and how a fill
+    /// is stopped part-way, for the tests.
+    ///
+    /// # Errors
+    ///
+    /// [`RenderError`] for unusable data or a cancelled job.
+    pub fn fill_level_bands(
+        &self,
+        src: &PhotoSource,
+        state: &ViewportState,
+        bands: usize,
+        cancel: &CancelToken,
+    ) -> Result<level::LevelStatus, RenderError> {
+        let mut job = Job::new(self, src, cancel)?;
+        let image = job.final_size()?;
+        let options = FrameOptions::default();
+        let (spec, zoom, geometry) =
+            self.viewport_spec(&job, state, image, &options, FrameOutput::Device);
+        let Some(ask) = level::ask(&mut job, &spec, geometry, state.mask_view.is_some())? else {
+            return Ok(level::LevelStatus::None);
+        };
+        drop(job);
+        self.fill_level_now(src, &ask, cancel, bands);
+        Ok(self.level_status(src, zoom))
+    }
+
+    /// How the level of `zoom` (device pixels per image pixel) of a photo stands.
+    #[must_use]
+    pub fn level_status(&self, src: &PhotoSource, zoom: f64) -> level::LevelStatus {
+        self.existing_graph(src.id)
+            .map_or(level::LevelStatus::None, |g| {
+                g.with_levels(|s| s.status(zoom))
+            })
+    }
+
+    /// The levels a photo holds: how many (a partly made one counts) and the device bytes of their strips.
+    #[must_use]
+    pub fn levels_held(&self, id: crate::session::PhotoId) -> (usize, usize) {
+        self.existing_graph(id)
+            .map_or((0, 0), |g| g.with_levels(|s| (s.len(), s.bytes())))
     }
 
     /// Computes the full-resolution tiles a viewport state shows, so that the next
@@ -2454,7 +3745,7 @@ impl Renderer {
         let to_final = state.view_to_final(image);
         let (dw, dh) = state.device_size();
         let (to_final, dw, dh) = match ViewSharpening::of_view(
-            src.settings.output_sharpening,
+            src.settings.output().output_sharpening,
             &to_final,
             image,
             state.before,
@@ -2466,21 +3757,22 @@ impl Renderer {
             },
         };
         let grid = job
-            .geometry()
+            .geometry()?
             .at_full_resolution()
             .grid_from((plan.out_w, plan.out_h), to_final);
         let Some((x0, y0, x1, y1)) = grid.source_bounds(0, 0, dw, dh, 3) else {
             return Ok(0);
         };
-        job.warm_tiles(Rect::new(x0, y0, x1 - x0, y1 - y0))?;
-        let made = job.runs.tiles;
+        job.lens_warm_tiles(Rect::new(x0, y0, x1 - x0, y1 - y0))?;
+        let made = job.runs.tiles + job.runs.lens_tiles;
         job.finish(1, ComputeDevice::Cpu, OutputTarget::Viewport);
         Ok(made as usize)
     }
 
     /// The camera RGB under a point of the cell (the raw group's output, before C1, sampled at the
-    /// scale the viewport uses) and the grade plan of the photo: what [`Renderer::sample_pixel`] and
-    /// [`Renderer::sample_chroma`] read. `None` outside the photo (the letterbox).
+    /// scale the viewport uses), the grade plan of the photo and the point's place in the photo frame (for the
+    /// mask shapes of the nodes): what [`Renderer::sample_pixel`] and [`Renderer::sample_chroma`] read. `None`
+    /// outside the photo (the letterbox).
     fn point_reading(
         &self,
         src: &PhotoSource,
@@ -2488,7 +3780,7 @@ impl Renderer {
         css: (f64, f64),
         before: bool,
         cancel: &CancelToken,
-    ) -> Result<Option<(Vec3, Arc<GradePlan>)>, RenderError> {
+    ) -> Result<Option<(Vec3, Arc<GradePlan>, PixelAt<'static>)>, RenderError> {
         let mut job = Job::new(self, src, cancel)?;
         let image = job.final_size()?;
         let Some((fx, fy)) = state.final_point_at(image, css) else {
@@ -2516,8 +3808,9 @@ impl Renderer {
             return Ok(None);
         }
         let rgb = pixel_rgb(&view.sampled.img);
+        let at = view.spot();
         job.finish(view.scale, ComputeDevice::Cpu, OutputTarget::Viewport);
-        Ok(Some((rgb, grade)))
+        Ok(Some((rgb, grade, at)))
     }
 
     /// Display values (0 to 255) under a point of the cell, as the viewport shows them (the Before
@@ -2542,7 +3835,8 @@ impl Renderer {
         } else {
             src
         };
-        let Some((rgb, grade)) = self.point_reading(src, state, css, state.before, cancel)? else {
+        let Some((rgb, grade, at)) = self.point_reading(src, state, css, state.before, cancel)?
+        else {
             return Ok(None);
         };
         let kind = if state.before {
@@ -2550,7 +3844,7 @@ impl Renderer {
         } else {
             View::Final
         };
-        let v = grade.chain.apply_view_pixel(kind, rgb);
+        let v = grade.chain.apply_view_pixel_at(kind, rgb, at);
         let q = |c: f64| (c.clamp(0.0, 1.0) * 255.0).round() as u8;
         Ok(Some(PixelSample {
             r: q(v[0]),
@@ -2575,7 +3869,33 @@ impl Renderer {
     ) -> Result<Option<Vec3>, RenderError> {
         Ok(self
             .point_reading(src, state, css, false, cancel)?
-            .map(|(rgb, _)| rgb))
+            .map(|(rgb, ..)| rgb))
+    }
+
+    /// The camera RGB (the raw group's output, before C1) over `rect` of the auto-cropped image at
+    /// full resolution, as an export tile makes it: one call over the rectangle, nothing cached.
+    /// With `lens` the photo's lens (L1 to L3, `docs/21`) is applied when it has one; without it,
+    /// or without a lens, this is the raw group alone. For checks and diagnostics, like
+    /// [`Renderer::camera_rgb_at`], of which this is the region form.
+    ///
+    /// # Errors
+    ///
+    /// [`RenderError`] for unusable data, a region outside the photo or a cancelled job.
+    pub fn camera_region(
+        &self,
+        src: &PhotoSource,
+        rect: Rect,
+        lens: bool,
+        cancel: &CancelToken,
+    ) -> Result<RgbImage, RenderError> {
+        let mut job = Job::for_export(self, src, cancel);
+        let image = if lens {
+            job.lens_region(rect, false)?
+        } else {
+            job.region(rect, false)?
+        };
+        job.finish(1, ComputeDevice::Cpu, OutputTarget::Viewport);
+        Ok(image)
     }
 
     /// The chroma of the colour under a point of the cell at the input of the colour warp: the pixel
@@ -2595,10 +3915,44 @@ impl Renderer {
         css: (f64, f64),
         cancel: &CancelToken,
     ) -> Result<Option<ChromaSample>, RenderError> {
-        let Some((rgb, grade)) = self.point_reading(src, state, css, false, cancel)? else {
+        self.sample_chroma_at(src, None, ChromaTap::WarpInput, state, css, cancel)
+    }
+
+    /// [`Renderer::sample_chroma`] for the colour at a place in a node (`docs/01`, the `at` and
+    /// `tap` arguments); `None` is Main.
+    ///
+    /// * [`ChromaTap::WarpInput`]: the input of the node's colour warp, after the node's trim and
+    ///   grade, or the Input's output for `Input`. The node's own pins act on these colours, so
+    ///   Pick colour on a corrector reads them.
+    /// * [`ChromaTap::NodeInput`]: the picture the node reads, before its trim and its grade (the
+    ///   Input's output for Main and the Input). A Colour range selects on the chroma of exactly
+    ///   this (`docs/algorithms/06` section 4), in the same axes, so a centre picked here selects
+    ///   the pixel that was clicked.
+    ///
+    /// See `signal_source` (`pipeline::thumbs`).
+    ///
+    /// # Errors
+    ///
+    /// [`RenderError`] for unusable data, a node the photo does not have, the Output, or a
+    /// cancelled job.
+    pub fn sample_chroma_at(
+        &self,
+        src: &PhotoSource,
+        node: Option<NodeId>,
+        tap: ChromaTap,
+        state: &ViewportState,
+        css: (f64, f64),
+        cancel: &CancelToken,
+    ) -> Result<Option<ChromaSample>, RenderError> {
+        let tap = match tap {
+            ChromaTap::WarpInput => Tap::WarpInput,
+            ChromaTap::NodeInput => Tap::NodeInput,
+        };
+        let (src, stage) = signal_source(src, node, tap)?;
+        let Some((rgb, grade, at)) = self.point_reading(&src, state, css, false, cancel)? else {
             return Ok(None);
         };
-        let [a, b] = chroma_of(grade.chain.trace(rgb).c9_logc4);
+        let [a, b] = chroma_of(stage.of(&grade.chain.trace_at(rgb, at)));
         Ok(Some(ChromaSample { a, b }))
     }
 
@@ -2622,7 +3976,7 @@ impl Renderer {
         let Some((fx, fy)) = state.final_point_at(image, css) else {
             return Ok(None);
         };
-        let geom = job.geometry();
+        let geom = job.geometry()?;
         let Some(o) = geom.final_to_oriented((plan.out_w, plan.out_h), fx, fy) else {
             return Ok(None);
         };
@@ -2642,6 +3996,55 @@ impl Renderer {
             (ay / plan.height as f64).clamp(0.0, 1.0),
         ];
         Ok(Some(sensor_to_oriented(geom.exif_orientation, area)))
+    }
+
+    /// Maps points between the photo frame and the cell (`viewport_map_points`, `docs/23` sections 3.6 and 9):
+    /// the handles and outlines the page draws over the photo, and the place a drag lands on.
+    ///
+    /// * [`MapFrom::Photo`]: each point `[x, y]` is in the photo frame (the photo as the camera oriented it,
+    ///   after the camera's own lens corrections, before the lens character's bend, the crop, the
+    ///   straightening and the turn); the answer is where it is drawn, in CSS pixels from the cell's corner,
+    ///   through the user's turn, the lens's bend and its zoom, the straightening, the crop and the view's zoom
+    ///   and pan. It may lie outside the cell, and is `None` only for a point that is not a number.
+    /// * [`MapFrom::Cell`]: each point is a CSS point of the cell; the answer is its place in the photo frame
+    ///   (the same chain the other way), `None` on the paper (outside the picture, or in the empty corner a
+    ///   straightening leaves).
+    ///
+    /// The place is the one the colour pass gives a pixel (`SamplerGrid::photo_at`): a Radial's centre is
+    /// drawn where this answers for it.
+    ///
+    /// # Errors
+    ///
+    /// [`RenderError`] for unusable data, a lens that cannot be prepared or a cancelled job.
+    pub fn map_points(
+        &self,
+        src: &PhotoSource,
+        state: &ViewportState,
+        from: MapFrom,
+        points: &[[f64; 2]],
+        cancel: &CancelToken,
+    ) -> Result<Vec<Option<[f64; 2]>>, RenderError> {
+        let mut job = Job::new(self, src, cancel)?;
+        let plan = job.plan()?;
+        let buffer = (plan.out_w, plan.out_h);
+        let image = job.final_size()?;
+        let geom = job.geometry()?;
+        Ok(points
+            .iter()
+            .map(|&[x, y]| match from {
+                MapFrom::Photo => {
+                    let at = geom.oriented_to_final(buffer, [x, y])?;
+                    state.css_point_at(image, at).map(|(cx, cy)| [cx, cy])
+                }
+                MapFrom::Cell => {
+                    if !(x.is_finite() && y.is_finite()) {
+                        return None;
+                    }
+                    let at = state.final_point_at(image, (x, y))?;
+                    geom.final_to_oriented(buffer, at.0, at.1)
+                }
+            })
+            .collect())
     }
 
     /// Renders the photo at full resolution (`docs/01` "Export: full resolution"), tile by tile: the
@@ -2755,7 +4158,7 @@ impl Renderer {
         }
         let plan = job.plan()?;
         // Which geometry the target asks for (see [`FullTarget`]).
-        let baked = job.geometry().at_full_resolution();
+        let baked = job.geometry()?.at_full_resolution();
         let (geom, window) = match request.target {
             FullTarget::DisplayLinear(_) => (baked, None),
             FullTarget::DngLinearAwg4 if baked.is_unrotated() => {
@@ -2781,7 +4184,37 @@ impl Renderer {
         // The options of this render are the ones of the moment it began (a device attached while
         // an export runs cannot move half of it onto another device).
         let tile = job.options().full_tile_px.max(64);
-        let halo_allowance = 160usize;
+        // The raw stages' halo, and the lens's (`docs/21` section 3: the raw region of a tile is grown by
+        // it; 0 without a lens), and the lens's bend: a tile's source rectangle is the box of its bent
+        // edge, a fraction of the tile larger (the shrink at the sides is at most 1.25: a quarter).
+        let bend = if baked.warp.is_some() {
+            tile / 4 + 8
+        } else {
+            0
+        };
+        // The Film nodes of the chain read the photo wider than the pixels they make (`film_pass`).
+        let grade_for_film = job.grade(
+            match request.target {
+                FullTarget::DisplayLinear(t) => t,
+                FullTarget::DngLinearAwg4 | FullTarget::DngPreview => OutputTarget::Srgb,
+            },
+            false,
+        )?;
+        let film_extent = {
+            let (fw, fh) = geom.output_size(plan.out_w, plan.out_h);
+            Area::whole(fw, fh)
+        };
+        let film_render = FilmRender::build(
+            &job,
+            &grade_for_film.chain,
+            film_extent,
+            match request.target {
+                FullTarget::DisplayLinear(t) => t,
+                FullTarget::DngLinearAwg4 | FullTarget::DngPreview => OutputTarget::Srgb,
+            },
+        )?;
+        let film_halo = film_render.as_ref().map_or(0, FilmRender::total_halo);
+        let halo_allowance = 160usize + job.lens_halo()? + bend + film_halo;
         let per_px = 12u64 * 12; // twelve f32 planes of working set per tile pixel, a generous bound
         let working = ((tile + halo_allowance) as u64).pow(2) * per_px;
         let frame_extra = job.frame()?.extra_bytes() as u64;
@@ -2791,23 +4224,28 @@ impl Renderer {
             (plan.width * plan.height * 4) as u64
         };
         let output = (fw * fh * 12) as u64;
-        let _reservation = self
+        let mut reservation = self
             .ledger()
-            .try_reserve(output + working + frame_extra + sigma_map)
+            .reserve_reclaiming(output + working + frame_extra + sigma_map, Some(src.id))
             .map_err(|_| RenderError::Memory)?;
         // The DNG's pixels and preview are made for sRGB, the display its fitted profile emulates: a
-        // chain whose display rendering is not ours (a look with its own, an imported display LUT)
-        // inverts it from sRGB for the pixels.
+        // chain whose display rendering is not ours (a look with its own) inverts it from sRGB for the
+        // pixels.
         let target_out = match request.target {
             FullTarget::DisplayLinear(t) => t,
             FullTarget::DngLinearAwg4 | FullTarget::DngPreview => OutputTarget::Srgb,
         };
         let grade = job.grade(target_out, false)?;
         let grid = geom.grid((plan.out_w, plan.out_h), (fw, fh));
-        let mut rgb = vec![0.0f32; fw * fh * 3];
-        let threads = job.options().threads;
-        let strict = job.options().gpu_strict;
-        let tiles_total = (fw.div_ceil(tile) * fh.div_ceil(tile)).max(1);
+        // The raster masks of the nodes are made over each tile grown by their receptive field (`docs/algorithms/06`
+        // section 5.2) and cut: a tile is sampled, guided and coloured over `grown` and its pixels are the window.
+        let frame_area = Area::whole(fw, fh);
+        // The scheduler's schedule of the chain (`ym_color::schedule`): the masks' planes and the Film nodes.
+        let schedule = grade
+            .chain
+            .schedule(1.0 / grid.sampler_grid().photo_frame().pixel, &|id| {
+                film_render.as_ref().and_then(|f| f.reach_of(id))
+            });
         // The colour stage of a DNG's renders runs on the device when the export tail is on; the
         // frame stays on the host. A device error there, or in the raw chain, makes the whole render
         // again on the CPU: one file is wholly device or wholly CPU, never a mix of tiles.
@@ -2816,7 +4254,25 @@ impl Renderer {
         } else {
             None
         };
+        // Tiles equal the whole frame, so a tile may be any size: one whose grown window would pass the design
+        // binding is made smaller (`docs/17-gpu.md` section 4). The Film nodes read their halos beyond the masks'.
+        let tile = fit_tile(&schedule, (fw, fh), tile);
+        // A tile of a Film node is read that much wider on every side, so a small tile spends most of its work on
+        // the halo: the CPU's tiles are larger (tiles equal the whole frame, so the size is free). The device's are
+        // held to the design binding above, which a larger tile would pass.
+        let tile = if film_render.is_some() && tile >= FILM_TILE_FROM_PX && device_colour.is_none()
+        {
+            tile.max(FILM_TILE_PX)
+        } else {
+            tile
+        };
+        let mut rgb = vec![0.0f32; fw * fh * 3];
+        let threads = job.options().threads;
+        let strict = job.options().gpu_strict;
+        let tiles_total = (fw.div_ceil(tile) * fh.div_ceil(tile)).max(1);
         let colour_on_device = device_colour.is_some();
+        // The Film nodes as the device runs them (the same steps as the CPU's `film_render`).
+        let film_stack = film_render.as_ref().map(|f| Arc::new(f.device_stack()));
         let spec = JobSpec::new(Priority::Export).owned_by(u64::from(src.id.0));
         let mut best_fraction = 0.0f32;
         'render: loop {
@@ -2829,14 +4285,25 @@ impl Renderer {
                     job.check()?;
                     gate()?;
                     let tw = tile.min(fw - ox);
-                    if let Some((x0, y0, x1, y1)) = grid.source_bounds(ox, oy, tw, th, 3) {
+                    let tile_area = Area {
+                        x: ox as i64,
+                        y: oy as i64,
+                        w: tw,
+                        h: th,
+                    };
+                    let grown = schedule.infer(tile_area, &frame_area).source;
+                    let (gx, gy) = (grown.x as usize, grown.y as usize);
+                    if grid.source_bounds(ox, oy, tw, th, 3).is_some()
+                        && let Some((x0, y0, x1, y1)) =
+                            grid.source_bounds(gx, gy, grown.w, grown.h, 3)
+                    {
                         let rect = Rect::new(x0, y0, x1 - x0, y1 - y0);
                         // With the colour stage on the device the raw chain's tile may stay there
                         // (`Job::region_resident`); with the CPU colouring it the host's is wanted.
                         let region = if device_colour.is_some() {
-                            job.region_resident(rect)
+                            job.lens_region_resident(rect)
                         } else {
-                            job.region(rect, false).map(TileImage::Host)
+                            job.lens_region(rect, false).map(TileImage::Host)
                         };
                         let region = match region {
                             Ok(region) => region,
@@ -2859,10 +4326,12 @@ impl Renderer {
                                     image,
                                     (x0, y0),
                                     grid_s,
+                                    (fw, fh),
                                     (ox, oy),
                                     tw,
                                     th,
                                     Arc::clone(&grade.chain),
+                                    film_stack.clone(),
                                     stop,
                                 ),
                                 TileImage::Host(image) => colour_tile_to_host(
@@ -2870,10 +4339,12 @@ impl Renderer {
                                     export_tail::shared(image),
                                     (x0, y0),
                                     grid_s,
+                                    (fw, fh),
                                     (ox, oy),
                                     tw,
                                     th,
                                     Arc::clone(&grade.chain),
+                                    film_stack.clone(),
                                     stop,
                                 ),
                             };
@@ -2898,10 +4369,73 @@ impl Renderer {
                                         .to_owned(),
                                 ));
                             };
-                            let sampled =
-                                sample_to_camera(&region, (x0, y0), &grid, (ox, oy), tw, th);
-                            let frame = Frame::planar(tw, th, &sampled.img.data)
-                                .map_err(|e| RenderError::Color(e.to_string()))?;
+                            let sampled_grown = sample_to_camera(
+                                &region,
+                                (x0, y0),
+                                &grid,
+                                (gx, gy),
+                                grown.w,
+                                grown.h,
+                            );
+                            let sampler_grid = grid.sampler_grid();
+                            // The raster planes of the tile, from the picture over the grown area; with a Film
+                            // node, over the wider area its first node reads, and its nodes' pictures.
+                            let rasters = match &film_render {
+                                Some(film) => {
+                                    let wide = film.read_area(tile_area);
+                                    let planes = cpu_rasters(
+                                        &grade.chain,
+                                        &sampled_grown,
+                                        Some(&sampler_grid),
+                                        (gx, gy),
+                                        (frame_area, grown, wide),
+                                    )
+                                    .map(|p| (p, wide));
+                                    let cover = Cover {
+                                        sampled: &sampled_grown,
+                                        area: grown,
+                                        grid: Some(&sampler_grid),
+                                        grid_off: (gx, gy),
+                                    };
+                                    let films = film.planes(
+                                        &mut job,
+                                        tile_area,
+                                        &cover,
+                                        planes.as_ref().map(|(p, a)| (p, *a)),
+                                    )?;
+                                    Some(Planes::Film(OwnedPlanes {
+                                        rasters: planes,
+                                        films,
+                                        origin: (ox as i64, oy as i64),
+                                    }))
+                                }
+                                None => cpu_rasters(
+                                    &grade.chain,
+                                    &sampled_grown,
+                                    Some(&sampler_grid),
+                                    (gx, gy),
+                                    (frame_area, grown, tile_area),
+                                )
+                                .map(Planes::Raster),
+                            };
+                            // The tile's own pixels of the sampled picture.
+                            let sampled = if grown == tile_area {
+                                sampled_grown
+                            } else {
+                                crop_sampled(&sampled_grown, ox - gx, oy - gy, tw, th)
+                            };
+                            // The mask shapes of the nodes are placed in the photo frame: this tile's
+                            // pixels are the grid's from (ox, oy).
+                            let positions =
+                                photo_positions_of(&grade.chain, Some(&sampler_grid), (ox, oy));
+                            let frame = with_rasters(
+                                with_photo(
+                                    Frame::planar(tw, th, &sampled.img.data)
+                                        .map_err(|e| RenderError::Color(e.to_string()))?,
+                                    &positions,
+                                ),
+                                &rasters,
+                            );
                             let mut out = vec![0.0f32; 3 * tw * th];
                             match request.target {
                                 FullTarget::DisplayLinear(_) | FullTarget::DngPreview => grade
@@ -2959,6 +4493,8 @@ impl Renderer {
         };
         let fell_back_to_cpu = job.gpu_restarted();
         let report = job.finish(1, device, target_out);
+        // The working set goes with the render; the picture stays counted while the caller holds it.
+        let held = crate::scheduler::Held::new(reservation.split_off(output));
         Ok(Attempt::Done(Box::new(FullImage {
             width: fw,
             height: fh,
@@ -2967,6 +4503,7 @@ impl Renderer {
             window,
             report,
             fell_back_to_cpu,
+            held,
         })))
     }
 }
@@ -3472,14 +5009,15 @@ mod sampler_tests {
         for exif in 1..=8u16 {
             for turns in 0..4u8 {
                 for angle in [0.0, 4.0, -17.5] {
-                    let settings = DevelopSettings {
-                        orientation: match turns {
+                    let settings = {
+                        let mut s = DevelopSettings::default();
+                        s.input_mut().orientation = match turns {
                             0 => Orientation::Deg0,
                             1 => Orientation::Deg90,
                             2 => Orientation::Deg180,
                             _ => Orientation::Deg270,
-                        },
-                        crop: Some(Crop {
+                        };
+                        s.input_mut().crop = Some(Crop {
                             rect: NormRect {
                                 x: 0.04,
                                 y: 0.07,
@@ -3488,8 +5026,9 @@ mod sampler_tests {
                             },
                             angle_deg: angle,
                             aspect: CropAspect::Free,
-                        }),
-                        ..DevelopSettings::default()
+                            auto: false,
+                        });
+                        s
                     };
                     let g = Geometry::new(exif, &settings);
                     let own = g.at_full_resolution().output_size(bw, bh);

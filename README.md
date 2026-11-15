@@ -30,6 +30,14 @@ One raw file from a Sony A1: on the left as the camera renders it, on the right 
 |---|---|
 | ![The camera's own rendering of the photo](docs/images/readme/compare-sony.jpg) | ![The same raw file developed by Yellowmoon with the Signature look](docs/images/readme/compare-yellowmoon.jpg) |
 
+## Before and after
+
+Another A1 photo in the app on a Mac. Left: Auto set by Antigravity, with the Signature look. Right: Before (`\`), the camera's default rendering of the same raw file.
+
+| Auto by Antigravity, Signature | Before: camera default |
+|---|---|
+| ![The photo with Auto set by Antigravity and the Signature look](docs/images/readme/before-after-auto.jpg) | ![The same photo in the Before view, the camera's default rendering](docs/images/readme/before-after-before.jpg) |
+
 ## Why
 
 I like how ARRI looks, but I can't afford an ALEXA. I've used LUTs that smart people make, and they're hit-or-miss: a LUT is static, and it can't know what light a photo was taken in.
@@ -51,7 +59,11 @@ I don't intend to compete with existing raw processors or to replace any of them
 - Built-in looks, and a guided import of ARRI's free Look Library.
 - Exports JPEG, TIFF, PNG, and DNG with your look baked in.
 - A command-line tool, `ym`, with the same results as the app, for scripts and batch jobs.
-- On macOS 27 with Apple Intelligence, Auto can ask Apple's on-device model to fine-tune each photo (below).
+- Auto can ask a grader to fine-tune each photo: Apple's on-device model on macOS 27, or the Claude Code or Antigravity you have installed (below).
+- Nodes and masks, behind a button. The **Nodes** button turns a photo into a small graph (the Input, corrector nodes you add, the Output) so you can grade part of it: a corrector takes masks that are shapes (Linear, Radial), ranges of colour or brightness, painted strokes (Brush), the out-of-focus background, an object you click (found by SAM 2.1 small, bundled, run on your Mac's processor), or the main subject and people (Apple's Vision, on Macs that support it). Show mask (M) shows what a mask selects. The simple view stays the default, and nothing about nodes or masks is saved with a photo.
+- A Depth mask, from 0.2.2. **Add mask › Depth** selects by distance from the camera: the nearest part of the photo is fully selected, the farthest not at all, and everything in between is graded, from a depth map that Depth Anything V2-Small (bundled) makes from the photo on your Mac's processor. Click the photo with **Pick depth** to make the mask fade out just past that point, or use **Focus plane** to do the same at the camera's focus point. **Show depth** shows the map.
+- A Film node, from 0.2.1. **Add node › Film** makes a photo look as if it had been shot on a colour film, printed on paper and scanned. Pick one of 20 stocks (colour negative, cine negative and slide) and, if you want, a paper; set the exposure, the enlarger's filtering, halation and grain. It takes masks and links like any corrector, and `ym film list` lists the stocks for a `--settings` file. The profiles are modelled on the makers' published data: see the credits.
+- Mixers, from 0.2.3. **Add node** offers **Parallel** (adds the change each branch makes to the picture they started from), **Layer** (blends one branch over another through the mask of the node that feeds it: Normal, Add, Subtract, Multiply, Lighten, Darken or Difference, with an Opacity) and **Splitter and combiner** (grade the red, green and blue of a photo separately). Parallel and Layer add a corrector beside the selected node, as Resolve does. A settings file for `ym` can hold them.
 
 ## How the colour works
 
@@ -62,29 +74,27 @@ In short: estimate the light, translate what the Sony sensor recorded into what 
 3. **Sensor map.** A 3×3 matrix built for that light (blended by light type and colour temperature) turns white-balanced Sony RGB into the RGB an ALEV III sensor would have recorded. It is fitted from Weta's measured Sony spectral sensitivities and my own estimate of the ALEV III curves, which I publish.
 4. **ALEXA colour.** From there it follows the ALEXA's own path: ARRI's published camera matrices for 17 colour temperatures (interpolated in mired) into ARRI Wide Gamut 3, then Wide Gamut 4 and exposure. White balance, the sensor map and this step fold into one 3×3 matrix per photo, so colour changes are instant.
 5. **Grade and look.** The highlight range (where the camera's clipping point lands, up to an ALEXA's at EI 800), then LogC4 (ARRI's log encoding), where contrast, colour balance, curves and looks work as in a grading suite. A look is a CDL plus a 3D LUT; ARRI's free Look Library imports directly.
-6. **Display.** The ACES 2.0 output transform (or ARRI's own display LUT, once imported) renders the result for your screen or the export colour space.
+6. **Display.** Our own display rendering (a tone curve and a few colour terms, written as plain formulas) renders the result for your screen or the export colour space.
 
 The details, with every constant and gate, are in `docs/02-colour-pipeline.md`.
 
-## Auto with Apple Intelligence (macOS 27)
+## Auto grading
 
-On a Mac with Apple silicon, macOS 27 and Apple Intelligence turned on, Yellowmoon can ask Apple's on-device model to look at each photo and fine-tune four of Auto's values:
+Auto sets the exposure and the white of each photo by a fixed rule. That is **Default Auto**: it is the same on every computer and sends nothing anywhere. Beside it, another grader can look at each photo and fine-tune Auto's values: exposure, highlights, shadows, black level, contrast, warmth, tint, saturation and the colours of the shadows and highlights. Choose who grades in **Preferences › Auto grading**:
 
-- **Exposure:** a little brighter or darker than Yellowmoon's own Auto, by up to one stop.
-- **White:** the estimated white made a little warmer or cooler. The model never picks the Kelvin itself.
-- **Contrast** and **saturation**.
+- **Apple Intelligence** (a Mac with Apple silicon, macOS 27 and Apple Intelligence turned on): Apple's on-device model. It runs on your Mac and sends nothing anywhere. Yellowmoon uses only the on-device model, never Apple's cloud models.
+- **Claude Code** and **Antigravity (agy)**: the programs you installed and signed in to yourself. Yellowmoon runs them on your computer and hands them a small copy of each photo (768 pixels on the long side) and your instructions. The program sends them to its own service, Anthropic's or Google's, or the one you set it up to use, with your own account and plan; Yellowmoon makes no connection of its own and never touches your sign-in. The original file, its name and its place on disk stay on your computer. Antigravity is marked experimental.
 
 How it behaves:
 
-- It is on by default where it is available: **Preferences › Auto with Apple Intelligence**. Turn it off to use Yellowmoon's own Auto, the same on every computer.
-- It runs on your Mac and sends nothing anywhere. Yellowmoon uses only the on-device model, never Apple's cloud models, and never uses its answers to train anything.
-- A photo appears at once with Yellowmoon's own Auto. When the answer arrives, a second or a few later, its Auto values and the picture update, and the Automatic card on the Look tab says what Apple Intelligence did. Exports wait for the answers.
-- Only values you leave on Auto change. Anything you set by hand stays as you set it.
-- Answers can differ between Macs and after macOS updates. Every export records which Auto made it and, for Apple's, the model and the macOS version that answered (`ym:Auto` and `ym:AppleAuto` in its metadata).
-- On other Macs (Intel, macOS 14 to 26, or Apple Intelligence off or still downloading its model) the setting is not shown and Auto works as before.
-- `ym` follows the same setting. `ym render --apple-auto off` (or `on`) overrides it for one run, and `ym doctor` says whether it is available on this Mac and, if not, why.
+- Apple Intelligence is the default where it is available. Claude Code and Antigravity are never chosen for you: the first time you choose one, Yellowmoon says what is sent and where, and asks you to agree. Cancel keeps the previous choice. A row for a program that is installed but not usable is listed greyed out and says why, for example "Not signed in".
+- A photo appears at once with Default Auto. When the answer arrives, a second or a few later, its Auto values and the picture update, and the Automatic card on the Look tab says who graded it. Exports wait for the answers. A photo whose answer fails keeps Default Auto's values.
+- Only values you leave on Auto change. Anything you set by hand stays as you set it. Your own instructions, in Preferences, go to whichever grader you chose.
+- Answers can differ. Apple's model gives the same answer on one Mac and macOS version, but Claude Code and Antigravity have no seed, so the same photo can be graded differently from run to run. Every export records which Auto made it and the model that answered (`ym:Auto` and `ym:AutoAdvisor` in its metadata), and its settings pin the values, so rendering from them gives the same picture.
+- A grader that is not there is not shown, or is greyed out, and Auto works as before.
+- `ym` follows the same setting and the same consent. `ym render --auto-provider claude` (or `apple`, `agy`, `yellowmoon`) chooses for one run; naming a program is your agreement to send photos to it for that run, and nothing is saved. `ym doctor` says what is available and, if not, why. `--apple-auto on` and `off` still work.
 
-This is a first version: how much each answer moves a photo is still being tuned. The details are in `docs/19-apple-auto.md`.
+This is a first version: how much each answer moves a photo is still being tuned. The details are in `docs/22-auto-providers.md` and, for Apple's model, `docs/19-apple-auto.md`.
 
 ## Install
 
@@ -133,15 +143,35 @@ Bugs in the Windows build go to [this fork's issues](https://github.com/shawnzeb
 
 ```
 ym render ~/Pictures/2026-10-04 --look neutral --format jpeg --long-edge 3000
-ym info DSC04204.ARW --json
-ym render DSC04204.ARW --apple-auto off      # Yellowmoon's own Auto, the same on every computer
+ym info DSC04204.ARW
+ym render DSC04204.ARW --auto-provider yellowmoon   # Default Auto, the same on every computer
+ym render DSC04204.ARW --auto-provider claude       # Claude Code grades it (sends a small copy of the photo to Anthropic)
 ym looks import ~/Downloads/<ARRI look package>.zip
+ym render DSC04204.ARW --settings graph.json        # settings that need more than the flags: other nodes, masks, links
+                                                    # (an export's XMP holds a photo's settings as ym:Settings, in the same form)
+ym doctor                                           # the Masks line lists the kinds of mask this computer can make
 ```
+
+From 0.2.0 a photo's settings are a graph of nodes (the Input, node 1 Main, any other nodes, the Output): each flag sets a field of one of them, and `--settings` takes the whole graph, or only the part you change. A file that adds a second node, Sky, with a Linear mask and a cooler trim:
+
+```json
+{ "nodes": { "items": [
+    { "id": 2, "kind": "corrector", "name": "Sky", "trim": { "temperature": -18 },
+      "masks": { "items": [ { "kind": "linear", "center": [0.5, 0.2], "feather": 0.25 } ] } } ],
+  "links": [
+    { "from": { "node": "input", "port": "picture" }, "to": { "node": 1, "port": "picture" } },
+    { "from": { "node": 1, "port": "picture" }, "to": { "node": 2, "port": "picture" } },
+    { "from": { "node": 2, "port": "picture" }, "to": { "node": "output", "port": "picture" } } ] } }
+```
+
+A mask of the kinds `object`, `subject`, `people`, `background` and `depth` is found from the photo when `ym` exports it, so the same file gives the same mask in the app; `subject` and `people` need a Mac that supports Apple's Vision, and a photo that needs a mask this computer cannot make fails with a sentence that says what to do, and is not written. `ym doctor` prints a **Masks** line with the kinds this computer can make and why it cannot make the others. A settings file in the form of Yellowmoon 0.1 is refused with a sentence that says so, and `ym render --json` and `ym info --json` print settings in the new form. `docs/10-cli.md` has the rest.
 
 ## Licence and credits
 
-Apache-2.0. Model weights in `data/models/` carry the licence their model card states (a model trained on ShareAlike data is CC BY-SA 4.0, with its own `LICENSE` file). See `NOTICE` for third-party data and credits, including ARRI's published ALEXA colour matrices (via the Academy's aces-dev, AMPAS licence) and Weta's Sony sensor measurements (rawtoaces-data, Apache-2.0).
+Apache-2.0. Model weights in `data/models/` carry the licence their model card states (a model trained on ShareAlike data is CC BY-SA 4.0, with its own `LICENSE` file). See `NOTICE` for third-party data and credits, including Meta's SAM 2.1 small weights for Object masks (Apache-2.0), the Depth Anything V2-Small weights for Depth masks (Apache-2.0), ARRI's published ALEXA colour matrices (via the Academy's aces-dev, AMPAS licence) and Weta's Sony sensor measurements (rawtoaces-data, Apache-2.0).
 
 This product includes DNG technology under license by Adobe.
+
+Film profiles by [Andrea Volpato (spektrafilm)](https://github.com/andreavolpato/spektrafilm), [CC BY-SA 4.0](https://creativecommons.org/licenses/by-sa/4.0/). The Film node reads them as unmodified data files; Yellowmoon uses none of spektrafilm's code, and its engine is our own. The profiles were made from the makers' published data sheets. Modelled on published data. Not affiliated with Kodak or Fujifilm. Kodak, Portra, Ektar, Vision3, Ektachrome, Kodachrome, Fujifilm, Velvia and the other film and paper names shown are trademarks of their owners.
 
 Yellowmoon is not affiliated with ARRI or Sony. ARRI and ALEXA are trademarks of ARRI AG; Sony is a trademark of Sony Group Corporation. ARRI's looks are never included with Yellowmoon: you download them from ARRI and the app imports them.

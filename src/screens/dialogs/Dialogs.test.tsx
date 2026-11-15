@@ -2,9 +2,11 @@ import { act, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { MockOptions } from "../../api.mock";
 import { FAILURE_ZIPS, PACKAGE_ZIPS } from "../../api.mock";
+import { FILM_CREDIT, FILM_CREDIT_NAME, FILM_CREDIT_URL } from "../../fixtures/filmCredit";
 import { openPhotos, renderApp } from "../../test/harness";
 import { updater } from "../../updater";
 import type { Harness } from "../../test/harness";
+import { nextOpener } from "./Overlays";
 
 let h: Harness | undefined;
 afterEach(() => {
@@ -31,10 +33,14 @@ const sw = (dialog: HTMLElement, name: string): HTMLElement => within(dialog).ge
 describe("Preferences (⌘,)", () => {
   it("opens from Start with one row for each preference of docs/11", async () => {
     const dialog = await openPreferences();
-    for (const row of ["Default look", "Display rendering", "Export defaults", "Remove location from exports", "Watch Downloads during import", "Check for updates automatically", "Command-line tool"]) {
+    for (const row of ["Default look", "Export defaults", "Remove location from exports", "Watch Downloads during import", "Check for updates automatically", "Command-line tool"]) {
       expect(within(dialog).getByRole("group", { name: row })).toBeInTheDocument();
     }
     expect(within(dialog).getByRole("heading", { level: 2, name: "Preferences" })).toBeInTheDocument();
+    // ARRI's display LUT is not a rendering Yellowmoon offers (owner's decision of 2026-10-29): no row, no choice.
+    expect(within(dialog).queryByRole("group", { name: "Display rendering" })).toBeNull();
+    expect(within(dialog).queryByRole("radiogroup", { name: "Display rendering" })).toBeNull();
+    expect(within(dialog).queryByText(/display LUT/i)).toBeNull();
     expect(within(dialog).getByRole("combobox", { name: "Default look" })).toHaveTextContent("Neutral");
     expect(sw(dialog, "Remove location from exports")).toHaveAttribute("aria-checked", "false");
     expect(sw(dialog, "Watch Downloads during import")).toHaveAttribute("aria-checked", "false");
@@ -56,19 +62,19 @@ describe("Preferences (⌘,)", () => {
     await waitFor(() => expect(h!.store.currentPhoto()?.picked).toBe(false));
   });
 
-  it("leaves the panel behind alone when ⌘1 to ⌘6 are pressed over it", async () => {
+  it("leaves the panel behind alone when ⌘1 to ⌘7 are pressed over it", async () => {
     h = renderApp({ current: 3 });
     await openPhotos(h);
     await h.user.keyboard("{Meta>}e{/Meta}");
     expect(await screen.findByRole("complementary", { name: "Export" })).toBeInTheDocument();
     await h.user.keyboard("{Meta>},{/Meta}");
     await screen.findByRole("dialog", { name: "Preferences" });
-    await h.user.keyboard("{Meta>}3{/Meta}");
+    await h.user.keyboard("{Meta>}4{/Meta}");
     expect(h.store.getState().panel).toBe("export");
     expect(screen.getByRole("complementary", { name: "Export" })).toBeInTheDocument();
     // Once the dialog is closed the shortcut works again.
     await h.user.keyboard("{Escape}");
-    await h.user.keyboard("{Meta>}3{/Meta}");
+    await h.user.keyboard("{Meta>}4{/Meta}");
     await waitFor(() => expect(h!.store.getState().panel).toBe("tools"));
     expect(screen.getByRole("tab", { name: "Colour", selected: true })).toBeInTheDocument();
   });
@@ -100,6 +106,20 @@ describe("Preferences (⌘,)", () => {
     await openPreferences();
     await h!.user.click(document.querySelector('[data-slot="dialog-overlay"]') as HTMLElement);
     expect(screen.queryByRole("dialog")).toBeNull();
+  });
+
+  it("has one \"Single-key shortcuts\" switch, on by default, with its line, that saves the preference (docs/28 A-P11)", async () => {
+    const dialog = await openPreferences();
+    const row = sw(dialog, "Single-key shortcuts");
+    expect(row).toHaveAttribute("aria-checked", "true");
+    expect(within(dialog).getAllByRole("switch", { name: "Single-key shortcuts" })).toHaveLength(1);
+    expect(within(dialog).getByText("Turn off if you use speech input or a screen reader. Every action stays in the menu bar.")).toBeInTheDocument();
+    expect((await h!.api.preferencesGet()).single_key_shortcuts).toBe(true);
+    await h!.user.click(row);
+    expect((await h!.api.preferencesGet()).single_key_shortcuts).toBe(false);
+    expect(sw(dialog, "Single-key shortcuts")).toHaveAttribute("aria-checked", "false");
+    await h!.user.click(sw(dialog, "Single-key shortcuts"));
+    expect((await h!.api.preferencesGet()).single_key_shortcuts).toBe(true);
   });
 
   it("saves each switch as soon as it is flipped, and shows it again next time", async () => {
@@ -150,23 +170,6 @@ describe("Preferences (⌘,)", () => {
     await waitFor(async () => expect((await h!.api.preferencesGet()).default_look).toBe("arri:3000:film-warm-logc3"));
   });
 
-  it("offers ARRI's display rendering only once display LUTs are imported", async () => {
-    const dialog = await openPreferences({ looksImported: false });
-    const group = within(dialog).getByRole("radiogroup", { name: "Display rendering" });
-    expect(within(group).getByRole("radio", { name: "ARRI's display rendering, not imported" })).toBeDisabled();
-    expect(within(dialog).getByText("Import ARRI's display LUTs to use them here.")).toBeInTheDocument();
-    await act(async () => {
-      await h!.api.looksImport(`~/Downloads/${PACKAGE_ZIPS.display_luts_logc4}`);
-    });
-    await h!.store.refreshDisplayLuts();
-    const arri = await within(dialog).findByRole("radio", { name: "ARRI's display rendering" });
-    expect(arri).toBeEnabled();
-    await h!.user.click(arri);
-    await waitFor(async () => expect((await h!.api.preferencesGet()).display_rendering).toEqual({ kind: "arri_display", id: "arri-display:logc4:rec709-g24" }));
-    await h!.user.click(within(dialog).getByRole("radio", { name: "Ours · ACES 2" }));
-    await waitFor(async () => expect((await h!.api.preferencesGet()).display_rendering).toEqual({ kind: "aces2" }));
-  }, 20_000);
-
   it("edits the export defaults with the options of the Export panel, without photos or a command line", async () => {
     const dialog = await openPreferences();
     await h!.user.click(within(dialog).getByRole("button", { name: "Edit…" }));
@@ -202,6 +205,50 @@ describe("Preferences (⌘,)", () => {
   });
 });
 
+describe("focus return from About (docs/28 F3, A-04)", () => {
+  /** ⌘, from the Open files button, then About from Preferences' footer: About replaces Preferences. */
+  async function aboutFromPreferences(): Promise<HTMLElement> {
+    await start();
+    const opener = screen.getByRole("button", { name: "Open files ⌘O" });
+    opener.focus();
+    await h!.user.keyboard("{Meta>},{/Meta}");
+    const preferences = await screen.findByRole("dialog", { name: "Preferences" });
+    await waitFor(() => expect(within(preferences).queryByText("Loading your preferences…")).toBeNull());
+    await h!.user.click(within(preferences).getByRole("button", { name: "About Yellowmoon" }));
+    await screen.findByRole("dialog", { name: "About Yellowmoon" });
+    return opener;
+  }
+
+  it("returns to what opened Preferences on Esc", async () => {
+    const opener = await aboutFromPreferences();
+    await h!.user.keyboard("{Escape}");
+    expect(screen.queryByRole("dialog")).toBeNull();
+    await waitFor(() => expect(opener).toHaveFocus());
+  });
+
+  it("returns to what opened Preferences on Done", async () => {
+    const opener = await aboutFromPreferences();
+    await h!.user.click(within(screen.getByRole("dialog", { name: "About Yellowmoon" })).getByRole("button", { name: "Done" }));
+    expect(screen.queryByRole("dialog")).toBeNull();
+    await waitFor(() => expect(opener).toHaveFocus());
+  });
+
+  it("starts About on Done, not on the Preferences it replaced", async () => {
+    await aboutFromPreferences();
+    const about = screen.getByRole("dialog", { name: "About Yellowmoon" });
+    await waitFor(() => expect(within(about).getByRole("button", { name: "Done" })).toHaveFocus());
+  });
+
+  it("nextOpener keeps the first opener while one dialog replaces another, and drops it when none is open", () => {
+    const first = document.createElement("button");
+    const second = document.createElement("button");
+    expect(nextOpener({ overlay: null, opener: null }, "preferences", first)).toBe(first);
+    expect(nextOpener({ overlay: "preferences", opener: first }, "about", second)).toBe(first);
+    expect(nextOpener({ overlay: "about", opener: first }, null, second)).toBeNull();
+    expect(nextOpener({ overlay: null, opener: null }, "about", second)).toBe(second);
+  });
+});
+
 describe("About", () => {
   async function openAbout(): Promise<HTMLElement> {
     await start();
@@ -227,6 +274,16 @@ describe("About", () => {
     expect(
       within(dialog).getByText("Not affiliated with ARRI or Sony. ARRI and ALEXA are trademarks of ARRI AG; Sony is a trademark of Sony Group Corporation."),
     ).toBeInTheDocument();
+  });
+
+  it("carries the film credit line with its two links and the trademark line (docs/24 section 4.6)", async () => {
+    const dialog = await openAbout();
+    const film = within(dialog).getByRole("region", { name: "Film" });
+    await waitFor(() => expect(film).toHaveTextContent(FILM_CREDIT));
+    expect(within(film).getByText("Kodak, Portra, Ektar, Vision3, Ektachrome, Kodachrome, Fujifilm, Velvia and the other film and paper names shown are trademarks of their owners.")).toBeInTheDocument();
+    await h!.user.click(within(film).getByRole("button", { name: FILM_CREDIT_NAME }));
+    await h!.user.click(within(film).getByRole("button", { name: "CC BY-SA 4.0" }));
+    expect(h!.api.system.opened).toEqual([FILM_CREDIT_URL, "https://creativecommons.org/licenses/by-sa/4.0/"]);
   });
 
   it("opens the project's page in the browser and closes with Done", async () => {
@@ -336,12 +393,12 @@ describe("the menu bar", () => {
   });
 });
 
-describe("Import .cube…", () => {
+describe("Import LUTs and look files…", () => {
   async function chooseCube(...files: string[]): Promise<HTMLElement> {
     await start({ looksImported: false });
     h!.api.queueChoice("files", files.map((f) => `~/LUTs/${f}`));
     act(() => h!.api.emitEvent("menu_action", { action: "import_cube" }));
-    return screen.findByRole("dialog", { name: "Import LUTs" });
+    return screen.findByRole("dialog", { name: "Import LUTs and look files" });
   }
 
   it("asks what the LUT expects as input, and imports it into Your LUTs", async () => {
@@ -405,19 +462,27 @@ describe("Import .cube…", () => {
   });
 
   it("starts on the Import button once there is nothing left to answer", async () => {
-    const dialog = await chooseCube(PACKAGE_ZIPS.display_luts_logc4);
+    const dialog = await chooseCube(PACKAGE_ZIPS.look_library_logc4);
     expect(within(dialog).getByRole("button", { name: "Import" })).toHaveFocus();
   });
 
   it("imports an ARRI package without asking, and lists a file that can't be used with the reason", async () => {
-    const dialog = await chooseCube(PACKAGE_ZIPS.display_luts_logc4, FAILURE_ZIPS.damagedLookFile);
-    expect(within(dialog).getByText(/Display LUTs · LogC4 · 22 \.cube\. It is imported as it comes\./)).toBeInTheDocument();
+    const dialog = await chooseCube(PACKAGE_ZIPS.look_library_logc4, FAILURE_ZIPS.damagedLookFile);
+    expect(within(dialog).getByText(/Look Library · LogC4 · log to log · 87 \.cube · 65-point\. It is imported as it comes\./)).toBeInTheDocument();
     expect(within(dialog).getByText("Damaged_Look.alf4 cannot be used. Its checksum does not match, so the file is damaged. Download it again.")).toBeInTheDocument();
     expect(within(dialog).queryByRole("radiogroup")).toBeNull();
     await h!.user.click(within(dialog).getByRole("button", { name: "Import" }));
     await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull(), { timeout: 8000 });
-    expect(await h!.api.looksDisplayLuts()).toHaveLength(22);
+    expect((await h!.api.looksList()).filter((l) => l.group.kind === "arri")).toHaveLength(87);
   }, 20_000);
+
+  it("says ARRI's display LUT package has nothing to import, and imports nothing from it", async () => {
+    const dialog = await chooseCube(FAILURE_ZIPS.displayLutsLogc4);
+    expect(within(dialog).getByText("This package has only display renderings. Yellowmoon uses its own rendering, so there is nothing to import.")).toBeInTheDocument();
+    expect(within(dialog).queryByRole("radiogroup")).toBeNull();
+    expect(within(dialog).getByRole("button", { name: "Import" })).toHaveAttribute("aria-disabled", "true");
+    expect(await h!.api.looksList()).toHaveLength(2);
+  });
 
   it("takes an ARRI Look File without a question: it says what it expects", async () => {
     const dialog = await chooseCube(FAILURE_ZIPS.ownAlf4c);
@@ -441,7 +506,7 @@ describe("Import .cube…", () => {
     expect(screen.queryByRole("dialog")).toBeNull();
     h!.api.queueChoice("files", [`~/LUTs/${FAILURE_ZIPS.ownCube}`]);
     act(() => h!.api.emitEvent("menu_action", { action: "import_cube" }));
-    const dialog = await screen.findByRole("dialog", { name: "Import LUTs" });
+    const dialog = await screen.findByRole("dialog", { name: "Import LUTs and look files" });
     await h!.user.click(within(dialog).getByRole("button", { name: "Cancel" }));
     expect(screen.queryByRole("dialog")).toBeNull();
     expect((await h!.api.looksList()).filter((l) => l.group.kind === "user")).toHaveLength(0);
@@ -451,7 +516,7 @@ describe("Import .cube…", () => {
     h = renderApp({ current: 3 });
     await openPhotos(h);
     h.api.queueChoice("files", [`~/LUTs/${FAILURE_ZIPS.ownCube}`]);
-    await h.user.click(screen.getByRole("button", { name: "Import .cube…" }));
-    expect(await screen.findByRole("dialog", { name: "Import LUTs" })).toBeInTheDocument();
+    await h.user.click(screen.getByRole("button", { name: "Import LUTs and look files…" }));
+    expect(await screen.findByRole("dialog", { name: "Import LUTs and look files" })).toBeInTheDocument();
   });
 });

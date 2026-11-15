@@ -1,6 +1,6 @@
 import { expect, test } from "@playwright/test";
 import type { Page } from "@playwright/test";
-import { mockQuery, openApp, openPhotos, watchErrors } from "./helpers/app";
+import { importLooks, mockQuery, openApp, openPhotos, watchErrors } from "./helpers/app";
 
 // Preferences (⌘,), About and the menu bar's items (M3-13) in a real browser against the mocked API. docs/11 §Preferences is
 // not mocked, so there is no screenshot to compare with; the layout rules are asserted instead.
@@ -16,7 +16,7 @@ test.describe("Preferences", () => {
     await page.keyboard.press("Meta+,");
     const dialog = page.getByRole("dialog", { name: "Preferences" });
     await expect(dialog).toBeVisible();
-    for (const row of ["Default look", "Display rendering", "Export defaults", "Remove location from exports", "Watch Downloads during import", "Check for updates automatically", "Command-line tool"]) {
+    for (const row of ["Default look", "Export defaults", "Remove location from exports", "Watch Downloads during import", "Check for updates automatically", "Single-key shortcuts", "Command-line tool"]) {
       await expect(dialog.getByRole("group", { name: row })).toBeVisible();
     }
     // A glasscn dialog: a glass pane with a 1 px rim and rounded corners, titled by an h2, over a dimmed window.
@@ -54,11 +54,11 @@ test.describe("Preferences", () => {
     await expect(focused).toHaveCSS("outline-offset", "2px");
   });
 
-  test("Import LUTs keeps the keyboard inside while its question is unanswered, and Esc still closes it", async ({ page }) => {
+  test("Import LUTs and look files keeps the keyboard inside while its question is unanswered, and Esc still closes it", async ({ page }) => {
     await openApp(page);
     await page.evaluate(() => window.__yellowmoon!.mockApi.queueChoice("files", ["~/LUTs/Warm_Film.cube"]));
     await menu(page, "import_cube");
-    const dialog = page.getByRole("dialog", { name: "Import LUTs" });
+    const dialog = page.getByRole("dialog", { name: "Import LUTs and look files" });
     await expect(dialog).toBeVisible();
     // Nothing says what Warm_Film.cube expects, so Import is locked (aria-disabled, still in the tab order).
     await expect(dialog.getByRole("button", { name: "Import" })).toHaveAttribute("aria-disabled", "true");
@@ -121,19 +121,33 @@ test.describe("Preferences", () => {
     await expect(page.locator(".ym-about-row", { hasText: "Default look" })).toContainText("Signature");
   });
 
-  test("the imported looks and the display choice persist as well", async ({ page }) => {
+  test("the imported looks persist as well, and a display choice kept by an earlier version is ignored without a word", async ({ page }) => {
     await page.goto(mockQuery({ mockPersist: 1, mockLooks: 0 }));
     await expect(page.locator("[data-screen]")).toBeVisible();
-    await page.evaluate(async () => {
-      const { mockApi } = window.__yellowmoon!;
-      await mockApi.looksImport("~/Downloads/ARRI_DisplayLUTs_LogC4.zip");
-      await mockApi.preferencesSet({ display_rendering: { kind: "arri_display", id: "arri-display:logc4:rec709-g24" } });
+    // Not `await mockApi.looksImport(...)` inside the evaluate below: see `importLooks`.
+    await importLooks(page, "~/Downloads/ARRI_LookLibrary_LogC4.zip");
+    await page.evaluate(() => {
+      // What an earlier version left in the page's storage: the choice of ARRI's display LUT, and the display package it imported.
+      const key = "yellowmoon.mock.state";
+      const stored = JSON.parse(localStorage.getItem(key) ?? "{}");
+      stored.preferences = { ...stored.preferences, display_rendering: { kind: "arri_display", id: "arri-display:logc4:rec709-g24" } };
+      stored.importedPackages = [...stored.importedPackages, "display_luts_logc4"];
+      localStorage.setItem(key, JSON.stringify(stored));
     });
     await page.reload();
     await expect(page.locator("[data-screen]")).toBeVisible();
+    await expect(page.getByRole("alert")).toHaveCount(0);
     await page.keyboard.press("Meta+,");
     const dialog = page.getByRole("dialog", { name: "Preferences" });
-    await expect(dialog.getByRole("radio", { name: "ARRI's display rendering" })).toHaveAttribute("aria-checked", "true");
+    await expect(dialog.getByRole("group", { name: "Default look" })).toBeVisible();
+    await expect(dialog.getByRole("group", { name: "Display rendering" })).toHaveCount(0);
+    await expect(dialog.getByRole("radio", { name: /display rendering/i })).toHaveCount(0);
+    const result = await page.evaluate(async () => {
+      const { mockApi } = window.__yellowmoon!;
+      return { preferences: await mockApi.preferencesGet(), arri: (await mockApi.looksList()).filter((l) => l.group.kind === "arri").length };
+    });
+    expect(result.preferences).not.toHaveProperty("display_rendering");
+    expect(result.arri).toBe(87);
   });
 
   test("the command-line tool: Install… links it and says where", async ({ page }) => {
@@ -192,14 +206,14 @@ test.describe("the menu bar", () => {
     await expect(page.getByText("The command-line tool is installed at /usr/local/bin/ym.")).toBeVisible();
   });
 
-  test("Import ARRI Looks… and Import .cube… open the wizard and the dialog", async ({ page }) => {
+  test("Import ARRI Looks… and Import LUTs and look files… open the wizard and the dialog", async ({ page }) => {
     await openApp(page);
     await menu(page, "import_arri_looks");
     await expect(page.getByRole("heading", { level: 1, name: "Choose what to import" })).toBeVisible();
     await page.getByRole("button", { name: "Cancel" }).click();
     await page.evaluate(() => window.__yellowmoon!.mockApi.queueChoice("files", ["~/LUTs/Warm_Film.cube"]));
     await menu(page, "import_cube");
-    await expect(page.getByRole("dialog", { name: "Import LUTs" })).toBeVisible();
+    await expect(page.getByRole("dialog", { name: "Import LUTs and look files" })).toBeVisible();
   });
 
   test("File, Edit and View items act on the photos", async ({ page }) => {
