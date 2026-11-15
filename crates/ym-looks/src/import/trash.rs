@@ -32,6 +32,12 @@ pub fn move_to_trash(path: &Path) -> Result<(), TrashError> {
     if std::fs::symlink_metadata(path).is_err() {
         return Err(TrashError::Missing(path.to_path_buf()));
     }
+    #[cfg(target_os = "ios")]
+    return Err(TrashError::Failed {
+        path: path.to_path_buf(),
+        reason: "Moving files to the Trash is not available on iPhone.".to_owned(),
+    });
+    #[cfg(not(target_os = "ios"))]
     ::trash::delete(path).map_err(|e| TrashError::Failed {
         path: path.to_path_buf(),
         reason: e.to_string(),

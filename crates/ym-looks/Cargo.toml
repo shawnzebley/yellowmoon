@@ -21,6 +21,7 @@ time.workspace = true
 zip.workspace = true
 # Cross-process file lock for `looks/.lock` (MIT OR Apache-2.0).
 fs4.workspace = true
+[target.'cfg(not(target_os = "ios"))'.dependencies]
 # Recoverable "Move to Trash" for the downloaded zip (MIT).
 trash = "5"
 

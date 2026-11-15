@@ -32,6 +32,14 @@ Data flow:
 2. **Editing.** A control change is a settings patch for one photo. The render graph re-runs only the stages the patch affects, and the viewport draws the new frame.
 3. **Export.** The export queue renders each photo at full resolution in tiles, and the writers in `ym-export` encode the file. The CLI and the app call the same function, so the bytes are the same.
 
+## iPhone preview (Windows fork)
+
+The SwiftUI app under `mobile/ios/` calls the `ym-mobile` Rust static library
+through a C interface. The bridge uses the same `ym-core` session, automatic
+develop and JPEG export as the desktop app. The initial iPhone build uses the
+CPU path, processes one photo at a time, and keeps temporary copies in the
+app cache. See [the iPhone build guide](../mobile/ios/README.md).
+
 ## Repository layout
 
 ```

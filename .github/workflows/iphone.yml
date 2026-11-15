@@ -1,0 +1,56 @@
+name: iPhone
+on:
+  pull_request:
+    paths:
+      - .github/workflows/iphone.yml
+      - mobile/ios/**
+      - crates/**
+      - data/**
+      - Cargo.toml
+      - Cargo.lock
+      - rust-toolchain.toml
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  simulator:
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - run: brew install xcodegen
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-about@0.9.2
+      - name: Check bridge on a synthetic Sony RAW
+        run: cargo test --locked --release -p ym-mobile
+      - name: Cross compile the engine and generate the Xcode project
+        run: mobile/ios/prepare.sh simulator
+      - name: Build the iPhone app
+        run: |
+          xcodebuild -project mobile/ios/Yellowmoon.xcodeproj -scheme Yellowmoon \
+            -configuration Release -sdk iphonesimulator -destination 'generic/platform=iOS Simulator' \
+            -derivedDataPath "$RUNNER_TEMP/Yellowmoon" ARCHS="$(uname -m)" CODE_SIGNING_ALLOWED=NO build
+      - name: Install and launch on an iPhone simulator
+        run: |
+          device="$(xcrun simctl list devices booted available -j | python3 -c '
+          import json, sys
+          devices = json.load(sys.stdin)["devices"].values()
+          print(next((d["udid"] for group in devices for d in group if d["name"].startswith("iPhone")), ""))')"
+          if [ -z "$device" ]; then
+            device="$(xcrun simctl list devices available -j | python3 -c '
+          import json, sys
+          devices = list(json.load(sys.stdin)["devices"].values())
+          print(next(d["udid"] for group in reversed(devices) for d in group if d["name"].startswith("iPhone")))')"
+            xcrun simctl boot "$device"
+          fi
+          xcrun simctl bootstatus "$device" -b
+          xcrun simctl install "$device" "$RUNNER_TEMP/Yellowmoon/Build/Products/Release-iphonesimulator/Yellowmoon.app"
+          xcrun simctl launch "$device" com.shawnzebley.yellowmoon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Yellowmoon-iPhone-Simulator
+          path: ${{ runner.temp }}/Yellowmoon/Build/Products/Release-iphonesimulator/Yellowmoon.app
+          if-no-files-found: error

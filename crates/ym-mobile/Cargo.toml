@@ -1,0 +1,23 @@
+[package]
+name = "ym-mobile"
+description = "Native mobile bridge for Yellowmoon's Sony RAW engine."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+publish = false
+
+[lib]
+crate-type = ["staticlib"]
+
+[dependencies]
+ym-core.workspace = true
+ym-export.workspace = true
+ym-looks.workspace = true
+ym-raw.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+ym-raw = { workspace = true, features = ["testgen"] }
