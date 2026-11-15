@@ -1,0 +1,39 @@
+{
+  "_header": {
+    "licence": "Apache-2.0",
+    "note": "Yellowmoon's own numbers, chosen by hand. Nothing here is taken from another program or fitted to a profile.",
+    "model": "Inter-layer inhibition by DIR couplers (Hunt, The Reproduction of Colour, 6th ed., chapter 15). Each layer's effective log10 exposure is lowered in proportion to the dye densities formed in the layers: log E'_i = log E_i - amount * sum_j M[i][j] * D_j. Row i is the layer that is inhibited, column j the layer whose density inhibits it. Order: red-sensitive (cyan dye), green-sensitive (magenta dye), blue-sensitive (yellow dye).",
+    "choice": "A moderate default: the inhibition between different layers (0.03 to 0.14) is larger than a layer's own (0.06), which is what makes saturated colours richer without changing a neutral ramp. The film's curves in the engine are the profile's curves without couplers, found so that a neutral ramp still reproduces the profile's density_curves for these numbers. The largest slope of any curve in the data is 0.9 density per decade, so 1 - sum_j M[i][j] * slope_j stays above 0.7 and the curves can always be undone.",
+    "amount": "FilmParams.coupler_amount scales the matrix. 1 is the profile's curves on a neutral ramp; 0 turns the couplers off and leaves the steeper curves without couplers."
+  },
+  "matrix": [
+    [
+      0.06,
+      0.12,
+      0.03
+    ],
+    [
+      0.14,
+      0.06,
+      0.1
+    ],
+    [
+      0.04,
+      0.14,
+      0.06
+    ]
+  ],
+  "diffusion": {
+    "note": "Pass P3 (docs/24 section 3.9). The inhibitor released by the developing dye spreads in the plane before it acts (Hunt chapter 15; James on adjacency and edge effects; Eberhard and Kostinsky effects, tens to hundreds of um). Chosen: a short Gaussian (sigma about 25 um, share 0.7) and a radial exponential tail with lambda = 100 um (share 0.3), the tail written as two Gaussians (sigma 0.55 and 1.7 lambda, shares 14.4 % and 85.6 %: the non-negative least-squares fit to exp(-r / lambda) in two dimensions, relative error within 32 % out to 3 lambda). The tail's inner Gaussian (55 um) is merged into the short one, which becomes 28 um with share 0.74. All sizes in micrometres on the film. The largest sigma, 170 um, sets the halo: 6 sigma = 1.0 mm.",
+    "shape": [
+      [
+        0.74,
+        28.0
+      ],
+      [
+        0.26,
+        170.0
+      ]
+    ]
+  }
+}

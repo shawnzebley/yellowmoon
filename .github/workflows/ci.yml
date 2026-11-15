@@ -9,13 +9,17 @@
 # is the place that is meant to run them, the job sets the matching YM_REQUIRE_* variable, which turns the skip into a failure:
 # YM_REQUIRE_GPU (gpu-lavapipe, ml-backends), YM_REQUIRE_EXTERNAL_TOOLS (dng), YM_REQUIRE_ORACLE (oracle, dng),
 # YM_REQUIRE_FIXTURES (spectral-fixtures), YM_REQUIRE_SYNTHETIC (synthetic-set), YM_REQUIRE_ORT (ml-backends),
-# YM_REQUIRE_PARITY_BIN and YM_REQUIRE_FORCE_DEMOSAIC (parity). The macOS `rust` job sets none of them.
+# YM_REQUIRE_PARITY_BIN and YM_REQUIRE_FORCE_DEMOSAIC (parity), YM_REQUIRE_SAM2 (sam2, gpu-lavapipe, parity: SAM 2.1's weights are
+# fetched there and every Object test runs in one of them), YM_REQUIRE_DEPTH (depth: Depth Anything's weights and oracle fixtures), and YM_REQUIRE_VISION (the macOS `rust` job's two Vision steps: the runner is
+# a Mac that runs Vision's requests, so "not supported" there is a failure). The rest of the macOS `rust` job sets none of them.
 name: CI
 
 on:
   push:
     branches: [main]
   pull_request:
+  # By hand on a feature branch that has no pull request yet (the nodes branch runs it before each checkpoint DMG).
+  workflow_dispatch:
   schedule:
     - cron: "17 3 * * *"   # nightly: full oracle corpus, private golden tier, fuzzing; also a fresh advisory check (the 500-photo latency is weekly: weekly.yml)
 
@@ -50,7 +54,7 @@ jobs:
 
   e2e:
     if: github.event_name != 'schedule'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04   # Playwright 1.56 has no browsers for 26.04; move back when Playwright supports it
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -60,6 +64,10 @@ jobs:
       - run: npm ci
       - run: npx playwright install --with-deps chromium
       - run: npm run e2e
+      # The production build, served by `vite preview`: xyflow's stylesheet and the chunking only behave as in the app there
+      # (the links that vanished after a drag, the grey picked link and the grab cursor passed on the dev server).
+      - name: e2e against the production build
+        run: npm run e2e:built
       - uses: actions/upload-artifact@v4
         if: failure()
         with:
@@ -82,6 +90,46 @@ jobs:
       - name: Clippy in the release profile
         run: cargo clippy --workspace --release -- -D warnings
       - run: cargo test --workspace
+      # Subject and People masks (docs/23 sections 3.10 and 4.5, N-19). The ordinary macOS image has the macOS 15 (or later) SDK, which has the Vision
+      # requests, so the Vision bridge (crates/ym-apple/swift/VisionMasks.swift) is compiled here, for this architecture, by the steps above; its own
+      # gate in crates/ym-apple/build.rs is separate from Apple Auto's (which needs the macOS 27 SDK and builds in apple-bridge.yml). Why here: the job
+      # builds on every push with no weights or fixtures to fetch, so the cheapest place to check the one thing only a Mac can: that the Swift compiles
+      # and links, carries the two ym_apple_mask_* symbols and runs. The steps below only show what `cargo test --workspace` already ran: the probe
+      # (each request on a 64 x 64 picture), a real Subject and People request on a test picture twice with equal bytes, the doctor's Masks line, and the
+      # app's path against the binary with this Mac's own Vision (tests/parity.rs, `with_this_computers_vision`). The macos-15 and macos-26 runners (macos-latest
+      # is one of them) are virtual Macs that do run the requests (a 768 x 512 mask in about 0.7 s, equal bytes twice; the numbers are in docs/STATUS.md), so the
+      # two steps below set YM_REQUIRE_VISION: a "not supported" answer from the real provider fails them, where on a computer without Vision (a developer's
+      # Linux box, the macos-14 runner of apple-bridge.yml, which is not asked to) the same tests print the answer plainly and pass. The tests that play
+      # Vision with a fake (tests/mask_vision.rs) do not read it. `cargo test --workspace` above sets nothing.
+      - name: The Vision bridge is in the binary (nm)
+        run: |
+          cargo build -p ym-apple --examples
+          nm target/debug/examples/probe | grep -E ' _ym_apple_mask_(probe|make)$' | tee nm-vision.txt
+          test "$(wc -l < nm-vision.txt)" -eq 2
+      - name: What Vision says on this runner (probe, request on a test picture, twice)
+        env:
+          YM_REQUIRE_VISION: "1"   # the ym-apple test below fails on "not supported"; the greps do the same for the probe's own output
+        run: |
+          target/debug/examples/probe | tee probe-vision.txt
+          grep -q '^Vision bridge built: yes' probe-vision.txt
+          grep -q '^Vision Subject: supported' probe-vision.txt
+          grep -q '^Vision People: supported' probe-vision.txt
+          # (Not `! grep ...`: bash's -e does not stop a script at an inverted command, so that form would never fail.)
+          if grep -E '^Vision (Subject|People): (not supported|supported, and the request failed)' probe-vision.txt; then
+            echo "Vision does not run its requests on this runner, and YM_REQUIRE_VISION is set"
+            exit 1
+          fi
+          if grep -q 'repeated: NO' probe-vision.txt; then
+            echo "the same picture gave two different masks"
+            exit 1
+          fi
+          cargo test -p ym-apple vision -- --nocapture
+      - name: Subject and People through the core and ym (the fake, and this Mac's own Vision)
+        env:
+          YM_REQUIRE_VISION: "1"   # `ym doctor` and the parity leg with this Mac's Vision fail on "not supported"; mask_vision's fakes ignore it
+        run: |
+          cargo test -p ym-core --test mask_vision
+          cargo test -p ym-cli --test parity --test cli --test render -- subject people vision --nocapture
 
   deny:
     # Also runs on the nightly schedule: new RustSec advisories appear without any change in this repository.
@@ -123,7 +171,7 @@ jobs:
   # Scripts under tools/fetch: shellcheck plus the stdlib unit tests, which run against a local HTTP
   # server and never touch the network (the corpus hosts are not needed to prove the script logic). The same job runs the other
   # stdlib-only Python tool tests: tools/oracle (the metadata gate's command line), tools/looks (the ARRI package fingerprints),
-  # tools/golden (the LibRaw oracle verdicts) and tools/eval/ab (the blind A/B kit of Apple Auto, docs/19 section 13), and
+  # tools/golden (the LibRaw oracle verdicts) and tools/eval/ab (the blind A/B kit of Apple Auto and of Auto crop, docs/19 and docs/20), and
   # shellchecks the developer, oracle and A/B scripts.
   fetch-tools:
     if: github.event_name != 'schedule'
@@ -149,14 +197,23 @@ jobs:
   gpu-lavapipe:
     if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 100   # the lens kernels' suites, measured 2026-10-26: about 55 minutes before the export parity step (60 cancelled it)
     env:
       YM_REQUIRE_GPU: "1"
+      YM_REQUIRE_SAM2: "1"   # the Object tests of the last steps need SAM 2.1's weights, fetched below
       WGPU_BACKEND: vulkan
       # Release test builds have no debug fallback to the workspace data/ folder (ym-core data_dir.rs).
       YELLOWMOON_DATA: ${{ github.workspace }}/data
     steps:
       - uses: actions/checkout@v4
+      # SAM 2.1 small's weights (about 77 MB, our own release asset, tools/fetch/sam2.sh): the same download as the sam2 job's, without
+      # its fixtures, and cached on its own key (the sam2 job's entry holds the 490 MB of fixtures too).
+      - name: SAM 2.1 weights (cached by their pin)
+        uses: actions/cache@v4
+        with:
+          path: data/models/sam2/sam2.1_hiera_small.f16.safetensors
+          key: sam2-weights-${{ hashFiles('data/models/sam2/SHA256SUMS') }}
+      - run: tools/fetch/sam2.sh
       - name: Mesa lavapipe (software Vulkan)
         run: sudo apt-get update && sudo apt-get install -y mesa-vulkan-drivers libvulkan1 vulkan-tools
       - name: Show the adapter
@@ -174,11 +231,24 @@ jobs:
       # `-p ym-gpu` was run here; the one other place was the macOS `rust` job, where the test skips itself and passes when
       # the runner opens no Metal adapter. YM_REQUIRE_GPU (above) makes a missing adapter a failure.
       - name: Renderer on the GPU against the CPU reference, with device faults injected
-        run: cargo test -p ym-core --release --features fault-injection --test render_gpu --test render_sharpen --test render_graph --test gpu_reduced --test gpu_export --test gpu_determinism --test gpu_faults --test device_frames
+        run: cargo test -p ym-core --release --features fault-injection --test render_gpu --test render_sharpen --test render_graph --test gpu_reduced --test gpu_export --test gpu_determinism --test gpu_faults --test device_frames --test render_lens
+      # N-20: the device suites of the node work that only skipped on `ci.yml` until now (the macOS `rust` job opens no Metal adapter). Measured on
+      # lavapipe in release on 2026-11-03 (a four-core machine): mask_raster 54 s, mask_background 20 s, render_before 13 s, render_nodes 11 s,
+      # tile_lights 9 s, mask_view 7 s, node_thumbs 4 s, range_pick 3 s, gpu_policy 1 s, gpu_residency 20 to 34 s (five runs); about 3 minutes with the
+      # build on top. `gpu_residency` joined on 2026-11-03, when the owner gave software adapters the hardware's bound in its fault test
+      # ("lose bounds on gpu_residency", docs/STATUS.md).
+      - name: The node, mask, thumbnail and policy suites on the device
+        run: cargo test -p ym-core --release --features fault-injection --test mask_background --test mask_raster --test mask_view --test node_thumbs --test range_pick --test render_before --test render_nodes --test tile_lights --test gpu_policy --test gpu_residency
       - name: The app and ym give the same exports on the GPU
         env:
           YELLOWMOON_GPU: "on"
         run: cargo test -p ym-cli --release --test parity_gpu
+      # N-18, the Object tests that need a device (the CPU ones run in the macOS `sam2` job; parity_gpu's Object test ran in the step
+      # above). SAM's encoder takes seconds in release and minutes in the dev profile, so `--release` is not optional here.
+      - name: Object masks on the device against the CPU, and the app against ym on the device
+        run: |
+          cargo test -p ym-core --release --features fault-injection --test mask_object -- the_device_makes_the_same_frames_and_masks_as_the_cpu_with_an_object_row
+          cargo test -p ym-cli --release --test parity -- an_object_mask_is_the_same_files_through_the_app_path_and_the_binary_on_the_device
 
   # M0-05: decoder oracle. LibRaw (rawpy), rawler (tools/oracle) and libjpeg compare ym-raw's pixels,
   # levels and white balance. Test-only: none of them is ever linked into a shipped crate. Until the
@@ -235,7 +305,8 @@ jobs:
 
   # Data, fits and test vectors stay reproducible: camera profiles and registry (M1-04), the spectral
   # reference for the Rust runtime (M1-02), the research reproduction and the sensor-map gate with its
-  # one reported failure (M1-05, LED-V2), LUT and ACES 2 vectors against OpenColorIO (M1-10, M1-11),
+  # reported failures (M1-05: LED-V2 since 2026-10-12; five more lights since the owner's decision of 2026-10-25,
+  # "Move ALEXA estimate", docs/STATUS.md), LUT vectors against OpenColorIO (M1-10),
   # the illuminant estimator (M1-06) and the noise-prior fitting (M2-01).
   data-checks:
     if: github.event_name != 'schedule'
@@ -251,9 +322,14 @@ jobs:
       - run: python3 -m training.sensor_map.check_reference
       - run: python3 -m training.sensor_map.evaluate
       - run: python3 -m training.sensor_map.build_profiles --check
-      - run: python3 -m training.sensor_map.gate --expect-failing LED-V2
+      # The thresholds are unchanged (median 0.5, p95 1.2). Exactly these seven lights of the A7R IV are over: LED-V2 (owner,
+      # 2026-10-12), with the ALEXA estimate moved (owner, 2026-10-25) blackbody 2850 K, D 5250 K, D 6750 K, FL3.15 and
+      # LED-B3, and with the push taken to 4.5 degrees (owner, 2026-10-26) LED-RGB1. An eighth, or one fewer, fails.
+      - run: python3 -m training.sensor_map.gate --expect-failing blackbody-2850K daylight-5250K daylight-6750K FL3.15 LED-B3 LED-RGB1 LED-V2
+      # The hue push of the shipped ALEXA curve (4.5 degrees, past the matrix limit by the owner's decision of 2026-10-26):
+      # its numbers against the committed data (docs/03, The ALEXA estimate).
+      - run: python3 -m unittest training.alexa.test_push
       - run: python3 -I tools/vectors/lut_vectors.py --check
-      - run: python3 -I tools/vectors/aces2_vectors.py --check
       - run: pip install -r training/illum/requirements.txt && python3 -m unittest training.illum.test_illum
       - run: python3 -m unittest training.noise.test_public_priors
       # The white scale of stand-in bodies (docs/03): our SR2 reader, the two references, the fit, and that registry.json carries
@@ -457,12 +533,12 @@ jobs:
             device-check.txt
           if-no-files-found: ignore
 
-  # M3-12: every exported DNG passes Adobe's dng_validate, and its render is within a median ΔE00 of 1.5 of our JPEG (docs/09
+  # M3-12: every exported DNG passes Adobe's dng_validate, and its render is within a median ΔE00 of 1.5 of our unsharpened JPEG (docs/09
   # Gates). tools/dng/run_gates.sh is the same script a developer runs: it builds `ym` and `dngfit` (two cargo invocations, for
   # the reason given at the golden job), runs `dngfit eval` and `dngfit gate --require-all`. dng_validate is built from the DNG SDK
   # at a pinned commit (about 10 minutes) and the binary is cached; the key has the Ubuntu release because the binary links the
   # system libjpeg and zlib. The image is pinned to ubuntu-24.04, the one this was run on (libjpeg-turbo 2.1.5, the libjxl 0.7
-  # headers): the SDK build and the stub in tools/dng/dng_jxl_stub.cpp are not known to build against the headers of a newer
+  # headers): the SDK build and the JPEG XL stub that tools/dng/build_dng_validate.sh writes are not known to build against the headers of a newer
   # libjxl. The tests run apart from the gates: `cargo test -p ym-export --test dng_validate` runs that one test
   # target only, so `-p dngfit` needs its own command. YM_REQUIRE_EXTERNAL_TOOLS turns "SKIPPED: tool missing" into a failure.
   dng:
@@ -489,7 +565,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: testdata/dng_sdk/dng_validate
-          key: dng-validate-ubuntu-${{ steps.os.outputs.release }}-${{ hashFiles('tools/dng/build_dng_validate.sh', 'tools/dng/dng_jxl_stub.cpp') }}
+          key: dng-validate-ubuntu-${{ steps.os.outputs.release }}-${{ hashFiles('tools/dng/build_dng_validate.sh') }}
       - name: Build dng_validate from the DNG SDK
         if: steps.dng_sdk.outputs.cache-hit != 'true'
         run: tools/dng/build_dng_validate.sh testdata/dng_sdk
@@ -560,6 +636,62 @@ jobs:
           YM_REQUIRE_SYNTHETIC: "1"
         run: cargo test -p ym-core --test export_real the_generated_synthetic_set_is_found -- --nocapture
 
+  # A full disk stops an export at the first photo that hits it (docs/26-hardening.md P2-2, H-06): `ym render` of five synthetic photos
+  # (the ym-raw `gen_arw` example, no download) to PNG on a 3 MiB tmpfs. tools/ci/disk_full.sh asserts exit 1, one error line and the
+  # "Stopped after 0 of 5" line, an empty folder (no temporary file) and a wall time under two photos' render (no stop: five). The Rust
+  # side of the same stop, with a write fault and no mount, runs here too (`ym-core/tests/export_stop.rs`, feature fault-injection);
+  # `ym-cli/tests/export_stop.rs` mounts its own tmpfs and skips itself where `mount` is refused, as it is for the runner's user.
+  disk-full:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45   # a cold cache builds ym (debug)
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust toolchain from rust-toolchain.toml
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: ym and the synthetic ARW writer
+        run: |
+          cargo build -p ym-cli
+          cargo build -p ym-raw --features testgen --example gen_arw
+      - name: Five photos to a 3 MiB tmpfs
+        run: tools/ci/disk_full.sh
+      - name: The same stop with a write fault (ym-core, no mount) and in the ym tests
+        run: |
+          cargo test -p ym-core --features fault-injection --test export_stop
+          cargo test -p ym-cli --test export_stop --test write_errors
+
+  # H-12 (docs/26 P4-2, docs/13): the peak memory of a 50 MP and a 61 MP export as an 8 GB machine. YELLOWMOON_RAM_GB=8 makes the
+  # budget rule, the develop pool and the unified-memory rule plan for 8 GB (docs/17); `tools/ci/memory_gate.py` renders a synthetic
+  # file of each size to JPEG, TIFF 16-bit and DNG with `ym render -v`, reads the process's peak RSS (wait4) and the ledger's peak
+  # ("Ledger peak:" line), writes the six rows to the job summary, and fails when
+  #   * a peak RSS is over its bound (BOUNDS_MIB in the script, one table; set from the first run of this job, see the comment there), or
+  #   * the ledger's peak is not within a factor of two of the RSS (H-13): a buffer nobody counted, or a count with nothing behind it.
+  # Release build, CPU path (no adapter on the runner); the machine is shared, so the bounds carry the noise of the runner.
+  memory-8gb:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90   # a cold cache builds ym in release; the six renders take about 12 minutes on 4 cores
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust toolchain from rust-toolchain.toml
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: ym and the synthetic ARW writer (release)
+        run: |
+          cargo build --release -p ym-cli
+          cargo build --release -p ym-raw --features testgen --example gen_arw
+      - name: Peak memory of six exports as an 8 GB machine
+        env:
+          YELLOWMOON_RAM_GB: "8"
+        run: |
+          python3 tools/ci/memory_gate.py \
+            --ym target/release/ym \
+            --gen target/release/examples/gen_arw \
+            --work "$RUNNER_TEMP/memory-8gb" \
+            --ram-gb 8 \
+            --summary "$GITHUB_STEP_SUMMARY"
+
   # tools/eval: the unit tests of the auto-exposure study and of its M1-08 gate logic (G3, `--gate`). Pure numpy/Pillow/tifffile;
   # the one test that runs `ym` skips itself when there is no binary or no synthetic set. The gate itself runs in the golden job.
   eval-tools:
@@ -573,7 +705,7 @@ jobs:
       - run: pip install numpy pillow tifffile
       - run: python3 -I -m unittest discover -s tools/eval -p 'test_*.py'
 
-  # THIRD-PARTY.md (NOTICE item 9, the About dialog): the licence texts of the Rust crates, npm packages and fonts that ship.
+  # THIRD-PARTY.md (NOTICE item 8, the About dialog): the licence texts of the Rust crates, npm packages and fonts that ship.
   # The release workflow generates it before `tauri build`; this job runs the same generator on every change, so a new
   # dependency without a licence text, a broken cargo-about config or a bundle that stops carrying the file fails here and not on
   # the day of a release. `check_bundle.py` also holds NOTICE to the BSD 3-Clause conditions of the ported Menon demosaic.
@@ -601,8 +733,10 @@ jobs:
         run: python3 -I -m unittest discover -s tools/licences -p 'test_*.py' -v
       - name: Generate THIRD-PARTY.md (fails on a package without a licence text)
         run: python3 tools/licences/generate.py
-      - name: The bundle carries THIRD-PARTY.md, NOTICE and LICENSE, and NOTICE carries the BSD conditions
+      - name: The bundle carries THIRD-PARTY.md, NOTICE and LICENSE, NOTICE carries the BSD conditions and the film credits, and the film data matches its sums
         run: python3 tools/licences/check_bundle.py
+      - name: Film policy (nothing under training/ reads data/film/; the name spektrafilm only in the credit lines and About)
+        run: python3 tools/licences/check_film_policy.py
       - uses: actions/upload-artifact@v4
         with:
           name: third-party
@@ -666,6 +800,19 @@ jobs:
           YM_BIN="$RUNNER_TEMP/ym-force-demosaic" cargo test -p yellowmoon-app --test app_cli_parity -- --nocapture with_menon_forced 2>&1 | tee "$RUNNER_TEMP/forced-demosaic.txt"
           # A name filter that matches no test ends green with "0 passed"; the one test has to have run (bash -eo pipefail).
           grep -q 'test result: ok\. 1 passed' "$RUNNER_TEMP/forced-demosaic.txt"
+      # N-18: the shell's Object tests (src-tauri/src/api/tests.rs: the kinds of mask, mask_find and the encoder's events) need SAM 2.1's
+      # weights. No job builds the app's tests in release, and a release build of the app (webview, thin LTO) is too much for three tests;
+      # the dev profile is enough, because Cargo.toml builds ym-ml, where the encoder's arithmetic is, at opt-level 3.
+      - name: SAM 2.1 weights (cached by their pin)
+        uses: actions/cache@v4
+        with:
+          path: data/models/sam2/sam2.1_hiera_small.f16.safetensors
+          key: sam2-weights-${{ hashFiles('data/models/sam2/SHA256SUMS') }}
+      - run: tools/fetch/sam2.sh
+      - name: The shell's Object tests (weights required)
+        env:
+          YM_REQUIRE_SAM2: "1"
+        run: cargo test -p yellowmoon-app -- the_kinds_of_mask_this_machine_makes mask_find
       - name: Rustdoc (warnings are errors)
         env:
           RUSTDOCFLAGS: -D warnings
@@ -715,6 +862,71 @@ jobs:
           echo "ORT_DYLIB_PATH=$lib" >> "$GITHUB_ENV"
       - run: cargo clippy -p ym-ml --all-targets --features burn,ort -- -D warnings
       - run: cargo test -p ym-ml --features burn,ort
+  # SAM 2.1 small (docs/algorithms/06 section 6.5, N-17): our Rust runtime against Meta's oracle fixtures, on Apple silicon, in
+  # release (the gates take about 90 s a photo in the dev profile, where the rust job skips them and says so). The weights and the
+  # fixtures are our own release assets (models-sam2.1-small-1), fetched by SHA-256 and cached; YM_REQUIRE_SAM2 makes a missing
+  # file a failure. The timing example prints the encoder's and the decoder's times on this runner (print only).
+  # N-18, the Object masks, run here too, on the CPU and in release: ym-core's mask_object (its device test skips: the runner opens no
+  # Metal adapter; gpu-lavapipe runs it) and, of ym-cli, the Object legs of parity, the render test that renders with the weights, and
+  # the doctor tests, whose Masks row and weights list differ with the weights there. The device legs run in gpu-lavapipe and the
+  # shell's tests in parity.
+  sam2:
+    if: github.event_name != 'schedule'
+    runs-on: macos-latest
+    timeout-minutes: 45
+    env:
+      YM_REQUIRE_SAM2: "1"
+      # Release test builds have no debug fallback to the workspace data/ folder (ym-core data_dir.rs).
+      YELLOWMOON_DATA: ${{ github.workspace }}/data
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust toolchain from rust-toolchain.toml
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/cache@v4
+        with:
+          path: |
+            data/models/sam2/sam2.1_hiera_small.f16.safetensors
+            testdata/sam2
+          key: sam2-oracle-${{ hashFiles('data/models/sam2/SHA256SUMS', 'tools/fetch/sam2.sha256') }}
+      - name: zstd for the fixtures' archive
+        run: command -v zstd >/dev/null || brew install zstd
+      - run: tools/fetch/sam2.sh --fixtures
+      - run: cargo test -p ym-ml --release --test sam2 -- --nocapture
+      - name: Encoder and decoder times on this runner (print only)
+        run: cargo run -p ym-ml --release --example sam2_time -- --reps 2
+      - name: Object masks through the render graph (ym-core, the CPU)
+        run: cargo test -p ym-core --release --test mask_object -- --nocapture
+      - name: Object masks in ym and in the app's path (ym-cli, the CPU), and the doctor with the weights
+        run: cargo test -p ym-cli --release --test parity --test render --test cli -- object doctor
+  # Depth Anything V2-Small against the upstream PyTorch code (docs/algorithms/06 section 8.6, D-03): 20 public photos, the
+  # resize, the map from upstream's tensor, the whole path, and the stage by stage trace of three of them, plus the real weights'
+  # bit-identity on 1, 2, 4 and 8 threads. Linux, not macOS: the runtime is CPU code in a fixed order without fused multiply-add,
+  # so it gives the same bits on any machine, and the cheaper runner is enough (the 20 photos take a few minutes in release).
+  # The weights and fixtures are fetched by tools/fetch/depth.sh and cached on the hashes they are checked against.
+  depth:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      YM_REQUIRE_DEPTH: "1"
+      # Release test builds have no debug fallback to the workspace data/ folder (ym-core data_dir.rs).
+      YELLOWMOON_DATA: ${{ github.workspace }}/data
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust toolchain from rust-toolchain.toml
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/cache@v4
+        with:
+          path: |
+            data/models/depth/depth_anything_v2_vits.f16.safetensors
+            testdata/depth
+          key: depth-oracle-${{ hashFiles('data/models/depth/SHA256SUMS', 'tools/fetch/depth.sha256') }}
+      - name: zstd for the fixtures' archive
+        run: command -v zstd >/dev/null || sudo apt-get install -y zstd
+      - run: tools/fetch/depth.sh --fixtures
+      - run: cargo test -p ym-ml --release --test depth -- --nocapture --test-threads=1
   # Fuzzing (docs/13): every cargo-fuzz target runs for 10 minutes each night (property: no panic, no unbounded allocation, a
   # typed error for any input). One job per target, so a crash names its target and the others still run. The targets are
   # crates/ym-raw/fuzz (the ARW container and the decoders, docs/04) and crates/ym-color/fuzz (the `.cube` parser and the look

@@ -10,15 +10,11 @@ use ym_color::cdl::Cdl;
 use ym_color::consts::Vec3;
 use ym_color::consts::linalg::Mat3;
 use ym_color::curve::{Curve, CurveSet};
-use ym_color::display::{
-    ArriDisplayLut, ChainParams, DisplayLutInput, DisplayLutOutput, DisplayLutPrimaries,
-    DisplayLutTransfer, DisplayTransform, LookSetting, OutputTarget,
-};
-use ym_color::exposure::white::WhiteLift;
+use ym_color::display::{ChainParams, LookSetting, OutputTarget};
 use ym_color::grade::{ColorBalance, GradeParams};
 use ym_color::look::{LookInput, LookTransform};
 use ym_color::lut::{Lut, Lut1d, Lut3d};
-use ym_color::tone::ToneParams;
+use ym_color::tone::{AchromaticGate, ToneParams};
 use ym_color::warp::{WARP_MAX_PINS, WarpParams, WarpPin};
 use ym_gpu::cpu::RgbImage;
 
@@ -132,11 +128,6 @@ pub fn curves() -> CurveSet {
     }
 }
 
-pub fn display_lut(input: DisplayLutInput, output: DisplayLutOutput) -> DisplayTransform {
-    let lut = cube_lut(17, |c| c.map(|x| (x * 1.02).clamp(0.0, 1.0).powf(1.3)));
-    DisplayTransform::arri(ArriDisplayLut::new(Arc::new(lut), input, output).expect("display lut"))
-}
-
 /// A body-shaped camera default for the Before view: a published-looking D65 matrix (strong red-green
 /// overlap, negative off-diagonals), an as-shot white that differs from the initial gains.
 pub fn camera_default() -> CameraDefault {
@@ -155,7 +146,7 @@ pub fn base(target: OutputTarget) -> ChainParams {
     p
 }
 
-/// A chain with everything on: tone, grade, a LogC4 look at 70 %, curves, ACES 2.
+/// A chain with everything on: tone, grade, a LogC4 look at 70 %, curves, the cine rendering.
 pub fn full(target: OutputTarget) -> ChainParams {
     let mut p = base(target);
     p.grade = grade_params();
@@ -166,14 +157,16 @@ pub fn full(target: OutputTarget) -> ChainParams {
 
 /// Colour warp pins (C9b) placed where the colours of [`camera_image`] are after C9 (half its pixels
 /// have a chroma `|c|` under 0.02, a tenth over 0.06; tones from 3 stops under grey to 4 over): moves
-/// with the default and with split tonal weights, pivots under and over grey, exposure up and down, a
-/// long move with the smallest range (the flow takes 12 steps for the set), an exposure-only pin, a
-/// lock between them and a still pin (left out by the preparation).
+/// with the default and with split tonal weights, pivots under and over grey, exposure up and down,
+/// saturation up and down (also on a pin that moves and changes exposure), a long move with the
+/// smallest range (the flow takes 12 steps for the set), an exposure-only pin, a saturation-only pin,
+/// a lock between them and a still pin (left out by the preparation).
 pub fn warp_pins() -> WarpParams {
     WarpParams {
         pins: vec![
             WarpPin {
                 range: 0.05,
+                saturation: 0.5,
                 ..WarpPin::moving([0.045, 0.015], [0.015, 0.06])
             },
             WarpPin {
@@ -182,6 +175,7 @@ pub fn warp_pins() -> WarpParams {
                 highlights: 0.2,
                 pivot_ev: -2.0,
                 exposure_ev: -0.6,
+                saturation: -0.7,
                 ..WarpPin::moving([-0.03, 0.04], [-0.07, 0.0])
             },
             WarpPin {
@@ -190,7 +184,14 @@ pub fn warp_pins() -> WarpParams {
                 highlights: 1.0,
                 pivot_ev: 1.0,
                 exposure_ev: 0.8,
+                saturation: 1.0,
                 ..WarpPin::moving([-0.02, -0.05], [0.01, -0.08])
+            },
+            WarpPin {
+                range: 0.035,
+                shadows: 0.7,
+                saturation: -1.0,
+                ..WarpPin::moving([-0.05, -0.02], [-0.05, -0.02])
             },
             WarpPin {
                 range: 0.01,
@@ -215,6 +216,9 @@ pub fn warp_pins() -> WarpParams {
 /// beyond the limit of 0.5, and every control drawn a little beyond its range now and then, so the
 /// preparation's clamping is exercised too.
 pub fn random_warp(rng: &mut Rng) -> WarpParams {
+    // The saturations come from a stream of their own, seeded from the state on entry, so the pins
+    // (and everything drawn after them) are those of the sets before saturation existed.
+    let mut sat_rng = Rng(rng.0 ^ 0x5A70_A710_0000_0000);
     let count = (rng.next_u64() % (WARP_MAX_PINS as u64 + 3)) as usize;
     let point = |rng: &mut Rng, reach: f64| {
         let (r, a) = (
@@ -253,6 +257,13 @@ pub fn random_warp(rng: &mut Rng) -> WarpParams {
                 pivot_ev: rng.range(-7.0, 7.0),
                 exposure_ev: if rng.unit() < 0.5 {
                     rng.range(-2.5, 2.5)
+                } else {
+                    0.0
+                },
+                // About half the pins change saturation, drawn a little beyond +-1 now and then; a
+                // pin that stays and changes nothing else is then a saturation-only pin.
+                saturation: if sat_rng.unit() < 0.5 {
+                    sat_rng.range(-1.2, 1.2)
                 } else {
                     0.0
                 },
@@ -319,80 +330,15 @@ pub fn cases() -> Vec<(String, ChainParams)> {
             v.push((format!("baked-look/{}/{pct}", t.name()), p));
         }
     }
-    for (name, input, output) in [
-        (
-            "709-g24",
-            DisplayLutInput::LogC4,
-            DisplayLutOutput::REC709_G24,
-        ),
-        (
-            "p3-g26-logc3",
-            DisplayLutInput::LogC3Ei800,
-            DisplayLutOutput {
-                primaries: DisplayLutPrimaries::P3D65,
-                transfer: DisplayLutTransfer::Gamma(2.6),
-            },
-        ),
-        (
-            "2020-srgb",
-            DisplayLutInput::LogC4,
-            DisplayLutOutput {
-                primaries: DisplayLutPrimaries::Rec2020,
-                transfer: DisplayLutTransfer::Srgb,
-            },
-        ),
-    ] {
-        for t in [OutputTarget::Srgb, OutputTarget::Rec2020] {
-            let mut p = full(t);
-            p.display = display_lut(input, output);
-            v.push((format!("display-lut/{name}/{}", t.name()), p));
-        }
-    }
-    // Display LUT together with a display-baked look (both feed C12).
-    let mut p = full(OutputTarget::DisplayP3);
-    p.display = display_lut(DisplayLutInput::LogC4, DisplayLutOutput::REC709_G24);
-    p.look = Some(LookSetting::new(baked_look(), 60.0));
-    v.push(("display-lut+baked-look".into(), p));
     v.extend(range_cases());
-    // The white lift (C12 step 1b): alone, with everything on, a narrow strong ramp, behind the highlight
-    // range at its default (both stages run: the range on the scene side, the lift after C11), on the own
-    // branch of a display-baked look, and (ignored) with a display LUT.
-    let lift = WhiteLift::new(1.1, 2.8).expect("lift");
-    for t in [OutputTarget::Viewport, OutputTarget::Srgb] {
-        let mut p = base(t);
-        p.white_lift = lift;
-        v.push((format!("lift/auto/{}", t.name()), p));
-        let mut p = full(t);
-        p.white_lift = lift;
-        v.push((format!("lift/full/{}", t.name()), p));
-    }
-    let mut p = base(OutputTarget::Viewport);
-    p.white_lift = WhiteLift::new(2.6, 1.3).expect("lift");
-    v.push(("lift/strong-narrow".into(), p));
-    let mut p = base(OutputTarget::Srgb);
-    p.tone = range_tone(1.0, AUTO_CLIP_STOPS);
-    p.white_lift = lift;
-    v.push(("lift/behind-the-range".into(), p));
-    let mut p = full(OutputTarget::Srgb);
-    p.look = Some(LookSetting::new(baked_look(), 25.0));
-    p.white_lift = lift;
-    v.push(("lift/baked-look/25".into(), p));
-    let mut p = full(OutputTarget::Srgb);
-    p.display = display_lut(DisplayLutInput::LogC4, DisplayLutOutput::REC709_G24);
-    p.white_lift = lift;
-    v.push(("lift/display-lut-ignores-it".into(), p));
     // The colour warp (C9b): alone, after the full grade and before the look and the curves, and
-    // feeding a display LUT and a display-baked look.
+    // feeding a display-baked look.
     let mut p = base(OutputTarget::Viewport);
     p.warp = warp_pins();
     v.push(("warp/auto/viewport".into(), p));
     let mut p = full(OutputTarget::Srgb);
     p.warp = warp_pins();
     v.push(("warp/full/srgb".into(), p));
-    let mut p = full(OutputTarget::Srgb);
-    p.display = display_lut(DisplayLutInput::LogC3Ei800, DisplayLutOutput::REC709_G24);
-    p.warp = warp_pins();
-    v.push(("warp/display-lut".into(), p));
     let mut p = full(OutputTarget::Viewport);
     p.look = Some(LookSetting::new(baked_look(), 60.0));
     p.warp = warp_pins();
@@ -404,7 +350,7 @@ pub fn cases() -> Vec<(String, ChainParams)> {
 /// grey, so a fifth of [`camera_image`] lies above the knee), with everything on, a clip inside the fade
 /// (1.6 stops: the knee stays at +1 stop and the expansion is partly faded), a clip over the ALEXA's (the
 /// Exposure 5 stops up: no expansion, only the cap, which a fifth of the pixels reach), and the range in
-/// front of a display-baked look and of a display LUT (both see it, as everything after C7 does).
+/// front of a display-baked look (which sees it, as everything after C7 does).
 pub fn range_cases() -> Vec<(String, ChainParams)> {
     let mut v: Vec<(String, ChainParams)> = Vec::new();
     for r in [0.0, 0.5, 1.0] {
@@ -431,10 +377,16 @@ pub fn range_cases() -> Vec<(String, ChainParams)> {
     p.tone = range_tone(0.5, AUTO_CLIP_STOPS);
     p.look = Some(LookSetting::new(baked_look(), 25.0));
     v.push(("range/baked-look/25".into(), p));
+    // The achromatic gate (docs/02 C7) with edges that are not the default, and a gate
+    // that is off: the edges ride in the uniform block, so every parity, tile and determinism test of the
+    // colour kernel runs them too.
+    let custom = AchromaticGate::new(0.2, 0.9).expect("gate");
     let mut p = full(OutputTarget::Srgb);
-    p.tone = range_tone(1.0, AUTO_CLIP_STOPS);
-    p.display = display_lut(DisplayLutInput::LogC3Ei800, DisplayLutOutput::REC709_G24);
-    v.push(("range/display-lut".into(), p));
+    p.tone = range_tone(1.0, AUTO_CLIP_STOPS).with_gate(custom);
+    v.push(("range/custom-gate".into(), p));
+    let mut p = full(OutputTarget::Viewport);
+    p.tone = range_tone(1.0, AUTO_CLIP_STOPS).with_gate(AchromaticGate::OFF);
+    v.push(("range/gate-off".into(), p));
     v
 }
 

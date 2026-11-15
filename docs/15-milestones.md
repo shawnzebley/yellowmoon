@@ -1,8 +1,8 @@
 # 15 · Milestones and tasks
 
-Five milestones run in sequence; each ends at a gate we can measure. Dates come after M0, once the spikes show the real effort. Work in task order within a milestone unless dependencies allow parallel work. The UI design is done (`design/`); M0 and M1 don't wait for UI work.
+Five milestones run in sequence; each ends at a gate that can be measured. Milestone N (nodes and masks, released as 0.2.0) was added on 2026-11-01 and sits between M3 and M4; its full spec is `docs/23-nodes.md`. Milestone F (the Film node, `docs/24-film.md`) was scheduled on 2026-11-04 and released as 0.2.1; it follows N. Milestone D (the Depth mask, `docs/23` §4.8, `docs/algorithms/06` §5.8 and §8) was added on 2026-11-07 on the owner's decision (`docs/STATUS.md` question 41) and sits after F on its own branch, `depth-mask`; it needs the masks of N and no part of F. Milestone X (the mixers: Parallel, Layer, and Splitter and combiner, `docs/25-mixers.md`) was added on 2026-11-10 on the owner's request (`docs/STATUS.md` question 43), on its own branch, `mixers`, and released as 0.2.3; it needs the graph, plan and panel of N and no part of F or D. Work in task order within a milestone unless dependencies allow parallel work. The UI design is in `design/`; M0 and M1 don't wait for UI work.
 
-Task format: **ID · title** (depends on) — what to build. *Done when:* acceptance criteria. [HUMAN] tasks are Mykyta's (`AGENTS.md` rule 9): prepare around them and list them in `docs/STATUS.md`.
+Task format: **ID · title** (depends on) — what to build. *Done when:* acceptance criteria. [HUMAN] tasks are the owner's (`AGENTS.md` rule 9): prepare around them and list them in `docs/STATUS.md`.
 
 **Environment note.** Most crates build and test on Linux and macOS. GPU kernels are tested on Linux CI with Mesa lavapipe (software Vulkan) for correctness. The app shell, the native viewport, Metal-specific behaviour and performance need a Mac; if you aren't running on one, say so in `STATUS.md` and leave those checks to [HUMAN M0-H4].
 
@@ -23,7 +23,7 @@ Install `templates/github/workflows/ci.yml` and `templates/deny.toml`; add `CHAN
 *Done when:* CI is green on a PR; a test PR adding a GPL crate fails `cargo deny`.
 
 **M0-03 · Release pipeline and updater** (M0-02)
-Generate the updater signing key and set the secrets (`docs/12` §Signing); install `release.yml` and `Casks/yellowmoon.rb` with the repository from the handover message; wire `updater.ts` (from plugout) and the update cell placeholder; sidecar build step with a stub `ym-cli`.
+Generate the updater signing key and set the secrets (`docs/12` §Signing); install `release.yml` and `Casks/yellowmoon.rb` for the project repository; wire `updater.ts` (from plugout) and the update cell placeholder; sidecar build step with a stub `ym-cli`.
 *Done when:* merging a version bump publishes `v0.0.1` with dmg, tarball, signature and `latest.json`, updates the cask; an installed 0.0.1 updates itself to 0.0.2 [checked on a Mac]; `brew install --cask` from the tap installs app and `ym --version`.
 
 **M0-04 · ARW container and metadata** (M0-01, M0-09)
@@ -52,9 +52,9 @@ Random-weight `jdd` of the starting architecture (`docs/07`) exported to ONNX; r
 
 **M0-10 · Validation data plan** (M0-09)
 `docs/validation-data.md`: for every gate in `docs/13`, the public dataset or oracle that replaces a test shoot (V1 has none), with licence, download script and what may be stored where.
-*Done when:* every gate has a data source; nothing in the plan needs Mykyta's camera.
+*Done when:* every gate has a data source; nothing in the plan needs a test shoot.
 
-**[HUMAN] M0-H4** Run the Mac-only checks (M0-06, M0-07 timings) if the agent isn't on a Mac. (Earlier drafts had M0-H1 to M0-H3 for the signing key, the repository name and the golden set: the agent now generates the key, the repository and domain come with the handover message, and the golden set comes from public sources.)
+**[HUMAN] M0-H4** Run the Mac-only checks (M0-06, M0-07 timings) if the agent isn't on a Mac. The agent generates the updater signing key, and the golden set comes from public sources.
 
 **Gate M0:** decoders match oracles for all V1 variants except M/S and ARW 6.0; viewport approach decided; 50 MP tiles render within memory; ML runtime chosen; a release has updated itself.
 
@@ -90,11 +90,11 @@ Synthetic training data, Cube++ converted per profile, FFCC-style filter, class 
 
 **M1-07 · Fused colour chain** (M1-05, M1-06)
 C1–C6 as one matrix per photo; Auto WB, Kelvin/tint, light presets, Pick white maths; per-photo `AutoEstimates`.
-*Done when:* unit tests for each mode; "3200 K under daylight" renders warmer than Auto by the amount the ALEXA maths predicts (test against a CPU spectral simulation).
+*Done when:* unit tests for each mode; "3200 K under daylight" renders bluer than Auto by the amount the ALEXA maths predicts (the wording said "warmer" until 2026-11-13; the test always checked the sign the physics gives, STATUS question 8) (test against a CPU spectral simulation).
 
 **M1-08 · Auto exposure** (M1-07)
 Algorithm in `docs/02`; burst consistency.
-*Done when:* on the golden set, auto exposure lands within ±0.5 EV of the camera's own exposure for ≥ 80% of photos, measured with G3 (decision 2026-10-13): our `EV_auto` minus the camera engine's gain, where the gain is `log2(0.18 / x)` and `x` is the scene-linear level the embedded JPEG renders as mid grey (quantile match of the JPEG against our scene-linear render at the JPEG's size; `tools/eval/autoexp.py`). This keeps the display transform and the camera's tone curve out of the exposure check. Outliers listed for Mykyta's review (M1-H5).
+*Done when:* on the golden set, auto exposure lands within ±0.5 EV of the camera's own exposure for ≥ 80% of photos, measured with G3: our `EV_auto` minus the camera engine's gain, where the gain is `log2(0.18 / x)` and `x` is the scene-linear level the embedded JPEG renders as mid grey (quantile match of the JPEG against our scene-linear render at the JPEG's size; `tools/eval/autoexp.py`). This keeps the display transform and the camera's tone curve out of the exposure check. Outliers are listed for the owner's review (M1-H5).
 
 **M1-09 · Tone stages** (M1-07, M0-07)
 C7 roll-off and toe, C8 LogC4, C9 primary grade; CPU + WGSL.
@@ -107,9 +107,10 @@ CDL, `.cube` parser (fuzzed), tetrahedral interpolation on CPU and GPU, intensit
 **M1-11 · ACES 2 display transform** (M1-01)
 Port the output transform (CPU reference, then WGSL) for the four outputs in `docs/02`; ARRI display-LUT path.
 *Done when:* DRT gate vs OCIO vectors (≤ 1 code value at 10 bits).
+*Later:* the ACES 2 transform was replaced by the cine rendering (`docs/02` C12, pipeline 0.8.0); the DRT gate is now the cine fixture and the kernel parity test (`docs/13`).
 
 **M1-12 · Classical raw processing** (M0-07)
-R1 normalise and clip mask, R3 vignetting, R4 gains, R5 highlight reconstruction, R6 classical demosaic (Menon or LMMSE, pick by PSNR) + light denoise, R8 RL sharpening, R9 lens resample + auto crop; CPU + WGSL; a `lens-oracle` CI job that installs darktable on Ubuntu and compares with `darktable-cli`. *[Defaults today: M1-12 shipped Menon. The raw-algorithms package (`docs/algorithms/`) made the adaptive ratio demosaic the R6 default on 2026-10-13 (owner, `docs/16`; Menon, LMMSE, bilinear and log-guided stay selectable through a test-only switch), kept Richardson–Lucy as the R8 default (diffraction deconvolution is available; Mykyta's choice of the R8 default is open, `docs/STATUS.md`), and added output sharpening as a per-photo setting, default 100 %.]*
+R1 normalise and clip mask, R3 vignetting, R4 gains, R5 highlight reconstruction, R6 classical demosaic (Menon or LMMSE, pick by PSNR) + light denoise, R8 RL sharpening, R9 lens resample + auto crop; CPU + WGSL; a `lens-oracle` CI job that installs darktable on Ubuntu and compares with `darktable-cli`. *Current defaults (`docs/05`, `docs/algorithms/`): R6 is the adaptive ratio demosaic (Menon, LMMSE, bilinear and log-guided stay selectable through a test-only switch) followed by the single-frame denoise; R8 is Richardson–Lucy (diffraction deconvolution is available); output sharpening is a per-photo setting, default 100 %.*
 *Done when:* highlight gate; lens-correction gate against darktable-cli and the image checks (`docs/05`); demosaic PSNR reported on Kodak/McMaster.
 
 **M1-13 · Export writers** (M1-11)
@@ -124,9 +125,9 @@ Display encode with dither; JPEG/TIFF/PNG; ICC; EXIF copy; XMP `ym:` namespace; 
 `tools/golden` runner, `tools/fetch/golden.sh` (CC0 and free-licence tiers), references, CI job.
 *Done when:* CI fails on an unexplained ΔE00 > 0.5 change.
 
-**[HUMAN] M1-H3** Email HdM about a licence for the SXT curve (validation). **M1-H4** Decide on CIE-derived coefficient tables (`docs/14`). **M1-H5** Visual review of the golden set: colour, exposure, white balance. (No test shoots in V1: M1-H1 and M1-H2 moved to V2.)
+**[HUMAN] M1-H3** Email HdM about a licence for the SXT curve (validation). **M1-H4** Decide on CIE-derived coefficient tables (`docs/14`). **M1-H5** Visual review of the golden set: colour, exposure, white balance. (V1 has no test shoots; the captures are V2 work, below.)
 
-**Gate M1:** ALEXA curve, sensor map, illuminant, ARRI step, DRT, LUT, highlights and detection gates pass; the CLI renders the golden set; Mykyta's review accepts the colour direction.
+**Gate M1:** ALEXA curve, sensor map, illuminant, ARRI step, DRT, LUT, highlights and detection gates pass; the CLI renders the golden set; the owner's review accepts the colour direction.
 
 ---
 
@@ -178,7 +179,7 @@ Behind cargo feature `arw6`; lightcraft as reference/dependency; LibRaw master a
 Profile and fix against `docs/05` targets on M1 (8 GB) and an Intel Mac.
 *Done when:* targets met or the gaps documented with a plan.
 
-**[HUMAN] M2-H3** Email Sony about RDD 34-based decoding. **M2-H4** Provide GPU compute and run training. **M2-H5** Blind A/B of the A1 ISO ladder (evaluation-tier studio files) vs Capture One and DxO. (M2-H1 calibration frames and M2-H2 pixel-shift captures moved to V2.)
+**[HUMAN] M2-H3** Email Sony about RDD 34-based decoding. **M2-H4** Provide GPU compute and run training. **M2-H5** Blind A/B of the A1 ISO ladder (evaluation-tier studio files) vs Capture One and DxO. (Calibration frames and pixel-shift captures are V2 work, below.)
 
 **Gate M2:** demosaic, noise and ISO-ladder gates pass; all formats decode (ARW 6.0 pending Sony if needed).
 
@@ -221,12 +222,11 @@ Light, Colour (wheels), Detail, Curve (plot and histogram), RAW (camera card, sw
 
 **M3-09 · ARRI import wizard** (M1-10, M3-H2)
 Recogniser from `data/looks/arri-packages.json`, `tools/looks/fingerprint.py`, Downloads watcher, five-step UI, generic `.cube` question, `looks import/verify/default` CLI parity.
-*Done when:* wizard happy path and failure paths (wrong package, damaged look file, missing file) tested with synthetic packages; Mykyta imports the real packages successfully [M3-H4]. (0.1.3 reads ARRI Look Files too: `docs/08`.)
+*Done when:* wizard happy path and failure paths (wrong package, damaged look file, missing file) tested with synthetic packages; the owner imports the real packages successfully [M3-H4]. ARRI Look Files are read too (`docs/08-looks.md`).
 
 **M3-10 · Signature look** (M1-10, M3-H1)
 `looks bake` tool and contact sheets; ship `signature.json` once designed.
-*Done when:* Mykyta signs off the look.
-*Status (2026-10-14):* Signature shipped as candidate B (Mykyta's choice from the look preview) and made the default look; the name may change (M3-H1).
+*Done when:* the owner signs off the look.
 
 **M3-11 · Export panel and queue** (M1-13, M3-06)
 As mocked: options, estimate, CLI preview with Copy, queue states, cancel, Show in Finder, export-aware updater.
@@ -247,7 +247,7 @@ Every flag in `docs/10`; app/CLI byte-identical test.
 Playwright flows and screenshot comparisons for every mocked state.
 *Done when:* CI green.
 
-**M3-16 · Desktop feel** (M3-04, M3-06) *(added 2026-10-16 after the owner's report: "UI in Yellowmoon is sluggish. I can select UI text, when I pan photo with two fingers on trackpad - all app moves.")*
+**M3-16 · Desktop feel** (M3-04, M3-06)
 A two-finger pan or a pinch over the photo moves or zooms only the photo; nothing else on the page scrolls, bounces or zooms. Text is not selectable except fields, the command line, paths, errors, file names, version and legal text. Buttons have the arrow cursor and links the hand; WebKit's page menu (Reload, Back) never opens. `docs/11` §Photos input and desktop feel.
 *Done when:* `src/styles/desktop.node.test.ts`, the Vitest specs (`usePhotoGestures`, `desktopFeel`, `PhotoView`) and `e2e/desktop-feel.spec.ts` pass; on a Mac a two-finger pan at Fit and zoomed, over the header, the filmstrip, the panel's end stops and a dialog moves only the intended content, a pinch zooms the photo about the fingers, and nothing selects by drag, ⌘A, double click on the photo or triple click in the header [M0-H4].
 
@@ -269,28 +269,99 @@ The Look tab with hundreds of looks stays quick: one `IntersectionObserver` for 
 
 **[HUMAN] M3-H1** Design the Signature look and name it. **M3-H2** Download the five ARRI packages by hand and run the fingerprint script. **M3-H3** Email ARRI about in-app download (optional). **M3-H4** Review the app on a Mac against the mockups; import the real ARRI packages. **M3-H5** Use the app for one real shoot and report friction. **M3-H6** Check DNGs in Lightroom, RawTherapee, darktable, Capture One and Apple Photos.
 
-**Gate M3:** every mocked state implemented; app/CLI parity; DNG gates; Mykyta's review.
+**Gate M3:** every mocked state implemented; app/CLI parity; DNG gates; the owner's review.
+
+---
+
+## N · Nodes and masks (0.2.0)
+
+Goal: a node view behind a Nodes button, with a real graph of corrector nodes between a fixed Input and Output, masks in every corrector (shapes, ranges, Brush, and AI masks: Object from SAM 2.1 small, Subject and People from Apple Vision, Background from the blur map), and Pick white moved into the Colour tab. The spec is `docs/23-nodes.md` and the maths `docs/algorithms/06-masks.md`; the owner approved the plan on 2026-11-01. The work happens on one branch, `nodes`, from `main`: one reviewed commit per task with its checks green; at each checkpoint the owner gets a test DMG (checkpoints are not releases); when the whole plan is built and the last test build is approved, the branch is merged and released once as **0.2.0**. `PIPELINE_VERSION` goes to 0.9.0 (the curve moves in front of the look). Phases: B core (N-02, N-02b, N-03 to N-05; the settings become node-first first, with no visible change), C interface (N-06 to N-09), D masks (N-10 to N-12), E raster masks (N-13 to N-15), F SAM 2 (N-16 to N-18), G Vision (N-19), H finish (N-20). B before C before D; E and F alongside once D is done; G any time after E.
+
+**N-01 · Spec** () — `docs/23-nodes.md`, `docs/algorithms/06-masks.md`, the changes to other specs, `design/nodes/README.md`, `research/nodes-masks-2026-11-01.md`. **Done 2026-11-01 (the owner approved the spec, N-H1).** *Done when:* the owner approves it (N-H1).
+**N-02 · Node-first settings in the core, the CLI and the shell's Rust side** (N-01) — `DevelopSettings` becomes the graph (Input, Main, Output and any other nodes, links): the model, validation with plain errors, Auto only in Main, node patches, reset, copy rules, resolved settings and XMP, the schema (node-first only), the refusal of the flat form of 0.1; **the CLI follows**: flags as node patches, node-first `--settings` and JSON, the help and its snapshots, `docs/10`, the docs test (`crates/ym-cli/tests/docs.rs`); the golden manifest, test fixtures, CLI tests and schema test rewritten to node-first. **The shell's Rust side follows** (wire types, `bindings.ts`, the commands and their Rust tests), so `cargo test --workspace` is green at the end; `npm test` and `tsc -b` fail on the contract until N-02b. *Done when:* every existing render and export is byte-identical, the app and `ym` agree, the refusal and the node-patch tests pass, and the CLI's help, its snapshots and `docs/10` match.
+**N-02b · Node-first settings in the frontend** (N-02) — `types.ts`, `contract.ts` and the mock (the wire types and `bindings.ts` are N-02's); the store with node patches and per-node undo; every tab through the selectors (`inputOf`, `mainOf`, `outputOf`). *Done when:* nothing visible changes: every unit test, e2e test and reference screenshot is as before.
+**N-03 · The plan and the CPU reference** (N-02) — `ym_color::plan` (live and dead nodes, order, registers, passes), nodes in plan order, trims, bypass, the curve before the look, identity skipping, `PIPELINE_VERSION` 0.9.0 (also in `ym --version`, `ym doctor` and their snapshots). *Done when:* the default graph is byte-identical to 0.8.2 (the curve-and-look case has its own test) and the plan and node tests pass.
+**N-04 · The GPU plan loop** (N-03) — the node storage buffer and plan loop in the fused colour kernel, per-node curves and pins, the multi-pass split, DNG bakes nodes. *Done when:* parity (2e-4, one 10-bit code), tiles, determinism, app/`ym` parity and the goldens pass.
+**N-05 · Node thumbnails** (N-04, N-02b) — core, IPC, cache. *Done when:* thumbnails match truncated renders.
+**N-06 · Pick white into the Colour tab** (N-02b) — header button gone; the card row, the hint pill, W, off when the Colour tab is left. *Done when:* e2e passes and the screenshots are retaken.
+**N-07 · Node view shell** (N-02b, N-06) — Nodes button and N, layout A, divider and Expand, the viewport follows, the switcher, the simple-view notice and glyph. *Done when:* e2e passes; the native viewport check is listed for the Mac.
+**N-08 · The graph** (N-05, N-07) — `@xyflow/react`: markers, cards with thumbnails, ports and links, select, add, delete, bypass, rename, move and reorder, links drawn by hand (connect, replace, pick up, remove, the refusals, the keyboard path), zoom and Fit, keys, a11y. *Done when:* e2e, a11y and the glass audit pass.
+**N-09 · The panel** (N-08) — compact head, tabs by node kind, trim cards, per-node histogram, undo, copy and paste. *Done when:* e2e passes and the screenshots are reviewed.
+**[HUMAN] N-H2** Checkpoint 1: a test DMG of nodes without masks.
+**N-10 · Shapes and ranges** (N-04, N-09) — Linear, Radial, Colour range, Brightness range, key input and output, invert, opacity, feather; CPU and GPU. `ym`: masks in `--settings`, the `doctor` Masks line; `docs/10` and the help change in the same commit. *Done when:* parity, preview against export and the smooth-edge rule pass.
+**N-11 · Show mask** (N-10) — Overlay and Mask only rendered by the core, M, the toolbar toggle, the View card. *Done when:* e2e passes; the Mac check is listed.
+**N-12 · The Mask tab** (N-10, N-11) — Add mask menu, rows, cards, handles, range picking, copy rules. *Done when:* e2e passes and the screenshots are reviewed.
+**[HUMAN] N-H3** Checkpoint 2: a test DMG with shapes and ranges.
+**N-13 · Raster masks** (N-12) — photo-frame raster, resample, grow, feather, guided-filter Refine edges; CPU and GPU; tile halos; the memory cache. `docs/10` and the help change in the same commit if `ym` changes. *Done when:* parity, tiles and preview against export pass.
+**N-14 · Brush** (N-13) — strokes, erase, size, hardness, drawing on the photo. *Done when:* e2e and parity pass.
+**N-15 · Background from blur** (N-13) — the blur map as a mask. *Done when:* the tests on the blur-map fixtures pass.
+**N-16 · SAM 2 weights** (N-01) — conversion script, safetensors f16, our release asset, the fetch with SHA-256, bundled in the app and in `data/` for `ym`, model card, notice, `docs/14`. *Done when:* the licence check passes and the build bundles the weights.
+**N-17 · SAM 2 runtime** (N-16) — encoder, prompt encoder, decoder; deterministic; oracle fixtures from Meta's code. *Done when:* the IoU (≥ 0.99) and logit gates pass and the timing is measured.
+**N-18 · Object in the app** (N-13, N-17) — `mask_find`, encoder in the background, feature cache, points and box, the "Object found" pill and the nothing-found error. `ym`: the `mask` error kind and the Masks line gain Object; `docs/10` and the help in the same commit. *Done when:* e2e passes and the app and `ym` agree on an Object mask.
+**[HUMAN] N-H4** Checkpoint 3: a test DMG with SAM 2, timed on the owner's Mac.
+**N-19 · Subject and People** (N-13) — Vision through `ym-apple` behind the macOS gate, a cached run-time probe, the items hidden where unsupported, the row message and the `ym` error for a document that has one anyway. `ym`: the `mask` error for Subject and People; `docs/10` and the help in the same commit. *Done when:* the Mac CI and the parity on a Mac pass; Linux and older-Mac builds show no Vision items.
+**N-20 · Finish** (N-12 to N-19) — speed checks on a Mac, docs, `STATUS`, `CHANGELOG` (the JSON of `ym` changed shape; a 0.1 settings file is refused), README (its CLI section), `docs/10` read once more against the help and every output, screenshots; then the 0.2.0 release after N-H5. *Done when:* the gates are in `docs/STATUS.md`.
+**[HUMAN] N-H5** Checkpoint 4: the final test of the whole plan; the owner's OK releases 0.2.0. **N-H1** (approve the spec) closes N-01.
+
+**Gate N (0.2.0):** the gates of `docs/23` §11 pass (old documents byte-identical, parity, determinism and tiles, app and CLI, SAM 2, masks, speed on a Mac); the owner's approval of the last test build.
+
+---
+
+## F · Film node (released as 0.2.1)
+
+A **Film node** that simulates a colour negative, a print and a scan with our own engine (`ym-film`, Apache-2.0) and Andrea Volpato's spektrafilm profiles (CC BY-SA 4.0), shipped as separate credited data. **Scheduled 2026-11-04 (F-H0), on branch `film`;** the owner's decisions of that day are in `docs/24` §1.3 (no letter to the author, variant A, real stock names with the disclaimer, the CIE tables shipped as credited data). F-01, the mockup round, is first. The spec is `docs/24-film.md`; the facts are in `research/film-spektrafilm-2026-11-01.md`. It needs the graph, plan and multi-pass loop of N (N-02 to N-04), the panel and masks (N-08 to N-12) and the tile-halo machinery (N-13).
+
+Tasks (details, dependencies and *Done when* in `docs/24` §10): **F-01** mockups and the revised spec · **F-02** data and licences · **F-03** the engine's colour reference · **F-04** baking and the return through the cine rendering · **F-05** the spatial passes on the CPU · **F-06** the oracle and the provenance check · **F-07** the node in the core and `ym` · **F-08** the GPU passes · **F-09** the interface · **F-10** finish. **[HUMAN]** F-H0 schedule (done 2026-11-04) · F-H1 approve the mockups (variant A and the stock names decided 2026-11-04) · F-H2 write to the author and to hanatos (closed 2026-11-04: "It's fine just to mention Volpato") · F-H3 test build on a Mac · F-H4 trademark and data-rights check.
+
+**Gate F:** the gates of `docs/24` §8 pass; the credit lines are in `NOTICE`, About and the node; the owner's approval of the last test build.
+
+---
+
+## D · Depth mask (released as 0.2.2; the owner's approval 2026-11-09)
+
+Goal: a **Depth** mask in the Find group, cut from a relative depth map that **Depth Anything V2-Small** makes from the photo (24.8 M parameters, Apache-2.0, about 50 MB at f16, bundled like SAM 2.1's 77 MB), as a gradient to a far limit (first built as Near, Far and Softness bounds; the owner replaced them on 2026-11-08, `docs/23` §4.8), **Pick depth** and **Focus plane** (from the Sony focus box), a greyscale **Show depth** view, and `ym` support. The model is for masks only: lens character keeps its blur map. The spec is `docs/23-nodes.md` §4.8, the maths `docs/algorithms/06-masks.md` §5.8 and §8, the model `docs/07-ml-models.md`, the licence row `docs/14-licensing.md`; the facts and sources are in `research/depth-mask-2026-11-07.md`. **The owner's decisions of 2026-11-07** (`docs/STATUS.md` question 41): a depth model for masks only; bundled, never downloaded by the app; the teacher chain accepted (Apache-2.0 weights whose unreleased teacher trained on Hypersim, CC BY-SA 3.0, and Virtual KITTI 2, non-commercial), stated in the model card as SAM's card states SA-1B; the model is Depth Anything V2-Small; the working choices (band bounds with rank normalisation, Focus plane from the focus box, exports from the CPU map, evaluation on DIODE plus public photos) are settled on the evaluation sheets. V1's data rule holds: no measurements of our own, and no photos are shot for it.
+
+**D-01 · Spec** () — `docs/23` §3.3, §3.10a and §4.8, `docs/algorithms/06` §5.8 and §8, `docs/07`, `docs/14` (the licence row, the teacher chain), `docs/10`, `docs/11` (short, pending the mockup), `docs/12`, this milestone, the model card draft `data/models/depth/MODEL_CARD.md` and `NOTICE` item 13. *Done when:* the specs agree with each other, `python3 tools/licences/check_bundle.py` passes, and the lead has read them. Everything not yet measured is marked as such.
+**D-02 · Weights and oracle** (D-01) — `training/depth/` (`export.py`: the checkpoint to f16 safetensors with a self-describing header; `oracle.py`: fixtures from the upstream code; `oracle_photos.json`: 20 public photos with licences and hashes; `requirements.txt` with the pinned commit and versions; the tests of the scripts), a `depth` job in `.github/workflows/models.yml` that publishes the prerelease `models-depth-anything-v2-small-1`, `tools/fetch/depth.sh` (with `--fixtures`) with its SHA-256 pins, `data/models/depth/` (`.gitignore`, `SHA256SUMS`), and `tools/licences/check_bundle.py` taught the depth weights and `NOTICE` item 13. Conversion runs in CI, not on a developer's disk. The first fixtures settle the sign of the output (larger for nearer), how the sky is treated, the class-token and batch-norm settings of the checkpoint, and the exact tensor count and size. *Done when:* the release and the fixtures are published, the checkpoint's SHA-256 and the licence sentence are re-read at the pinned commit and written into `docs/14` and the card, `check_bundle.py --require-weights` passes with the fetched file, and the cost of f16 against the f32 checkpoint is reported.
+**D-03 · Runtime** (D-02) — `ym_ml::depth`: the network in Rust on the `sam2` kernels, the new operations (patch embedding, LayerScale, DINOv2's positional resize, the transposed convolutions, the dense 3 × 3 convolutions, the bilinear resizes) each with a test against its definition, the picture's resize and normalisation, the mid-rank (section 5.8 step 1), `DepthModel::probe`. *Done when:* the gates of `docs/algorithms/06` §8.6 pass against the oracle (the resize, the four maps, the map, **the cut's IoU at least 0.99** on 20 photos at five bands, a second run and 1, 2 and 8 threads bit-identical), the timing on the Linux machine is measured and written into the spec and `docs/STATUS.md`, and the Mac timing is listed under M0-H4.
+**D-04 · Core and `ym`** (D-01; real weights from D-03, a small fake model before) — `MaskKind::Depth` with its fields, validation and clamping (`docs/23` §3.3, §3.5), the map and its worker (150 ms debounce, cancellable, a viewer never waits), the key and its cache, `RasterSource::Depth` and the plane cache, the scheduler footprints (`StepKind` and `OpKind` have no wildcard arm), the grade-plan key, `sample_depth`, `focus_plane`, the Show depth view, `mask_kinds`, `DepthModel` in `MaskSupport`, `ym doctor`'s Masks line and the `mask` error, the schema, the copy rule, the mock's data, and a fake model so that the random-graph test draws Depth. `docs/10` and the help change in the same commit. *Done when:* `cargo test --workspace` is green; the rank, band, Pick depth and Focus plane tests of `docs/algorithms/06` §7 pass; **the app and `ym` write byte-identical files for a Depth row**; **the golden images and every document without a Depth row are unchanged**; the map's key follows the Input and not a node; the docs test passes.
+**D-05 · Interface** (D-04) — first the mockup of the Depth card (`docs/11` *The Depth card*) for the owner's approval, then the card, Pick depth, Focus plane, the Show depth view, the row, the menu item and the states (`docs/23` §7.6), then the e2e tests and the new reference screenshots. *Done when:* the mockup is approved (D-H1), e2e passes against the mock, the glass audit and a11y pass with the new states, the screenshots are looked at by the owner before they are committed, and the native-viewport check on a Mac is listed.
+**[HUMAN] D-H1 · Approve the mockup** of the Depth card (D-05 builds nothing before it).
+**D-06 · Evaluation** (D-03, D-04) — public data only (V1 data rule): the **ordering** of near and far on DIODE (MIT) against the oracle's own ordering and the DA-2K figure for ViT-S that the authors report (95.3 % of pairs; the exact pair metric is written first); contact sheets of public photos for hair, foliage, sky, glass, mirrors and water, macro, shallow-focus backgrounds and flat copy work, with the band at several settings, with and without Refine edges and with a Subject row; the rank against a percentile scaling on the same sheets; the defaults (`far` 0.5, `softness` 0.5, `refine` 0.5, the pick width 0.2, the ramp minimum 0.02) and the Focus plane's box and width; whether a width from `FocusPosition2` helps (on public files only); Linux timing, and the Mac timing listed under M0-H4; the model card's known limits filled in from the sheets. *Done when:* the numbers and the sheets are in `docs/STATUS.md`, the card is finished, and every changed default is in the spec.
+**[HUMAN] D-H2 · Blind review** of the contact sheets by the owner: keep, change the defaults, or drop the kind.
+
+**Gate D:** the gates of `docs/algorithms/06` §8.6 (resize, maps, the cut's IoU at least 0.99 on 20 photos, 1, 2 and 8 threads equal) and of `docs/23` §11 (the Depth row: app and `ym` byte-identical, documents without a Depth row byte-identical, the golden images unchanged); `cargo deny check` and `check_bundle.py --require-weights` pass with the depth weights and `NOTICE` item 13; the DIODE ordering of our runtime within half a point of the oracle's (starting); the timings written down (Mac: M0-H4); the owner's verdict at D-H2. A failed gate is reported, never loosened.
+
+---
+
+## X · Mixers (released as 0.2.3; the Mac speed check waits on the owner)
+
+The node kinds the Add node menu shows as "Later": **Parallel** (adds each branch's change to the picture the branches start from), **Layer** (stacks its inputs and blends each over the ones below, in linear light, through the mask of the node that feeds it) and **Splitter and combiner** (one channel per branch, then one picture again). The spec is `docs/25-mixers.md`; the facts are in `research/research_notes/Node mixers/resolve_mixers.md`. **The owner's decisions of 2026-11-10** (`docs/STATUS.md` question 43): "All three now"; Parallel is "Input + each branch's change" on LogC4 code values; the Layer's modes are the "Scene-safe short list" (Normal, Add, Subtract, Multiply, Lighten, Darken, Difference) in linear light; a layer's alpha is the "Feeding node's mask, as Resolve". The other choices are working choices that wait on X-H1 (`docs/25` §9). `PIPELINE_VERSION` takes a minor step to 0.11.0; graphs without the new kinds change by no bit. It needs the graph, plan and panel of N (N-02 to N-12).
+
+Tasks (details, dependencies and *Done when* in `docs/25` §10): **X-01** spec (this milestone, `docs/25`, the changes to `docs/23`, `docs/algorithms/06`, `docs/10`, `docs/11` and `docs/STATUS.md`) · **X-02** mockups in `design/mixers/` · **X-03** format, validation, patches, wire and TS types, schema and CLI (no change in the app's interface) · **X-04** the plan with steps of several inputs and the CPU reference, with random graphs that have joins · **X-05** the device (the plan record within the K3 bindings, the WGSL, parity on lavapipe; Metal through the Mac GPU CI) · **X-06** the interface (the menu, the cards with numbered ports and "+", the link rules, the graph operations, the panels, the mock, e2e, screenshots the owner reviews) · **X-07** finish (the gates, `CHANGELOG`, pipeline 0.11.0, a test build). **[HUMAN]** X-H1 approve the mockups and the working choices (no interface work before it) · X-H2 test build and review on a Mac.
+
+**Gate X:** the gates of `docs/25` §7 pass (formulas and identities on the CPU, the plan, random graphs with joins, tiles and determinism, app and `ym` byte-identical, device parity on lavapipe and Metal, the interface); `golden check` 61 of 61 unchanged; the owner's approval of the last test build.
 
 ---
 
 ## M4 · Beta to 1.0
 
 **M4-01 · Betas** 0.9.x releases to a small group; local panic log; triage. *Done when:* no open crash or data-loss bugs.
-**M4-02 · Hardening** 8 GB Macs, Intel Macs, 2000-file folders, corrupt files, disk-full during export. *Done when:* each case handled with a clear message.
-**M4-03 · Documentation** README (public, `README.md` draft in the package), user guide in `docs/user/`, CLI man page (`clap_mangen`), DNG notice. *Done when:* reviewed by Mykyta.
-**M4-04 · Accessibility** VoiceOver labels, focus order, keyboard-only use, contrast check of tab colours. *Done when:* checklist passes.
+**M4-02 · Hardening** 8 GB Macs, Intel Macs, 2000-file folders, corrupt files, disk-full during export. *Done when:* each case handled with a clear message. The audit and the tasks H-01 to H-18 are in `docs/26-hardening.md` (2026-11-11).
+**M4-03 · Documentation** README (public), user guide in `docs/user/`, CLI man page (`clap_mangen`), DNG notice. *Done when:* reviewed by the owner. The guide's Accessibility page is drafted in `docs/user-guide-accessibility.md` (M4-04 A-12); the guide takes it into `docs/user/` when it is written.
+**M4-04 · Accessibility** VoiceOver labels, focus order, keyboard-only use, contrast check of tab colours. *Done when:* checklist passes. The audit, the tasks A-01 to A-12 and the checklist are in `docs/28-accessibility.md` (2026-11-13), with the checklist's results in its section 6a. **Built; Mac checks waiting on the owner** (A-MC-1 to A-MC-11, `docs/STATUS.md`): until the owner runs them it is built and unproven, as M4-02 is.
 **M4-05 · Fuzzing campaign** 8 hours per target. *Done when:* no open findings.
 **M4-06 · Release 1.0.0** *Done when:* gate passes and the release pipeline publishes it.
 
-**[HUMAN] M4-H1** Blind A/B of 50 A1 photos vs Capture One, Lightroom and DxO. **M4-H2** Decide on Apple Developer ID signing and notarisation; provide certificates if yes. *(Answered 2026-10-15: no; the app ships unsigned.)* **M4-H3** Trademark clearance (EUIPO, INPI, WIPO, UK IPO). **M4-H4** Freedom-to-operate check on US 11948279. **M4-H5** Announce.
+**[HUMAN] M4-H1** Blind A/B of 50 A1 photos vs Capture One, Lightroom and DxO. **M4-H2** Decide on Apple Developer ID signing and notarisation; provide certificates if yes. (Decided: no; the app ships unsigned.) **M4-H3** Trademark clearance (EUIPO, INPI, WIPO, UK IPO). **M4-H4** Freedom-to-operate check on US 11948279. **M4-H5** Announce.
 
-**Gate M4 (1.0):** whole-app blind A/B ≥ 50% preferred or tied; all earlier gates still pass; legal items closed or explicitly accepted by Mykyta.
+**Gate M4 (1.0):** whole-app blind A/B ≥ 50% preferred or tied; all earlier gates still pass; legal items closed or explicitly accepted by the owner.
 
 ---
 
 ## V2 backlog: controlled captures
 
-Not part of V1. When Mykyta is ready to shoot, these improve accuracy for the A1:
+Not part of V1. When the owner is ready to shoot, these improve accuracy for the A1:
 
 - Grey-card shots under daylight, shade, tungsten, LED and fluorescent (illuminant-estimator truth on the target body).
 - Flat fields and lens test shots per lens (vignetting and distortion truth).

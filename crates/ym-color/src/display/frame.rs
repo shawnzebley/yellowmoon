@@ -24,6 +24,7 @@ use std::thread;
 use super::DisplayError;
 use super::chain::{ColorChain, View};
 use crate::consts::Vec3;
+use crate::mask::{PhotoFrame, PhotoMap, PhotoSpot, PixelAt, RasterPlanes};
 
 /// Rows per band are chosen so that each thread gets about this many bands (load balancing).
 const BANDS_PER_THREAD: usize = 8;
@@ -49,6 +50,8 @@ pub struct Frame<'a> {
     height: usize,
     layout: Layout,
     data: &'a [f32],
+    photo: Option<(&'a dyn PhotoMap, PhotoFrame)>,
+    rasters: Option<&'a dyn RasterPlanes>,
 }
 
 impl fmt::Debug for Frame<'_> {
@@ -57,6 +60,8 @@ impl fmt::Debug for Frame<'_> {
             .field("width", &self.width)
             .field("height", &self.height)
             .field("layout", &self.layout)
+            .field("photo", &self.photo.map(|(_, frame)| frame))
+            .field("rasters", &self.rasters.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -101,6 +106,37 @@ impl<'a> Frame<'a> {
             height,
             layout,
             data,
+            photo: None,
+            rasters: None,
+        })
+    }
+
+    /// The same frame with the photo-frame position of every pixel known: `map` gives the position of
+    /// pixel `(x, y)` of this frame and `frame` is the render's [`PhotoFrame`]. The mask shapes of the
+    /// nodes read it; without it they select nothing.
+    #[must_use]
+    pub fn with_photo(mut self, map: &'a dyn PhotoMap, frame: PhotoFrame) -> Self {
+        self.photo = Some((map, frame));
+        self
+    }
+
+    /// The same frame with the raster planes of its window: plane `i` at pixel `(x, y)` of this frame is the
+    /// value the raster row `i` of the chain selects there. A raster row of a frame without planes selects
+    /// nothing. The planes cover this frame's window exactly.
+    #[must_use]
+    pub fn with_rasters(mut self, planes: &'a dyn RasterPlanes) -> Self {
+        self.rasters = Some(planes);
+        self
+    }
+
+    /// The place of pixel `(x, y)` in the photo frame, when the frame knows it.
+    fn spot(&self, x: usize, y: usize) -> PixelAt<'a> {
+        self.photo.map(|(map, frame)| {
+            let spot = PhotoSpot::new(map.position(x, y), frame);
+            match self.rasters {
+                Some(planes) => spot.with_raster(planes, x, y),
+                None => spot,
+            }
         })
     }
 
@@ -317,8 +353,8 @@ impl ColorChain {
         out: &mut [f32],
         threads: usize,
     ) -> Result<(), DisplayError> {
-        map_pixels(src, out, out_layout, threads, |rgb, _, _| {
-            to_f32(self.apply_view_pixel(view, rgb))
+        map_pixels(src, out, out_layout, threads, |rgb, x, y| {
+            to_f32(self.apply_view_pixel_at(view, rgb, src.spot(x, y)))
         })
     }
 
@@ -335,14 +371,33 @@ impl ColorChain {
         out: &mut [f32],
         threads: usize,
     ) -> Result<(), DisplayError> {
-        map_pixels(src, out, out_layout, threads, |rgb, _, _| {
-            to_f32(self.apply_to_display_linear(rgb))
+        map_pixels(src, out, out_layout, threads, |rgb, x, y| {
+            to_f32(self.apply_to_display_linear_at(rgb, src.spot(x, y)))
+        })
+    }
+
+    /// Renders camera RGB to the LogC4 / AWG4 value the chain has after its nodes and its look
+    /// ([`ColorChain::apply_logc4_pixel_at`]), f32, not clamped. The Film node reads the picture it takes in this
+    /// way (`docs/24`): a chain whose plan ends at the node's input and has no look.
+    ///
+    /// # Errors
+    ///
+    /// [`DisplayError::BadBuffer`] when `out` has the wrong length.
+    pub fn render_logc4_f32(
+        &self,
+        src: &Frame<'_>,
+        out_layout: Layout,
+        out: &mut [f32],
+        threads: usize,
+    ) -> Result<(), DisplayError> {
+        map_pixels(src, out, out_layout, threads, |rgb, x, y| {
+            to_f32(self.apply_logc4_pixel_at(rgb, src.spot(x, y)).0)
         })
     }
 
     /// Renders the DNG's pixels ([`ColorChain::apply_dng_pixel`]): C1 to C11 decoded back to linear
-    /// AWG4 (f32, unclipped), or, when C12 is not our ACES 2 ([`ColorChain::dng_inverts_display`]),
-    /// the scene values that ACES 2 turns into the chain's picture.
+    /// AWG4 (f32, unclipped), or, when C12 is not the cine rendering ([`ColorChain::dng_inverts_display`]),
+    /// the scene values that the cine rendering turns into the chain's picture.
     ///
     /// # Errors
     ///
@@ -354,8 +409,8 @@ impl ColorChain {
         out: &mut [f32],
         threads: usize,
     ) -> Result<(), DisplayError> {
-        map_pixels(src, out, out_layout, threads, |rgb, _, _| {
-            to_f32(self.apply_dng_pixel(rgb))
+        map_pixels(src, out, out_layout, threads, |rgb, x, y| {
+            to_f32(self.apply_dng_pixel_at(rgb, src.spot(x, y)))
         })
     }
 
@@ -379,7 +434,7 @@ impl ColorChain {
     ) -> Result<(), DisplayError> {
         map_pixels(src, out, Layout::Interleaved, threads, |rgb, x, y| {
             self.quantize_u8(
-                self.apply_view_pixel(view, rgb),
+                self.apply_view_pixel_at(view, rgb, src.spot(x, y)),
                 origin.0.wrapping_add(x),
                 origin.1.wrapping_add(y),
             )
@@ -399,8 +454,8 @@ impl ColorChain {
         out: &mut [u16],
         threads: usize,
     ) -> Result<(), DisplayError> {
-        map_pixels(src, out, Layout::Interleaved, threads, |rgb, _, _| {
-            self.quantize_u16(self.apply_view_pixel(view, rgb), bits)
+        map_pixels(src, out, Layout::Interleaved, threads, |rgb, x, y| {
+            self.quantize_u16(self.apply_view_pixel_at(view, rgb, src.spot(x, y)), bits)
         })
     }
 

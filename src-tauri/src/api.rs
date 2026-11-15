@@ -14,9 +14,9 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 
-use ym_core::app::gpu::{GpuOpener, GpuPolicy, GpuSlot};
+use ym_core::app::gpu::{GpuPolicy, GpuSlot};
 use ym_core::app::{Core, CoreOptions};
-use ym_core::apple_auto::AutoAdvisor;
+use ym_core::auto_provider::ProviderAdvisors;
 use ym_core::export_queue::{ExportEvent, ExportJob as CoreExportJob, ExportSink};
 use ym_core::pipeline::PhotoSource;
 use ym_core::session::{
@@ -30,15 +30,19 @@ use ym_looks::library::LookId as CoreLookId;
 
 use crate::cli_link::{CliLink, Elevate};
 use crate::events::{AppEvent, Emitter};
+use crate::node_thumbs::NodeThumbnailer;
 use crate::thumbs::Thumbnails;
 use crate::viewport::{FrameSink, FrameStore, Viewport, core_id};
 use crate::wire::{
-    AppError, AppInfo, AppleAutoStatus, ApplyScope, ChromaSample, ChromaScatter, CliLinkResult,
-    CliLinkStatus, DisplayLut, ErrorScope, ExportEstimate, ExportJob, ExportJobId, HistogramData,
-    Look, LookId, LookInput, LooksImportProgress, LooksImportResult, OpenSummary, PasteReport,
-    PhotoId, PhotoProgress, PixelSample, Preferences, PreferencesPatch, ResolvedSettings,
-    SessionChange, SessionState, SettingsPatch, SourceRecognition, ThumbnailReady, ViewportInfo,
-    ViewportInput, ViewportMode, ViewportRect, WatchStatus, convert,
+    AppError, AppInfo, ApplyScope, AutoStatus, ChromaSample, ChromaScatter, ChromaTap,
+    CliLinkResult, CliLinkStatus, CropAspect, CropSuggestion, DepthFar, DepthState, ErrorScope,
+    ExportEstimate, ExportJob, ExportJobId, FocusPlaneResult, FocusReason, HistogramData, LensInfo,
+    Look, LookId, LookInput, LooksImportProgress, LooksImportResult, MapFrom, MaskFindPrompt,
+    MaskFindResult, MaskKind, MaskView, MemoryNotice, NodeId, Num, ObjectState, OpenProgress,
+    OpenSummary, Orientation, PasteReport, PhotoId, PhotoProgress, PixelSample, Preferences,
+    PreferencesPatch, ResolvedSettings, SessionChange, SessionState, SettingsPatch,
+    SourceRecognition, ThumbnailReady, ViewportInfo, ViewportInput, ViewportMode, ViewportRect,
+    VisionState, WatchStatus, convert,
 };
 use crate::wizard::{Downloads, recognise};
 
@@ -68,21 +72,46 @@ pub struct AppConfig {
     pub decode_threads: Option<usize>,
     /// The Downloads watcher's settings.
     pub watch: WatchConfig,
-    /// What looks at each photo for Apple Auto (`docs/19` sections 11 and 12): `ym_apple`'s system
-    /// advisor in the app (Apple's on-device model where it is available, the fake with
-    /// `YELLOWMOON_TEST_APPLE_AUTO=fake`); `None` in the tests unless they give one, which is the
-    /// same as unavailable.
-    pub advisor: Option<Advisor>,
+    /// What looks at each photo for Auto (`docs/19` sections 11 and 12, `docs/22` section 12.6): in
+    /// the app `ym_apple`'s system advisor (Apple's on-device model where it is available, the fake
+    /// with `YELLOWMOON_TEST_APPLE_AUTO=fake`) and the two programs' `ym_agents::system_advisors`
+    /// (Claude Code and Antigravity, **not started**: `LAUNCH_PROBE`; the test hook
+    /// `YELLOWMOON_TEST_AUTO_PROVIDERS` swaps them for fakes). Empty in the tests unless they give
+    /// some, which is the same as every provider unavailable.
+    pub advisors: ProviderAdvisors,
+    /// What makes the Subject and People masks (`docs/23` sections 3.10 and 4.5): in the app `ym_apple`'s system Vision
+    /// (this Mac's Vision framework, or what `YELLOWMOON_TEST_VISION` says); `None` in the tests unless they give one,
+    /// which is a computer that cannot make the masks.
+    pub vision: Option<Arc<dyn ym_core::vision::VisionProvider>>,
+    /// The Depth model (`docs/23` section 4.8): `None` in the app, which finds it in the data folder
+    /// (`models/depth`, `ym_core::pipeline::DepthModel::probe`); the tests give a fake one so that Depth rows work without the
+    /// weights.
+    pub depth: Option<Arc<ym_core::pipeline::DepthModel>>,
+    /// Where the memory-pressure poll reads the level (`docs/26` H-14): the app gives this computer's
+    /// (`ym_core::memory::system_pressure_source`, the macOS `sysctl`; always normal elsewhere); the tests give none (no poll
+    /// thread) or a source of their own.
+    pub pressure: Option<ym_core::memory::PressureSource>,
 }
 
-/// An Apple Auto advisor for [`AppConfig`].
-#[derive(Clone)]
-pub struct Advisor(pub Arc<dyn AutoAdvisor>);
+/// What the app starts when it launches: **no probe**. The programs' advisors are built with
+/// `StartProbe::Never`, so launching the app runs neither `claude` nor `agy` (owner, 2026-10-29:
+/// "only instantiate CLIs when we need grading and immediately close them after finish"; `docs/22`
+/// sections 0 and 3.3). The chosen program is checked when photos are opened or an export starts
+/// (`Session::open`, `Core::export_start`), and every program when Preferences opens
+/// (`Core::auto_status`).
+pub(crate) const LAUNCH_PROBE: ym_agents::StartProbe = ym_agents::StartProbe::Never;
 
-impl std::fmt::Debug for Advisor {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("Advisor")
+/// The advisors of this computer: Apple Intelligence's, and the two programs' (`docs/22` section 12.6),
+/// none of them started ([`LAUNCH_PROBE`]). Apple's availability is an operating-system call, not a
+/// program, and is read as before.
+fn system_advisors() -> ProviderAdvisors {
+    use ym_core::auto_provider::AutoProvider;
+    let mut advisors =
+        ProviderAdvisors::default().with(AutoProvider::Apple, ym_apple::system_advisor());
+    for (provider, advisor) in ym_agents::system_advisors(LAUNCH_PROBE) {
+        advisors = advisors.with(provider, advisor);
     }
+    advisors
 }
 
 impl AppConfig {
@@ -105,7 +134,10 @@ impl AppConfig {
             thumbnails: true,
             decode_threads: None,
             watch: WatchConfig::default(),
-            advisor: Some(Advisor(ym_apple::system_advisor())),
+            advisors: system_advisors(),
+            vision: Some(ym_apple::system_vision()),
+            depth: None,
+            pressure: Some(ym_core::memory::system_pressure_source()),
         })
     }
 }
@@ -116,6 +148,8 @@ pub struct AppApi {
     emitter: Arc<dyn Emitter>,
     viewport: Viewport,
     thumbs: Thumbnails,
+    /// The node thumbnails of the node view (`node_thumbnails`).
+    node_thumbs: NodeThumbnailer,
     downloads: Downloads,
     watch: WatchConfig,
     cli: Option<CliLink>,
@@ -165,10 +199,13 @@ fn look_id(id: &LookId) -> Result<CoreLookId, AppError> {
 
 /// The fields of a patch that change what a thumbnail shows.
 fn touches_thumbnail(patch: &SettingsPatch) -> bool {
-    patch.look.is_some()
-        || patch.look_intensity.is_some()
-        || patch.crop.is_some()
-        || patch.orientation.is_some()
+    patch.nodes.values().any(|node| {
+        node.look.is_some()
+            || node.look_intensity.is_some()
+            || node.crop.is_some()
+            || node.orientation.is_some()
+            || node.lens.is_some()
+    })
 }
 
 impl AppApi {
@@ -250,7 +287,9 @@ impl AppApi {
         options.export_events = export_events;
         options.home = config.home.clone();
         options.thumbnails = config.thumbnails;
-        options.advisor = config.advisor.as_ref().map(|a| Arc::clone(&a.0));
+        options.advisors = config.advisors.clone();
+        options.render.vision = config.vision.clone().map(ym_core::vision::VisionMasks::new);
+        options.render.depth_model = config.depth.clone();
         if let Some(threads) = config.decode_threads {
             options.decode_threads = threads;
         }
@@ -267,14 +306,108 @@ impl AppApi {
                 shared.invalidate();
             });
         }
+        {
+            // A provider's availability changed (a program found, signed in or out, a probe ended):
+            // the webview asks `auto_status()` again (`docs/22` section 12.6). It runs on the probe's
+            // thread, so it only sends the event.
+            let emitter = Arc::clone(&emitter);
+            core.on_auto_changed(move || emitter.emit(AppEvent::AutoStatusChanged));
+        }
+        {
+            // SAM's encoder started or stopped working for a photo: the rows say "Getting ready…" while it does, and a photo
+            // that has its features now is drawn again (an Object row selects nothing until then).
+            let emitter = Arc::clone(&emitter);
+            let shared = Arc::clone(&shared);
+            core.renderer
+                .set_object_listener(Arc::new(move |id, phase| {
+                    let preparing = phase == ym_core::pipeline::ObjectPhase::Preparing;
+                    emitter.emit(AppEvent::ObjectState(ObjectState {
+                        photo_id: PhotoId(id.0),
+                        preparing,
+                    }));
+                    if !preparing {
+                        shared.estimates_changed(id);
+                    }
+                }));
+        }
+        {
+            // The worker that makes the Subject and People masks of the photo being looked at (`docs/23` section 4.5): while
+            // it works the viewport is busy and finding (the rows say "Finding…", `viewport_busy.finding`); when it ends the
+            // photo is drawn again with the masks, and the page learns which kinds found nothing ("Nothing found").
+            let emitter = Arc::clone(&emitter);
+            let shared = Arc::clone(&shared);
+            core.renderer
+                .set_vision_listener(Arc::new(move |id, phase| match phase {
+                    ym_core::pipeline::VisionPhase::Started => shared.masks_finding(true),
+                    ym_core::pipeline::VisionPhase::Finished { nothing_found } => {
+                        shared.masks_finding(false);
+                        match convert::<_, Vec<MaskKind>>(&nothing_found) {
+                            Ok(nothing_found) => emitter.emit(AppEvent::VisionState(VisionState {
+                                photo_id: PhotoId(id.0),
+                                nothing_found,
+                            })),
+                            Err(e) => tracing::error!(error = %e, "vision_state did not convert"),
+                        }
+                        shared.estimates_changed(id);
+                    }
+                }));
+        }
+        {
+            // The worker that makes the depth map of the photo being looked at (`docs/23` section 4.8): while it runs the
+            // viewport is busy and finding (the Depth rows with the eye on say "Finding…", `viewport_busy.finding`); when it
+            // ends the photo is drawn again with the mask, and the page learns whether the map failed (`depth_state`).
+            let emitter = Arc::clone(&emitter);
+            let shared = Arc::clone(&shared);
+            core.renderer
+                .set_depth_listener(Arc::new(move |id, phase| match phase {
+                    ym_core::pipeline::DepthPhase::Started => shared.masks_finding(true),
+                    ym_core::pipeline::DepthPhase::Finished { failed } => {
+                        shared.masks_finding(false);
+                        emitter.emit(AppEvent::DepthState(DepthState {
+                            photo_id: PhotoId(id.0),
+                            failed,
+                        }));
+                        shared.estimates_changed(id);
+                    }
+                }));
+        }
+        if let Some(masks) = core.renderer.vision_masks() {
+            // Ask the computer once, off the thread that opens the app: the first Add mask menu then finds the answer
+            // there (`mask_kinds` waits for the same probe otherwise). It runs each Vision request on a 64 x 64 picture.
+            let spawned = std::thread::Builder::new()
+                .name("yellowmoon-vision-probe".to_owned())
+                .spawn(move || {
+                    let _ = masks.support();
+                });
+            if let Err(e) = spawned {
+                tracing::warn!(error = %e, "the Vision probe could not start early");
+            }
+        }
+        {
+            // The computer is short of memory (`docs/26` H-14): the core says the sentence once on the way into the critical level
+            // and says it is gone when the level is normal. It runs on the poll thread, so it only sends the event.
+            let emitter = Arc::clone(&emitter);
+            core.on_memory_notice(move |message| {
+                emitter.emit(AppEvent::MemoryNotice(MemoryNotice {
+                    message: message.map(str::to_owned),
+                }));
+            });
+        }
+        if let Some(source) = config.pressure.clone() {
+            core.start_memory_watch(source, ym_core::memory::POLL_INTERVAL)
+                .map_err(AppError::internal)?;
+        }
         viewport.attach(&core)?;
         let thumbs = Thumbnails::new(Arc::clone(&emitter), Arc::clone(&frames));
         thumbs.attach(&core).map_err(AppError::internal)?;
+        let node_thumbs = NodeThumbnailer::new(Arc::clone(&emitter), Arc::clone(&frames));
+        node_thumbs.attach(&core).map_err(AppError::internal)?;
         Ok(Arc::new(Self {
             core,
             emitter,
             viewport,
             thumbs,
+            node_thumbs,
             downloads: Downloads::default(),
             watch: config.watch,
             cli,
@@ -303,8 +436,15 @@ impl AppApi {
         &self.thumbs
     }
 
-    /// Stops what runs in the background (quitting): exports and renders are cancelled and partial
-    /// files are removed.
+    /// The maker of node thumbnails, for the tests.
+    #[cfg(test)]
+    pub(crate) fn node_thumbnailer(&self) -> &NodeThumbnailer {
+        &self.node_thumbs
+    }
+
+    /// Stops what runs in the background (quitting): exports and renders are cancelled, partial
+    /// files are removed and the programs Auto started are killed (`Core::shutdown` calls
+    /// `cancel_auto`, `docs/22` section 9.4: a child is not stopped by its parent's death on Unix).
     pub fn shutdown(&self) {
         self.downloads.set(
             false,
@@ -322,13 +462,31 @@ impl AppApi {
     ///
     /// # Errors
     ///
-    /// [`AppError`] with "No ARW files in what you dropped." when nothing is an ARW file, or when
-    /// what was given is not there.
+    /// [`AppError`] with "No ARW files in what you dropped." when nothing is an ARW file, with
+    /// "Yellowmoon can't read the folder {name}. …" when a folder could not be read (`docs/26`
+    /// H-02), or when what was given is not there.
     pub fn open_paths(&self, paths: &[String]) -> Result<SessionState, AppError> {
         let paths: Vec<PathBuf> = paths.iter().map(PathBuf::from).collect();
-        let outcome = self.core.session.open(&paths, OpenOptions::default());
-        // Something that is not there is not "no ARW files": say so first.
-        if outcome.added.is_empty() && outcome.already_open == 0 && !outcome.missing.is_empty() {
+        // Progress goes out as `open_progress` (at most one event per 50 files), so a long read of a
+        // folder of thousands shows "Reading {done} of {total} files…" and can be cancelled.
+        let emitter = &self.emitter;
+        let outcome = self.core.session.open_with_progress(
+            &paths,
+            OpenOptions::default(),
+            &|p: ym_core::session::OpenProgress| {
+                emitter.emit(AppEvent::OpenProgress(OpenProgress {
+                    done: u32::try_from(p.done).unwrap_or(u32::MAX),
+                    total: u32::try_from(p.total).unwrap_or(u32::MAX),
+                }));
+            },
+        );
+        // Something that is not there is not "no ARW files": say so first. A folder that could not be
+        // read is not "no ARW files" either: `message` names it.
+        if outcome.added.is_empty()
+            && outcome.already_open == 0
+            && outcome.unreadable.is_empty()
+            && !outcome.missing.is_empty()
+        {
             return Err(AppError::new(
                 ErrorScope::Open,
                 "That file isn't there any more. Check that its drive is connected, then open it again.",
@@ -343,8 +501,15 @@ impl AppApi {
         state.opened = Some(OpenSummary {
             added: u32::try_from(outcome.added.len()).unwrap_or(u32::MAX),
             already_open: u32::try_from(outcome.already_open).unwrap_or(u32::MAX),
+            cancelled: outcome.cancelled,
         });
         Ok(state)
+    }
+
+    /// `cancel_open`: stops the `open_paths` or `open_dialog` call that is reading files. The files
+    /// read so far stay in the session; the others are dropped (`docs/26` P3-3).
+    pub fn cancel_open(&self) {
+        self.core.session.cancel_open();
     }
 
     /// Remembers the folder the first path came from (`last_used_folders.open`). A failure to save
@@ -381,6 +546,7 @@ impl AppApi {
     pub fn close_session(&self) {
         self.core.close_session();
         self.thumbs.clear();
+        self.node_thumbs.clear();
         self.frames.clear_thumbnails();
         self.viewport.set_photo(None);
     }
@@ -398,6 +564,34 @@ impl AppApi {
                 url,
             })
             .collect()
+    }
+
+    /// `thumbnails_in_view(ids)` (`docs/26` H-11): the page shows these photos (the filmstrip draws
+    /// only the ones in view). Answers with the address of the thumbnail the shell holds for each, and
+    /// counts them as used. A photo whose thumbnail the shell let go of to keep its budget
+    /// ([`crate::viewport::THUMBNAIL_BUDGET_BYTES`]) gets a new one at the thumbnails' priority, announced
+    /// with `thumbnail_ready` like any other.
+    #[must_use]
+    pub fn thumbnails_in_view(&self, ids: &[PhotoId]) -> Vec<ThumbnailReady> {
+        let ids: Vec<u32> = ids.iter().map(|id| id.0).collect();
+        let (held, lost) = self.frames.thumbnails_in_view(&ids);
+        if !lost.is_empty() {
+            self.thumbs.refresh(lost.into_iter().map(CorePhotoId));
+        }
+        held.into_iter()
+            .map(|(id, url)| ThumbnailReady {
+                id: PhotoId(id),
+                url,
+            })
+            .collect()
+    }
+
+    /// `node_thumbnails` (`docs/23` sections 5.7 and 9): asks for the thumbnails of every node of a
+    /// photo. It answers at once; the pictures that changed since the webview was told come as a
+    /// `node_thumbnails_ready` event, and are served on the `ym-frame` scheme. A photo that cannot be
+    /// drawn (not developed yet, skipped, gone) gets none.
+    pub fn node_thumbnails(&self, photo: PhotoId) {
+        self.node_thumbs.request(core_id(photo));
     }
 
     /// `set_current`.
@@ -440,6 +634,7 @@ impl AppApi {
         let outcome = self.core.remove_photos(&core_ids);
         if !outcome.removed.is_empty() {
             self.thumbs.forget(&outcome.removed);
+            self.node_thumbs.forget(&outcome.removed);
             let gone: Vec<u32> = outcome.removed.iter().map(|id| id.0).collect();
             self.frames.set_aside_photos(&gone);
             self.sync_current();
@@ -493,7 +688,11 @@ impl AppApi {
         let current = self.core.session.current();
         if let Some(id) = current {
             self.core.renderer.navigate(id);
+            // A photo with an Object row is made ready for the person's clicks (`docs/23` section 4.4), and one with a
+            // Subject or People row gets its masks made in the background (section 4.5).
+            self.core.prepare_masks(id);
         }
+        self.frames.set_current_photo(current.map(|id| id.0));
         self.viewport.set_photo(current);
     }
 
@@ -526,9 +725,9 @@ impl AppApi {
         patch: &SettingsPatch,
     ) -> Result<ResolvedSettings, AppError> {
         let core_patch: ym_core::settings::SettingsPatch = convert(patch)?;
+        // The core also asks for SAM's features in the background when the photo has an Object row (`docs/23` section 4.4).
         let resolved = self
             .core
-            .session
             .update_settings(core_id(id), &core_patch)
             .map_err(session_error)?;
         self.settings_changed(core_id(id), touches_thumbnail(patch));
@@ -643,36 +842,45 @@ impl AppApi {
         convert(&report)
     }
 
-    /// `histogram`: the photo as it is rendered now. It is asked for after every frame, so it runs
-    /// as a thumbnail-priority job: a viewport frame that is wanted meanwhile goes first, as it
-    /// does for the Look tab's tiles.
+    /// `histogram(photo_id, at)`: the signal at a node as it is rendered now (`docs/01`): the input of
+    /// its curve, or the Input's output for `"input"`; left out (`None`) it is Main's, the photo as
+    /// it is rendered now. A node the photo does not have and the Output are refused in words. It is
+    /// asked for after every frame, so it runs as a thumbnail-priority job: a viewport frame that is
+    /// wanted meanwhile goes first, as it does for the Look tab's tiles.
     ///
     /// # Errors
     ///
-    /// [`AppError`] for an unknown or unfinished photo.
-    pub fn histogram(&self, id: PhotoId) -> Result<HistogramData, AppError> {
+    /// [`AppError`] for an unknown or unfinished photo, a node that cannot be read and a
+    /// cancelled render.
+    pub fn histogram(&self, id: PhotoId, at: Option<NodeId>) -> Result<HistogramData, AppError> {
         let id = core_id(id);
         let src = PhotoSource::from_session(&self.core.session, id).map_err(session_error)?;
         let histogram = self
             .core
             .renderer
-            .spawn_histogram(src)
+            .spawn_histogram_at(src, at.map(|n| n.0))
             .wait()
             .map_err(job_error)?
             .map_err(AppError::from)?;
         convert(&histogram)
     }
 
-    /// `chroma_scatter`: the photo's colours at the colour warp's input, for the plane of the Colour
-    /// warp card (`Renderer::chroma_scatter`: the histogram's view, at most 2048 points). Like the
-    /// histogram it is a thumbnail-priority job that a move to another photo cancels. A photo that
-    /// is still being developed has no points yet (an empty list, not an error: the plane is drawn
-    /// without them and asks again after the next `render_stats`).
+    /// `chroma_scatter(photo_id, at)`: the photo's colours at the input of a node's colour warp, for the
+    /// plane of the Colour warp card (`Renderer::chroma_scatter_at`: the histogram's view, at most 2048
+    /// points); left out (`None`) it is Main's. Like the histogram it is a thumbnail-priority job that
+    /// a move to another photo cancels. A photo that is still being developed has no points yet (an
+    /// empty list, not an error: the plane is drawn without them and asks again after the next
+    /// `render_stats`).
     ///
     /// # Errors
     ///
-    /// [`AppError`] for an unknown or failed photo and a cancelled render.
-    pub fn chroma_scatter(&self, id: PhotoId) -> Result<ChromaScatter, AppError> {
+    /// [`AppError`] for an unknown or failed photo, a node that cannot be read and a cancelled
+    /// render.
+    pub fn chroma_scatter(
+        &self,
+        id: PhotoId,
+        at: Option<NodeId>,
+    ) -> Result<ChromaScatter, AppError> {
         let id = core_id(id);
         let src = match PhotoSource::from_session(&self.core.session, id) {
             Ok(src) => src,
@@ -682,11 +890,33 @@ impl AppApi {
         let scatter = self
             .core
             .renderer
-            .spawn_chroma_scatter(src)
+            .spawn_chroma_scatter_at(src, at.map(|n| n.0))
             .wait()
             .map_err(job_error)?
             .map_err(AppError::from)?;
         convert(&scatter)
+    }
+
+    /// `suggest_crop`: Auto crop's proposal for a photo at an aspect and orientation
+    /// (`docs/20-auto-crop.md` §3). The first call for a photo renders its picture and analyses it
+    /// on the CPU; later calls only make the frames.
+    ///
+    /// # Errors
+    ///
+    /// [`AppError`] for an unknown, failed or developing photo, and when the picture cannot be
+    /// made.
+    pub fn suggest_crop(
+        &self,
+        id: PhotoId,
+        aspect: CropAspect,
+        orientation: Orientation,
+    ) -> Result<CropSuggestion, AppError> {
+        let suggestion = self
+            .core
+            .session
+            .suggest_crop(core_id(id), convert(&aspect)?, convert(&orientation)?)
+            .map_err(session_error)?;
+        convert(&suggestion)
     }
 
     // --- Viewport -----------------------------------------------------------------------------
@@ -732,10 +962,10 @@ impl AppApi {
             .map_err(AppError::from)?;
         // A click on the paper around the photo picks nothing.
         let Some(point) = point else { return Ok(()) };
-        let patch = ym_core::settings::SettingsPatch {
+        let patch = ym_core::settings::SettingsPatch::input(ym_core::settings::NodePatch {
             white_pick: Some(Some(point)),
-            ..ym_core::settings::SettingsPatch::default()
-        };
+            ..ym_core::settings::NodePatch::default()
+        });
         self.core
             .session
             .update_settings(photo, &patch)
@@ -746,13 +976,17 @@ impl AppApi {
         Ok(())
     }
 
-    /// `viewport_set_mode`.
+    /// `viewport_set_mode(mode, mask_view)`.
     ///
     /// # Errors
     ///
     /// [`AppError`] only if the shapes disagree (a bug).
-    pub fn viewport_set_mode(&self, mode: &ViewportMode) -> Result<(), AppError> {
-        self.viewport.set_mode(mode)
+    pub fn viewport_set_mode(
+        &self,
+        mode: &ViewportMode,
+        mask_view: Option<&MaskView>,
+    ) -> Result<(), AppError> {
+        self.viewport.set_mode(mode, mask_view)
     }
 
     /// `set_before`.
@@ -778,25 +1012,225 @@ impl AppApi {
         convert(&sample.ok_or_else(outside)?)
     }
 
-    /// `sample_chroma`: the chroma at the colour warp's input under a point of the cell, in CSS
-    /// pixels from its corner as `sample_pixel` and Pick white take it (`Renderer::sample_chroma`:
-    /// the pixel the readout reads, through the chain to C9, in the final picture also while the
-    /// Before view is shown). `None` (JSON `null`) on the paper around the photo, for a point that is
-    /// not a number and when no photo is shown.
+    /// `sample_chroma(x, y, at, tap)`: the chroma under a point of the cell, in CSS pixels from its
+    /// corner as `sample_pixel` and Pick white take it (`Renderer::sample_chroma_at`: the pixel the
+    /// readout reads, through the chain to the stage `tap` names, in the final picture also while the
+    /// Before view is shown). `tap` left out (`None`) or `warp_input` reads the input of the node's
+    /// colour warp, after its trim and grade (Pick colour of the Colour warp); `node_input` reads the
+    /// picture the node takes in, before its trim and grade (Pick colour of a Colour range). `at`
+    /// left out (`None`) is Main's. `None` (JSON `null`) on the paper around the photo, for a point
+    /// that is not a number and when no photo is shown.
     ///
     /// # Errors
     ///
-    /// [`AppError`] for a photo that cannot be read or rendered.
-    pub fn sample_chroma(&self, x: f64, y: f64) -> Result<Option<ChromaSample>, AppError> {
+    /// [`AppError`] for a photo that cannot be read or rendered, and a node that cannot be read.
+    pub fn sample_chroma(
+        &self,
+        x: f64,
+        y: f64,
+        at: Option<NodeId>,
+        tap: Option<ChromaTap>,
+    ) -> Result<Option<ChromaSample>, AppError> {
         let (photo, state) = self.viewport.snapshot_synced();
         let Some(photo) = photo else { return Ok(None) };
         let src = PhotoSource::from_session(&self.core.session, photo).map_err(session_error)?;
+        let tap = match tap {
+            None | Some(ChromaTap::WarpInput) => ym_core::pipeline::ChromaTap::WarpInput,
+            Some(ChromaTap::NodeInput) => ym_core::pipeline::ChromaTap::NodeInput,
+        };
         let sample = self
             .core
             .renderer
-            .sample_chroma(&src, &state, (x, y), &CancelToken::new())
+            .sample_chroma_at(
+                &src,
+                at.map(|n| n.0),
+                tap,
+                &state,
+                (x, y),
+                &CancelToken::new(),
+            )
             .map_err(AppError::from)?;
         sample.map(|s| convert(&s)).transpose()
+    }
+
+    /// `viewport_map_points(points, from)` (`docs/23` sections 3.6 and 9): maps points between the photo frame
+    /// and the cell, for the handles and outlines the page draws over the photo (`Renderer::map_points`).
+    /// With `photo` the points are `[x, y]` in the photo frame and come back as CSS pixels from the cell's
+    /// corner (they may lie outside the cell); with `cell` they are CSS pixels and come back as photo-frame
+    /// fractions, `null` for a point on the paper. The answer has one entry per point, in order; a point that
+    /// is not a number, and every point while no photo is shown, is `null`.
+    ///
+    /// # Errors
+    ///
+    /// [`AppError`] for a photo that cannot be read or prepared.
+    pub fn viewport_map_points(
+        &self,
+        points: &[[Num; 2]],
+        from: MapFrom,
+    ) -> Result<Vec<Option<[Num; 2]>>, AppError> {
+        let (photo, state) = self.viewport.snapshot_synced();
+        let Some(photo) = photo else {
+            return Ok(vec![None; points.len()]);
+        };
+        let src = PhotoSource::from_session(&self.core.session, photo).map_err(session_error)?;
+        let flat: Vec<[f64; 2]> = points.iter().map(|[x, y]| [x.0, y.0]).collect();
+        let from = match from {
+            MapFrom::Photo => ym_core::pipeline::MapFrom::Photo,
+            MapFrom::Cell => ym_core::pipeline::MapFrom::Cell,
+        };
+        let mapped = self
+            .core
+            .renderer
+            .map_points(&src, &state, from, &flat, &CancelToken::new())
+            .map_err(AppError::from)?;
+        Ok(mapped
+            .into_iter()
+            .map(|p| p.map(|[x, y]| [Num(x), Num(y)]))
+            .collect())
+    }
+
+    /// `mask_kinds()` (`docs/23` section 9): the kinds of mask this machine can make now, in the order of the
+    /// Add mask menu (`ym_core::settings::mask_kinds`). The menu lists exactly these.
+    ///
+    /// # Errors
+    ///
+    /// [`AppError`] only if the shapes disagree (a bug).
+    pub fn mask_kinds(&self) -> Result<Vec<MaskKind>, AppError> {
+        convert(&self.core.mask_kinds())
+    }
+
+    /// `mask_find(photo_id, node, mask, prompt)` (`docs/23` section 9): what the Object row `mask` of `node` becomes with the
+    /// person's click or box, or that nothing was found there. Nothing is changed: the page sends a found answer as one row
+    /// patch. It waits for the encoder when it is still running (`Core::mask_find`), so it runs off the command thread.
+    ///
+    /// # Errors
+    ///
+    /// [`AppError`] with the scope `mask` for an Object model that is missing, a mask that is not an Object row and a row
+    /// that has all its points; with the scope of the photo's errors for a photo that cannot be read.
+    pub fn mask_find(
+        &self,
+        photo: PhotoId,
+        node: u32,
+        mask: u32,
+        prompt: MaskFindPrompt,
+    ) -> Result<MaskFindResult, AppError> {
+        let prompt = match prompt {
+            MaskFindPrompt::Point { x, y, positive } => ym_core::pipeline::ObjectPrompt::Point {
+                x: x.0,
+                y: y.0,
+                positive,
+            },
+            MaskFindPrompt::Box { x0, y0, x1, y1 } => ym_core::pipeline::ObjectPrompt::Box {
+                x0: x0.0,
+                y0: y0.0,
+                x1: x1.0,
+                y1: y1.0,
+            },
+        };
+        let found = self
+            .core
+            .mask_find(
+                core_id(photo),
+                node,
+                mask as usize,
+                prompt,
+                &CancelToken::new(),
+            )
+            .map_err(AppError::from)?;
+        Ok(match found {
+            ym_core::pipeline::MaskFound::Found {
+                points,
+                box_,
+                took_ms,
+            } => MaskFindResult::Found {
+                points: points
+                    .into_iter()
+                    .map(|(x, y, positive)| (Num(x), Num(y), positive))
+                    .collect(),
+                box_: box_.map(|b| b.map(Num)),
+                took_ms: Num(took_ms),
+            },
+            ym_core::pipeline::MaskFound::NothingFound(_) => MaskFindResult::Nothing,
+        })
+    }
+
+    /// `sample_depth(photo_id, x, y)` (`docs/23` section 9, Pick depth): the far limit for the depth at the photo-frame point
+    /// (`x`, `y` are shares of the photo's width and height), the depth plus 0.1 and at most 1, or `None` when no depth
+    /// map can be made. Nothing is changed: the page writes the answer as one row patch. It waits for the depth worker when it
+    /// is still running (`Core::sample_depth`), so it runs off the command thread.
+    ///
+    /// # Errors
+    ///
+    /// [`AppError`] with the scope `mask` for a missing Depth model and a point that is not a number; with the scope of the
+    /// photo's errors for a photo that cannot be read.
+    pub fn sample_depth(
+        &self,
+        photo: PhotoId,
+        x: Num,
+        y: Num,
+    ) -> Result<Option<DepthFar>, AppError> {
+        let far = self
+            .core
+            .sample_depth(core_id(photo), x.0, y.0, &CancelToken::new())
+            .map_err(AppError::from)?;
+        Ok(far.map(|far| DepthFar { far: Num(far) }))
+    }
+
+    /// `focus_plane(photo_id)` (`docs/23` section 9, Focus plane): the far limit for the plane the camera focused on, from
+    /// the maker note's focus point and the median depth in its box; without a limit, why (`no_focus_point` is answered at once,
+    /// without waiting for the depth map). Nothing is changed: the page writes the limit as one row patch.
+    ///
+    /// # Errors
+    ///
+    /// [`AppError`] with the scope `mask` for a missing Depth model; with the scope of the photo's errors for a photo that
+    /// cannot be read.
+    pub fn focus_plane(&self, photo: PhotoId) -> Result<FocusPlaneResult, AppError> {
+        let answer = self
+            .core
+            .focus_plane(core_id(photo), &CancelToken::new())
+            .map_err(AppError::from)?;
+        Ok(match answer {
+            ym_core::pipeline::FocusPlane::Far { far, exact_centre } => FocusPlaneResult {
+                far: Some(Num(far)),
+                exact_centre,
+                reason: None,
+            },
+            ym_core::pipeline::FocusPlane::None(why) => FocusPlaneResult {
+                far: None,
+                exact_centre: false,
+                reason: Some(match why {
+                    ym_core::pipeline::FocusReason::NoFocusPoint => FocusReason::NoFocusPoint,
+                    ym_core::pipeline::FocusReason::MapFailed => FocusReason::MapFailed,
+                }),
+            },
+        })
+    }
+
+    /// `retry_depth(photo_id)` (`docs/23` section 4.8, "Try again"): starts the depth map of a photo again after it failed.
+    /// It returns at once: the worker runs in the background, the viewport is busy and finding meanwhile, and `depth_state`
+    /// says how it ended (`failed` null when the map is made, the sentence when it failed again). Nothing is changed in the
+    /// photo's settings. Nothing happens for a photo whose map did not fail, one that is not the photo being looked at and a
+    /// copy of Yellowmoon with no Depth model.
+    ///
+    /// # Errors
+    ///
+    /// [`AppError`] with the scope of the photo's errors for a photo that is unknown or not developed yet.
+    pub fn retry_depth(&self, photo: PhotoId) -> Result<(), AppError> {
+        self.core
+            .retry_depth(core_id(photo))
+            .map_err(AppError::from)
+    }
+
+    // --- Lens ---------------------------------------------------------------------------------
+
+    /// `lens_list`: the lenses of the Lens card's menu in menu order (`docs/21` sections 1 and 10);
+    /// empty when the lens data could not be loaded.
+    ///
+    /// # Errors
+    ///
+    /// [`AppError`] only if the shapes disagree (a bug).
+    pub fn lens_list(&self) -> Result<Vec<LensInfo>, AppError> {
+        convert(&self.core.lens_list())
     }
 
     // --- Looks --------------------------------------------------------------------------------
@@ -838,6 +1272,71 @@ impl AppApi {
         Ok(self.frames.put_look_tile(photo.0, &look.0, png))
     }
 
+    /// `film_catalogue`: the stocks and papers the Film node's pickers list (`names.json` through the core).
+    ///
+    /// # Errors
+    ///
+    /// [`AppError`] with scope `render` and "Yellowmoon's film data is missing. Reinstall the app." when the list cannot be read.
+    pub fn film_catalogue(&self) -> Result<crate::wire::FilmCatalogue, AppError> {
+        let c = ym_core::film_tiles::film_catalogue().ok_or_else(|| {
+            AppError::new(
+                ErrorScope::Render,
+                "Yellowmoon's film data is missing. Reinstall the app.",
+            )
+        })?;
+        Ok(crate::wire::FilmCatalogue {
+            stocks: c
+                .stocks
+                .into_iter()
+                .map(|s| crate::wire::FilmStockInfo {
+                    id: s.id,
+                    name: s.name,
+                    kind: s.kind.to_owned(),
+                    group: s.group,
+                    iso: s.iso,
+                    matching_paper: s.matching_paper,
+                })
+                .collect(),
+            papers: c
+                .papers
+                .into_iter()
+                .map(|p| crate::wire::FilmPaperInfo {
+                    id: p.id,
+                    name: p.name,
+                })
+                .collect(),
+            profile_version: c.profile_version,
+            credit: c.credit,
+            disclaimer: c.disclaimer,
+            trademarks: c.trademarks,
+        })
+    }
+
+    /// `film_tile`: the photo as it is developed now with the stock of Film node `node` replaced by `stock`. The PNG stays here
+    /// and is served on the `ym-frame` scheme like a look tile (the same store, its budget and its photo-by-photo forgetting); the
+    /// answer is its address. It runs at the thumbnails' priority and moving to another photo cancels it.
+    ///
+    /// # Errors
+    ///
+    /// [`AppError`] with scope `render` for a node the photo does not have, a stock that is not offered, or a cancelled render.
+    pub fn film_tile(&self, photo: PhotoId, node: u32, stock: &str) -> Result<String, AppError> {
+        let src =
+            PhotoSource::from_session(&self.core.session, core_id(photo)).map_err(session_error)?;
+        let png =
+            ym_core::film_tiles::spawn_film_tile(&self.core.renderer, src, node, stock.to_owned())
+                .wait()
+                .map_err(job_error)?
+                .map_err(AppError::from)?;
+        self.core
+            .session
+            .view(core_id(photo))
+            .map_err(session_error)?;
+        // A look tile's store keeps it: the key names the node and the stock, so a tile for the same pair replaces the older.
+        Ok(self
+            .frames
+            .put_look_tile(photo.0, &format!("film:{node}:{stock}"), png))
+    }
+
     /// `looks_import`: a zip, a folder or a `.cube` file; `input` answers the generic question for
     /// `.cube` files that match no ARRI package. Progress arrives as `looks_import_progress`.
     ///
@@ -877,15 +1376,6 @@ impl AppApi {
     #[must_use]
     pub fn looks_recognise(&self, path: &str) -> SourceRecognition {
         recognise(self.core.looks.packages(), Path::new(path))
-    }
-
-    /// `looks_display_luts`.
-    ///
-    /// # Errors
-    ///
-    /// [`AppError`] only if the shapes disagree (a bug).
-    pub fn looks_display_luts(&self) -> Result<Vec<DisplayLut>, AppError> {
-        convert(&self.core.looks_display_luts())
     }
 
     /// `looks_watch_downloads`: starts or stops the Downloads watcher.
@@ -964,7 +1454,7 @@ impl AppApi {
     /// # Errors
     ///
     /// [`AppError`] with a plain sentence: no photos in the scope, photos of the scope that have
-    /// no estimates yet ("Some photos are still being developed…"), a display LUT that is gone.
+    /// no estimates yet ("Some photos are still being developed…").
     pub fn export_start(&self, job: &ExportJob) -> Result<ExportJobId, AppError> {
         let job: CoreExportJob = convert(job)?;
         // Held while the job is queued: a restart that has begun (and found no export) is not
@@ -1059,25 +1549,38 @@ impl AppApi {
     ///
     /// # Errors
     ///
-    /// [`AppError`] for a default look that isn't in the library, a display LUT that isn't
-    /// imported, or a file that cannot be saved; nothing changes then.
+    /// [`AppError`] for a default look that isn't in the library or a file that cannot be saved;
+    /// nothing changes then.
     pub fn preferences_set(&self, patch: &PreferencesPatch) -> Result<Preferences, AppError> {
         let patch: ym_core::preferences::PreferencesPatch = convert(patch)?;
         let next = self.core.preferences_set(&patch).map_err(AppError::from)?;
-        // The display rendering may have changed what the viewport shows.
-        self.viewport.invalidate();
         convert(&next)
     }
 
-    /// `apple_auto_status`: whether Apple Auto is available on this computer, read again now, and
-    /// whether it acts (`docs/19` sections 1 and 2). Preferences asks when it opens and shows its
-    /// row only while Apple Auto is available.
+    /// `auto_status`: the four providers and which one grades now (`docs/22` sections 11 and 12.6).
+    /// Every advisor is asked to read its availability again, in the background, and the answer is
+    /// what they last said: nothing here waits for a program. Only Preferences opening asks for it
+    /// (the person looking at the providers is the request: `agy`'s sign-in check, which contacts
+    /// its service, runs then and never otherwise, `docs/22` section 3.3 and D7), and the row is
+    /// shown only while `visible` or while the saved choice is a program.
     ///
     /// # Errors
     ///
     /// [`AppError::internal`] when the answer does not cross the bridge (a bug).
-    pub fn apple_auto_status(&self) -> Result<AppleAutoStatus, AppError> {
-        convert(&self.core.apple_auto_status())
+    pub fn auto_status(&self) -> Result<AutoStatus, AppError> {
+        convert(&self.core.auto_status())
+    }
+
+    /// `auto_status_cached`: the same status as each advisor last said it, and no advisor is asked
+    /// to probe (`docs/22` section 12.6). The webview reads this after it changes the choice, the
+    /// consent or the instructions and on `auto_status_changed`, so typing instructions never makes
+    /// a program contact its service.
+    ///
+    /// # Errors
+    ///
+    /// [`AppError::internal`] when the answer does not cross the bridge (a bug).
+    pub fn auto_status_cached(&self) -> Result<AutoStatus, AppError> {
+        convert(&self.core.auto_status_cached())
     }
 
     /// `install_cli_link`.
@@ -1123,6 +1626,7 @@ impl AppApi {
         AppInfo {
             version: ym_core::version::app_version().to_owned(),
             pipeline_version: ym_core::version::PIPELINE_VERSION.to_owned(),
+            os: std::env::consts::OS.to_owned(),
         }
     }
 
@@ -1153,8 +1657,11 @@ fn open_app_gpu(enabled: bool, budget: ym_core::scheduler::MemoryBudget) -> GpuS
     if !enabled {
         return GpuSlot::off(budget);
     }
-    let slot = GpuOpener::new(gpu_policy(), budget)
+    // GPU pass times (timestamp queries, where the adapter has them) when `YM_PERF` is on: the `gpu passes`
+    // line of `ym::perf`. Off, nothing is timed.
+    let slot = ym_apple::gpu_opener(gpu_policy(), budget)
         .with_pipeline_cache_dir(ym_gpu::device::default_pipeline_cache_dir())
+        .with_timestamps(crate::perf::enabled())
         .open();
     // `require` is strict, and a window has no exit code to say so with: the application goes on
     // with the CPU, loudly, rather than quietly looking as if the device were in use.
@@ -1163,6 +1670,10 @@ fn open_app_gpu(enabled: bool, budget: ym_core::scheduler::MemoryBudget) -> GpuS
             "YELLOWMOON_GPU=require, but no graphics device opened ({reason}); using the CPU"
         );
     }
+    // Every kernel compiles in the background now, one job each at `Export` priority (a frame outranks
+    // them), so that no viewer frame waits for a shader compile on first use (the eye of a mask row cost
+    // 210 ms on Metal for the tint kernel). The jobs run on; the handles are not needed.
+    drop(slot.warm_up_for_viewer());
     slot
 }
 

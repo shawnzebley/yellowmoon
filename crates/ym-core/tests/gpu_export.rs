@@ -42,6 +42,7 @@ use ym_core::pipeline::{
 };
 use ym_core::session::{OpenOptions, PhotoId, Session};
 use ym_core::settings::{Crop, CropAspect, NormRect, RolloffPatch, SettingsPatch};
+use ym_core::settings::{GradePatch, NodeId, NodePatch};
 use ym_export::{BitDepth, ExportOptions, FormatKind, IfExists, Size, TiffCompression};
 use ym_gpu::device::{Gpu, GpuConfig, gpu_required_by_env};
 use ym_gpu::queue::{CancelToken, JobSpec, Priority};
@@ -320,12 +321,25 @@ fn apply_variant(shot: &Shot, pct: f64, straighten: bool) {
         },
         angle_deg: 5.0,
         aspect: CropAspect::Free,
+        auto: false,
     });
-    shot.edit(SettingsPatch {
-        output_sharpening: Some(pct),
-        crop: Some(crop),
-        ..SettingsPatch::default()
-    });
+    shot.edit(
+        SettingsPatch::default()
+            .and(
+                NodeId::Input,
+                NodePatch {
+                    crop: Some(crop),
+                    ..NodePatch::default()
+                },
+            )
+            .and(
+                NodeId::Output,
+                NodePatch {
+                    output_sharpening: Some(pct),
+                    ..NodePatch::default()
+                },
+            ),
+    );
 }
 
 /// What [`the_tail_writes_the_cpu_pixels_in_every_format`] allows of the sharpened and the JPEG
@@ -352,12 +366,15 @@ struct TailBounds {
 
 /// First measured on lavapipe: 354 of 1.62 M 16-bit samples over 1 code and 81 over 8 (at most 89
 /// off), the JPEGs 280 over 1 (1.7e-4) at most 5 off, and no sharpened 8-bit sample more than one off.
+/// The JPEG share over 1 is twice the worst of the moved ALEXA estimate instead (the owner's
+/// agreement, 2026-10-26): its picture put the straightened crop's JPEG at 249 of 703 800 samples
+/// (3.54e-4, at most 6 codes, 0.99900 exact) where the data before it gave 15, with the same code.
 const SOFTWARE: TailBounds = TailBounds {
     over_one_16: 4.4e-4,
     over_eight_16: 1.0e-4,
     max_16: 180,
     jpeg_max: 10,
-    jpeg_over_one: 3.5e-4,
+    jpeg_over_one: 7.1e-4,
     jpeg_exact: 0.99,
     sharp8_max: 1,
     sharp8_over_one: 0.0,
@@ -369,12 +386,16 @@ const SOFTWARE: TailBounds = TailBounds {
 /// sharpened 16 bit 2.55e-4 over 1, 9.7e-5 over 8, at most 551; JPEG at most 5 codes, 2.12e-4 over 1
 /// (long edge 500), 0.99829 exact (straightened crop). The limiter's rank flips are the cause, not the
 /// sharpening kernel, which gives lavapipe's bits on Metal (`docs/algorithms/04` section 10).
+/// The JPEG share over 1 is twice the worst of pipeline 0.5.1 instead (the owner's agreement,
+/// 2026-10-21): the denoise's new picture put a few more 8x8 blocks of the 331 px export at a
+/// quantiser edge, 96 of 219 453 samples (4.37e-4, at most 3 codes, 0.99906 exact) on macos-14 and
+/// macos-15 alike, while the 8-bit PNG of the same case stays within one code (0 over 1).
 const HARDWARE: TailBounds = TailBounds {
     over_one_16: 5.1e-4,
     over_eight_16: 1.94e-4,
     max_16: 1102,
     jpeg_max: 10,
-    jpeg_over_one: 4.25e-4,
+    jpeg_over_one: 8.8e-4,
     jpeg_exact: 0.9965,
     sharp8_max: 4,
     sharp8_over_one: 7.4e-6,
@@ -710,7 +731,11 @@ fn the_picture_is_never_a_host_frame() {
     // set alone.
     assert_eq!(peak_a - peak_b, frame, "{peak_a} against {peak_b}");
     assert_eq!(report_a.rendered, report_b.rendered);
+    // What is left is what the caches hold (`Renderer::release_caches`); a leak would stay after they go.
+    ca.renderer().release_caches();
     assert_eq!(ca.renderer().ledger().used(), 0);
+    // What is left is what the caches hold (`Renderer::release_caches`); a leak would stay after they go.
+    cb.renderer().release_caches();
     assert_eq!(cb.renderer().ledger().used(), 0);
 }
 
@@ -853,6 +878,8 @@ fn progress_never_goes_back_and_a_cancel_between_bands_leaves_nothing() {
             baseline,
             "{format:?}: the device buffers of a cancelled export are handed back"
         );
+        // What is left is what the caches hold (`Renderer::release_caches`); a leak would stay after they go.
+        ctx.renderer().release_caches();
         assert_eq!(ctx.renderer().ledger().used(), 0);
     }
 }
@@ -869,13 +896,6 @@ impl LookProvider for ChangingLook {
             l.fingerprint = format!("{id}-{}", if n == 0 { "v1" } else { "v2" });
             l
         })
-    }
-
-    fn display_transform(
-        &self,
-        id: &LookId,
-    ) -> Result<(ym_color::display::DisplayTransform, String), LookProblem> {
-        NeutralOnly.display_transform(id)
     }
 }
 
@@ -929,24 +949,16 @@ impl LookProvider for CubeLook {
             fingerprint: format!("{id}"),
         })
     }
-
-    fn display_transform(
-        &self,
-        id: &LookId,
-    ) -> Result<(ym_color::display::DisplayTransform, String), LookProblem> {
-        NeutralOnly.display_transform(id)
-    }
 }
 
 /// The picture the user sees is the export's picture: with a look that is a cube and a CDL (the
-/// shape of the default look), a look intensity below 100, a white offset (the white lift's manual
-/// part, C12 step 1b), the highlight range at 1 (the camera's clip on the ALEXA's, C7), contrast,
+/// shape of the default look), a look intensity below 100, the highlight range at 1 (the camera's clip on the ALEXA's, C7), contrast,
 /// saturation and a curve edit, the tail's export is the CPU export. These are
 /// stages of the colour chain, which the tail runs from the very chain object the CPU path uses; the
 /// test is the end-to-end proof, with the persistent tables of the device (the look's cube is
 /// uploaded once for the twelve tiles of the picture, not per tile).
 #[test]
-fn a_look_a_white_offset_the_range_and_a_curve_come_out_of_the_tail_as_on_the_cpu() {
+fn a_look_the_range_and_a_curve_come_out_of_the_tail_as_on_the_cpu() {
     let Some(gpu) = gpu() else { return };
     let shot = Shot::new();
     let home = tempfile::tempdir().expect("home");
@@ -961,19 +973,39 @@ fn a_look_a_white_offset_the_range_and_a_curve_come_out_of_the_tail_as_on_the_cp
         );
         decode_png(&read(&r.path)).3
     };
-    shot.edit(SettingsPatch {
-        look: Some(LookId::parse("user:cube").expect("look id")),
-        look_intensity: Some(70.0),
-        white_offset_ev: Some(0.4),
-        rolloff: Some(RolloffPatch {
-            highlights: Some(1.0),
-            low_light: None,
-        }),
-        contrast: Some(ym_core::settings::PercentSetting::manual_value(15.0)),
-        saturation: Some(ym_core::settings::PercentSetting::manual_value(10.0)),
-        output_sharpening: Some(0.0),
-        ..SettingsPatch::default()
-    });
+    shot.edit(
+        SettingsPatch::default()
+            .and(
+                NodeId::Input,
+                NodePatch {
+                    rolloff: Some(RolloffPatch {
+                        highlights: Some(1.0),
+                        low_light: None,
+                    }),
+                    ..NodePatch::default()
+                },
+            )
+            .and(
+                NodeId::MAIN,
+                NodePatch {
+                    grade: Some(GradePatch {
+                        contrast: Some(ym_core::settings::PercentSetting::manual_value(15.0)),
+                        saturation: Some(ym_core::settings::PercentSetting::manual_value(10.0)),
+                        ..GradePatch::default()
+                    }),
+                    ..NodePatch::default()
+                },
+            )
+            .and(
+                NodeId::Output,
+                NodePatch {
+                    look: Some(LookId::parse("user:cube").expect("look id")),
+                    look_intensity: Some(70.0),
+                    output_sharpening: Some(0.0),
+                    ..NodePatch::default()
+                },
+            ),
+    );
     let photo = shot.photo();
     let make = |gpu: Option<Arc<Gpu>>, stages: GpuStages| {
         context(
@@ -1067,13 +1099,6 @@ impl LookProvider for FileAppears {
             l.fingerprint = format!("{id}");
             l
         })
-    }
-
-    fn display_transform(
-        &self,
-        id: &LookId,
-    ) -> Result<(ym_color::display::DisplayTransform, String), LookProblem> {
-        NeutralOnly.display_transform(id)
     }
 }
 
@@ -1419,6 +1444,8 @@ fn fifty_megapixels_leave_no_host_frame_and_a_dng_keeps_its_own() {
             before.map(|b| b.0),
             after.map(|a| a.1),
         ));
+        // What is left is what the caches hold (`Renderer::release_caches`); a leak would stay after they go.
+        ctx.renderer().release_caches();
         assert_eq!(ctx.renderer().ledger().used(), 0);
         results.push((label, r.device, peak));
     }
@@ -1651,6 +1678,8 @@ mod faults {
                     // The device is usable again and everything was handed back.
                     assert_eq!(pool_in_use(&own), baseline, "{what}");
                 }
+                // What is left is what the caches hold (`Renderer::release_caches`); a leak would stay after they go.
+                ctx.renderer().release_caches();
                 assert_eq!(ctx.renderer().ledger().used(), 0, "{what}");
             }
         }
@@ -1922,6 +1951,9 @@ mod faults {
             }
             assert!(tiles.load(Ordering::SeqCst) >= 12, "{name}");
             assert_eq!(pool_in_use(&own), baseline, "{name}: the buffers are back");
+            // What is left is what the caches hold (`Renderer::release_caches`); a leak would stay after they go.
+            drop(got); // a picture that is held stays counted
+            dev.release_caches();
             assert_eq!(dev.ledger().used(), 0, "{name}");
         }
     }
@@ -2003,6 +2035,8 @@ mod faults {
             "the words were taken away"
         );
         assert_eq!(pool_in_use(&own), baseline);
+        // What is left is what the caches hold (`Renderer::release_caches`); a leak would stay after they go.
+        ctx.renderer().release_caches();
         assert_eq!(ctx.renderer().ledger().used(), 0);
     }
 

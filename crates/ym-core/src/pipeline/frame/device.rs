@@ -52,12 +52,14 @@
 //! thread before it is submitted (the upload planes, the sampler's grid, the bounding box of the
 //! photo), and everything it returns is converted on the render thread afterwards.
 
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::time::Duration;
 
 use rayon::prelude::*;
 use ym_color::display::ColorChain;
 use ym_color::encode::OutputSpace;
+use ym_color::mask::{OVERLAY_WEIGHT, PhotoFrame};
+use ym_color::plan::Stop as PlanStop;
 use ym_gpu::cpu::magnify::MagnifyMap;
 use ym_gpu::cpu::output_sharpen::OutputSharpen;
 use ym_gpu::cpu::sampler::{Sampled, SamplerGrid};
@@ -65,19 +67,27 @@ use ym_gpu::cpu::tiling::Rect;
 use ym_gpu::cpu::{Placement, RgbImage};
 use ym_gpu::device::{Gpu, GpuContext, GpuError};
 use ym_gpu::image::{GpuImage, IMAGE_USAGE};
-use ym_gpu::kernels::color::{PreparedChain, Stop, release_tables};
+use ym_gpu::kernels::color::{NodeStop, PreparedChain, Stop, release_tables};
 use ym_gpu::kernels::copy::{Piece, encode_gather};
 use ym_gpu::kernels::encode::{C13, Encoding, encode_c13};
+use ym_gpu::kernels::film_stack::{FilmPictures, FilmRasters, FilmStack};
 use ym_gpu::kernels::magnify::{MagnifyTarget, encode_magnify};
+use ym_gpu::kernels::mask_raster::{
+    PlaneKey, RasterJob, RasterTile, encode_raster_planes_kept, encode_raster_planes_over,
+    encode_raster_planes_tiled,
+};
 use ym_gpu::kernels::output_sharpen::{FusedC13, PreparedSharpen};
-use ym_gpu::kernels::sampler::encode_sample;
+use ym_gpu::kernels::sampler::encode_sample_at;
+use ym_gpu::kernels::tint::encode_tint;
+use ym_gpu::perf::{self, Split, Stage};
 use ym_gpu::pool::PooledBuffer;
 use ym_gpu::queue::{CancelToken, JobSpec, Priority};
 use ym_gpu::stream::{PassList, ReadId, upload_bytes};
 
 use super::{FrameOutput, Job, ViewSpec};
 use crate::app::gpu::GpuStages;
-use crate::pipeline::graph::ViewGpu;
+use crate::pipeline::graph::{ViewGpu, ViewLimits};
+use crate::pipeline::schedule::{camera_bytes, picture_bytes};
 
 /// How often a render that waits for its device job looks at its cancel token.
 const POLL: Duration = Duration::from_millis(5);
@@ -120,36 +130,71 @@ pub(super) struct ViewRoute {
     pub stages: ViewStages,
     spec: JobSpec,
     token: CancelToken,
-    /// The largest storage binding of one device pass over a frame
-    /// ([`RenderOptions::view_band_bytes`]).
-    ///
-    /// [`RenderOptions::view_band_bytes`]: crate::pipeline::RenderOptions::view_band_bytes
+    /// The largest picture (a piece's frame, its wider picture) of one device pass, at 16 bytes a pixel: the device's
+    /// binding and a share of its memory budget ([`view_bytes`], [`ViewLimits`]), less for a chain with raster masks or
+    /// the pixels' places. A pixel-exact cut: the pieces give the view in one piece bit for bit on any size.
     pub band_bytes: u64,
-    /// The largest uploaded camera RGB of one device pass: the same constant as the frame's (a
-    /// renderer constant, not the device's limit, so that the cut does not depend on the machine:
-    /// `docs/17-gpu.md` section 4).
+    /// The largest uploaded camera RGB of one device pass: the largest picture of the device, unreduced.
     pub source_bytes: u64,
+    /// The limits the sizes above were made from (the device's, or the options' `view_limits`).
+    pub limits: ViewLimits,
     /// The largest RGBA8 frame the device can hold in one buffer and bind whole: what a frame cut
     /// into bands may be to be gathered on the device ([`gather_job`]). The device's own limit: it
     /// decides only where the finished bytes are, never the pixels.
     pub frame_bytes: u64,
 }
 
+/// The sizes a view's pieces are cut to on a device with `limits`: `(band_bytes, source_bytes)` for a chain that keeps the
+/// pixels' places in the photo (`positions`: six planes where a frame has four) and/or raster planes (`rasters`: seven
+/// f32 planes of the wider picture), under the cap `cap` ([`RenderOptions::view_band_bytes`]).
+///
+/// [`RenderOptions::view_band_bytes`]: crate::pipeline::RenderOptions::view_band_bytes
+pub(super) fn view_bytes(
+    limits: ViewLimits,
+    cap: u64,
+    positions: bool,
+    rasters: bool,
+) -> (u64, u64) {
+    let unit = limits.picture_bytes(cap);
+    // The sampled picture of a chain whose mask shapes read the pixels' places in the photo has six planes (24 bytes a
+    // pixel) where the frames the cut is made for have four (16): such a chain gets two thirds of the size, so that every
+    // binding still fits (`docs/17-gpu.md` section 4).
+    let mut band_bytes = if positions { unit / 3 * 2 } else { unit };
+    // A chain with raster masks keeps seven f32 planes of the wider picture they look at for them (28 bytes a pixel where
+    // the frame is four planes, 16): a binding must hold them, so a view whose wider picture would pass the device's
+    // binding is cut (`band_split`, each piece grown by the masks' receptive field).
+    if rasters {
+        band_bytes = band_bytes.min(limits.binding_bytes / 28 * 16);
+    }
+    (band_bytes, unit)
+}
+
 impl ViewRoute {
     /// The route of `job` for `gpu`, at the queue priority `priority`.
     pub(super) fn new(job: &Job<'_>, gpu: ViewGpu, priority: Priority) -> Self {
+        let info = gpu.gpu.info();
+        let limits = job
+            .options()
+            .view_limits
+            .unwrap_or_else(|| ViewLimits::of_device(info));
+        let (band_bytes, source_bytes) = view_bytes(
+            limits,
+            job.options().view_band_bytes,
+            super::super::color::uses_photo_position(&job.src.settings)
+                || job.mask_uses_photo_position(),
+            super::super::color::uses_rasters(&job.src.settings) || job.mask_uses_rasters(),
+        );
         Self {
             stages: ViewStages::of(gpu.stages),
             spec: JobSpec::new(priority).owned_by(u64::from(job.src.id.0)),
             token: job.cancel.clone(),
-            band_bytes: job.options().view_band_bytes,
-            source_bytes: job.options().view_band_bytes,
-            frame_bytes: {
-                let limits = &gpu.gpu.info().limits;
-                limits
-                    .max_storage_buffer_binding_size
-                    .min(limits.max_buffer_size)
-            },
+            band_bytes,
+            source_bytes,
+            frame_bytes: info
+                .limits
+                .max_storage_buffer_binding_size
+                .min(info.limits.max_buffer_size),
+            limits,
             gpu: gpu.gpu,
         }
     }
@@ -183,21 +228,36 @@ impl ViewRoute {
         D: Send + 'static,
         R: Send + 'static,
     {
+        // The spans of `ym_gpu::perf` (`YM_PERF`) are kept per thread: the job's own go back to this thread's
+        // split when it is done.
+        let device_split = ym_gpu::perf::enabled().then(|| Arc::new(Mutex::new(Split::default())));
+        let sink = device_split.clone();
         let handle =
             self.gpu
                 .submit_with_token(self.spec, self.token.clone(), move |ctx, token| {
                     ctx.check_alive()?;
-                    match work(ctx, token, &data) {
+                    ctx.inject_view_fault()?;
+                    if sink.is_some() {
+                        ym_gpu::perf::begin();
+                    }
+                    let result = match work(ctx, token, &data) {
                         Err(GpuError::OutOfBudget { .. } | GpuError::BufferTooLarge { .. }) => {
                             ctx.pool().trim();
                             release_tables(ctx);
                             work(ctx, token, &data)
                         }
                         other => other,
+                    };
+                    if let Some(sink) = &sink {
+                        *sink.lock().unwrap_or_else(PoisonError::into_inner) = ym_gpu::perf::take();
                     }
+                    result
                 });
         loop {
             if let Some(done) = handle.wait_timeout(POLL) {
+                if let Some(split) = &device_split {
+                    ym_gpu::perf::add(&split.lock().unwrap_or_else(PoisonError::into_inner));
+                }
                 return done?;
             }
             if self.token.is_cancelled() {
@@ -212,7 +272,8 @@ impl ViewRoute {
 // ---------------------------------------------------------------------------------------------
 
 /// Sampled pixels ready to upload: three planes, or four when some pixel is outside the photo (the
-/// fourth is 1.0 there). Built on the render thread.
+/// fourth is 1.0 there), or six when the mask shapes of the nodes need the pixels' places in the photo (the
+/// fifth and sixth planes). Built on the render thread.
 pub(super) enum Upload {
     /// Camera RGB with no pixel outside the photo: the three planes of the sampled image as they are.
     Rgb(Arc<Sampled>),
@@ -225,16 +286,46 @@ pub(super) enum Upload {
         /// `4 * width * height` samples, planar.
         data: Vec<f32>,
     },
+    /// Six planes: the sampled image, its letterbox mask and the photo-frame position of every pixel.
+    Positioned {
+        /// Width in pixels.
+        width: usize,
+        /// Height in pixels.
+        height: usize,
+        /// `6 * width * height` samples, planar.
+        data: Vec<f32>,
+        /// The render's photo frame.
+        frame: PhotoFrame,
+    },
 }
 
+/// The photo-frame positions of a host-sampled picture: two planes (x, then y) and the render's frame.
+pub(super) type Positions = (Vec<f32>, PhotoFrame);
+
 impl Upload {
-    /// The upload of a host-sampled picture.
-    pub(super) fn of(sampled: &Arc<Sampled>) -> Self {
+    /// The upload of a host-sampled picture, with the pixels' places in the photo when the mask shapes of the
+    /// nodes need them.
+    pub(super) fn of(sampled: &Arc<Sampled>, positions: Option<Positions>) -> Self {
+        let (width, height) = (sampled.img.width, sampled.img.height);
+        let n = width * height;
+        if let Some((planes, frame)) = positions {
+            let mut data = Vec::with_capacity(6 * n);
+            data.extend_from_slice(&sampled.img.data);
+            match &sampled.outside {
+                Some(mask) => data.extend(mask.iter().map(|&o| if o != 0 { 1.0f32 } else { 0.0 })),
+                None => data.resize(4 * n, 0.0),
+            }
+            data.extend_from_slice(&planes);
+            return Self::Positioned {
+                width,
+                height,
+                data,
+                frame,
+            };
+        }
         let Some(mask) = &sampled.outside else {
             return Self::Rgb(Arc::clone(sampled));
         };
-        let (width, height) = (sampled.img.width, sampled.img.height);
-        let n = width * height;
         let mut data = Vec::with_capacity(4 * n);
         data.extend_from_slice(&sampled.img.data);
         data.extend(mask.iter().map(|&o| if o != 0 { 1.0f32 } else { 0.0 }));
@@ -264,7 +355,7 @@ pub(super) enum CameraSource {
 
 impl CameraSource {
     /// Width and height of the window in pixels.
-    fn size(&self) -> (usize, usize) {
+    pub(super) fn size(&self) -> (usize, usize) {
         match self {
             Self::Host(image) => (image.width, image.height),
             Self::Resident { window, .. } => (window.w, window.h),
@@ -281,24 +372,43 @@ pub(super) enum DeviceInput {
         source: CameraSource,
         /// Where the window starts in the buffer the grid maps into.
         origin: (usize, usize),
-        /// The geometry.
-        grid: SamplerGrid,
+        /// The geometry (boxed: with the lens's ten-constant bend a grid is some 250 bytes, and the other
+        /// variant is a few dozen).
+        grid: Box<SamplerGrid>,
         /// Width of the sampled picture.
         width: usize,
         /// Height of the sampled picture.
         height: usize,
+        /// Whether the sampler also writes the pixels' places in the photo (six planes): the mask shapes of the
+        /// nodes read them.
+        positions: bool,
     },
     /// Pixels the CPU sampled.
     Sampled(Upload),
 }
 
 impl DeviceInput {
-    /// Whether the buffers of a job over this input fit one storage binding: the frame (four
-    /// planes of f32, which the colour pass, the sharpening and C13 read and write) and the uploaded
-    /// camera RGB within the route's band size.
-    pub(super) fn fits(&self, route: &ViewRoute) -> bool {
-        let even = |n: usize| n.next_multiple_of(2) as u64;
-        let frame = |w: usize, h: usize| 16 * even(w) * h as u64 <= route.band_bytes;
+    /// The photo frame of the render, when the input carries the pixels' places in the photo (six planes): the
+    /// colour pass needs it with them.
+    pub(super) fn photo_frame(&self) -> Option<PhotoFrame> {
+        match self {
+            Self::Camera {
+                grid,
+                positions: true,
+                ..
+            } => Some(grid.photo_frame()),
+            Self::Sampled(Upload::Positioned { frame, .. }) => Some(*frame),
+            _ => None,
+        }
+    }
+
+    /// The first size of this input that passes the route's bindings, as `(bytes needed, bytes allowed)`, or `None` when it
+    /// fits. The same rule as [`DeviceInput::fits`], so a refusal can say what did not fit.
+    pub(super) fn overflow(&self, route: &ViewRoute) -> Option<(u64, u64)> {
+        let frame = |w: usize, h: usize| {
+            let need = picture_bytes(w, h);
+            (need > route.band_bytes).then_some((need, route.band_bytes))
+        };
         match self {
             Self::Camera {
                 source,
@@ -307,11 +417,25 @@ impl DeviceInput {
                 ..
             } => {
                 let (sw, sh) = source.size();
-                12 * even(sw) * sh as u64 <= route.source_bytes && frame(*width, *height)
+                let need = camera_bytes(sw, sh);
+                if need > route.source_bytes {
+                    Some((need, route.source_bytes))
+                } else {
+                    frame(*width, *height)
+                }
             }
             Self::Sampled(Upload::Rgb(s)) => frame(s.img.width, s.img.height),
-            Self::Sampled(Upload::Masked { width, height, .. }) => frame(*width, *height),
+            Self::Sampled(
+                Upload::Masked { width, height, .. } | Upload::Positioned { width, height, .. },
+            ) => frame(*width, *height),
         }
+    }
+
+    /// Whether the buffers of a job over this input fit one storage binding: the frame (four
+    /// planes of f32, which the colour pass, the sharpening and C13 read and write) and the uploaded
+    /// camera RGB within the route's band size.
+    pub(super) fn fits(&self, route: &ViewRoute) -> bool {
+        self.overflow(route).is_none()
     }
 }
 
@@ -339,6 +463,12 @@ pub(super) struct TailWork {
     /// then the 100 % picture under the view (not the view grown by the halo); the tail sharpens it
     /// and magnifies it to the view with C13 fused ([`record_magnified_tail`]).
     pub magnify: Option<Arc<MagnifyMap>>,
+    /// The view has no output sharpening: the stage is left out (the mask view's overlay takes the sharpened
+    /// road with nothing to sharpen).
+    pub identity: bool,
+    /// The mask view's overlay: the accent in the output's linear primaries. The tail then tints the sharpened
+    /// frame with the mask image between the stage and C13 ([`record_overlay_tail`]).
+    pub overlay: Option<[f32; 3]>,
 }
 
 /// A display-linear frame (C12) of a view on the device, before output sharpening: four planes (the
@@ -392,7 +522,14 @@ fn finish_rgba(
     dst: Arc<PooledBuffer>,
     read: Option<ReadId>,
 ) -> Result<Rgba8, GpuError> {
-    let mut done = passes.submit()?.finish()?;
+    let pending = {
+        let _span = perf::span(Stage::Submit);
+        passes.submit()?
+    };
+    let mut done = {
+        let _span = perf::span(Stage::Wait);
+        pending.finish()?
+    };
     Ok(match read {
         Some(read) => Rgba8::Host(done.take(read)),
         None => Rgba8::Device(dst),
@@ -403,7 +540,8 @@ fn finish_rgba(
 // Recording
 // ---------------------------------------------------------------------------------------------
 
-/// Uploads or samples the input: the picture the colour pass reads, three planes or four.
+/// Uploads or samples the input: the picture the colour pass reads, three planes, four, or six with the
+/// pixels' places in the photo.
 fn input_image(
     ctx: &GpuContext,
     passes: &mut PassList<'_>,
@@ -416,6 +554,7 @@ fn input_image(
             grid,
             width,
             height,
+            positions,
         } => {
             let src = match source {
                 CameraSource::Host(image) => {
@@ -425,7 +564,16 @@ fn input_image(
                     encode_gather(passes, pieces, *window)?
                 }
             };
-            let sampled = encode_sample(passes, &src, *origin, grid, (0, 0), *width, *height)?;
+            let sampled = encode_sample_at(
+                passes,
+                &src,
+                *origin,
+                grid,
+                (0, 0),
+                *width,
+                *height,
+                *positions,
+            )?;
             // The source must outlive the submission: a buffer made here (the upload, a gathered
             // copy) is kept by the pass list; a cached one is held by the input.
             if let Ok(owned) = Arc::try_unwrap(src) {
@@ -455,7 +603,193 @@ fn input_image(
             data,
             Placement::whole(*width, *height),
         ),
+        DeviceInput::Sampled(Upload::Positioned {
+            width,
+            height,
+            data,
+            ..
+        }) => GpuImage::upload(
+            ctx,
+            "view sampled",
+            *width,
+            *height,
+            6,
+            data,
+            Placement::whole(*width, *height),
+        ),
     }
+}
+
+/// The wider picture the raster masks of a view look at: the view's frame grown by the masks' receptive field and cut
+/// to the photo's extent (`super::RasterRead`), as a device input of its own, or as the tiles it is made in when it does
+/// not fit one binding.
+pub(super) struct GrownInput {
+    /// The pixels of the wider picture.
+    pub source: GrownSource,
+    /// Where it lies, and where the planes go.
+    pub read: super::RasterRead,
+    /// What the planes are kept under on the device (the rows add their own).
+    pub key: PlaneKey,
+}
+
+/// What the raster planes of a view are made from.
+pub(super) enum GrownSource {
+    /// The wider picture in one piece (the Film nodes read it too).
+    Whole(DeviceInput),
+    /// A tile of the planes and the wider picture of its own, for a view whose wider picture passes the route's bindings
+    /// (`docs/23` section 5.12). Only a chain with no Film node is made in tiles.
+    Tiles(Vec<PlaneTile>),
+}
+
+/// One tile of a view's raster planes with its own sampled picture.
+pub(super) struct PlaneTile {
+    /// The tile's extent and the grown window it reads.
+    pub tile: RasterTile,
+    /// The pixels of the grown window.
+    pub input: DeviceInput,
+}
+
+impl GrownInput {
+    /// The wider picture in one piece, when it is made in one.
+    pub(super) fn whole(&self) -> Option<&DeviceInput> {
+        match &self.source {
+            GrownSource::Whole(input) => Some(input),
+            GrownSource::Tiles(_) => None,
+        }
+    }
+
+    /// Whether every buffer of the planes' pass fits the route's bindings: the wider picture (every tile's, when it is made
+    /// in tiles: a tile was chosen to fit).
+    pub(super) fn fits(&self, route: &ViewRoute) -> bool {
+        self.whole().is_none_or(|input| input.fits(route))
+    }
+
+    /// The first size that passes the route's bindings, as [`DeviceInput::overflow`].
+    pub(super) fn overflow(&self, route: &ViewRoute) -> Option<(u64, u64)> {
+        self.whole().and_then(|input| input.overflow(route))
+    }
+}
+
+/// The colour chain prepared on the device, with the render's photo frame when the input has the pixels' places in the
+/// photo (the mask shapes of the nodes read them).
+fn prepared_for(
+    ctx: &GpuContext,
+    passes: &mut PassList<'_>,
+    chain: &ColorChain,
+    input: &DeviceInput,
+    rasters: Option<&GrownInput>,
+    film: Option<&FilmStack>,
+) -> Result<PreparedChain, GpuError> {
+    let mut prepared = {
+        let _span = perf::span(Stage::ColourRecord);
+        // A view runs the plain f32 arithmetic; the export tail and the DNG's colour stage run the compensated one
+        // (`docs/24` section 3.9c "Speed").
+        PreparedChain::new(ctx, chain)?.fast(true)
+    };
+    // A chain compiled to a node's mask (the mask view) ends the nodes at that node and writes `m` as grey code
+    // values, as the CPU chain does (`ColorChain::shows_mask`).
+    if let PlanStop::Mask(node) = chain.params().nodes.plan.stop {
+        prepared = prepared.with_node_stop(NodeStop::Mask(node))?;
+    }
+    let Some(frame) = input.photo_frame() else {
+        return Ok(prepared);
+    };
+    prepared = prepared.with_photo_frame(frame);
+    // The wider picture of the view, once for the job: the Film nodes and the raster masks both read it (they look at the
+    // same grown window), so it is sampled and uploaded once and the raster planes are made over the Film nodes' copy.
+    let mut shared: Option<GpuImage> = None;
+    // The Film nodes of the plan: their pictures are made from the wider picture the raster masks look at (grown by the Film
+    // halos too, `raster_read`) before the colour pass, which blends them by the nodes' masks (`docs/24` section 3.9c).
+    // With nothing of the photo in the view there is no wider picture and no pixel that reads a Film picture.
+    if !prepared.live_films().is_empty() {
+        prepared = match (rasters, film) {
+            (Some(grown), Some(stack)) => {
+                let r = &grown.read;
+                // The Film nodes read the wider picture whole: a chain with one is never made in tiles.
+                let Some(whole) = grown.whole() else {
+                    return Err(GpuError::InvalidInput(
+                        "a Film node reads the wider picture in one piece".to_owned(),
+                    ));
+                };
+                let wide = {
+                    let _span = perf::span(Stage::WideImage);
+                    input_image(ctx, passes, whole)?
+                };
+                let photo = whole.photo_frame();
+                let pictures = {
+                    let _span = perf::span(Stage::ColourRecord);
+                    stack.encode(
+                        ctx,
+                        passes,
+                        &wide,
+                        r.grown,
+                        r.window,
+                        photo,
+                        Some(FilmRasters {
+                            frame: r.frame,
+                            key: Some(&grown.key),
+                        }),
+                    )?
+                };
+                // The wider picture lives until the work has finished.
+                shared = Some(wide);
+                prepared.with_film(pictures, (r.extent.x, r.extent.y))
+            }
+            (None, _) => prepared.with_film(Arc::new(FilmPictures::empty()), (0, 0)),
+            // The job has no Film passes while the plan runs a Film node: no pixel reads a Film picture (the Before view
+            // has no raster read at all, so it takes the arm above). Zero pictures are never read.
+            (Some(_), None) => prepared.with_film(Arc::new(FilmPictures::empty()), (0, 0)),
+        };
+    }
+    // The raster masks of the nodes (`docs/23` section 5.5): their planes are made over the picture the colour pass
+    // makes, from a sampled picture that goes on beyond it by the masks' receptive field, as far as the photo does.
+    // The pixels of the picture that are paper have no plane.
+    if chain.uses_rasters()
+        && let Some(grown) = rasters
+    {
+        let r = &grown.read;
+        // The planes of a row that was made before (this frame's other chain, an earlier frame) are copied; the
+        // wider picture and the guide are made only when some row has none.
+        let job = RasterJob {
+            frame: r.frame,
+            grown: r.grown,
+            window: r.window,
+            extent: r.extent,
+            photo: frame,
+        };
+        let planes = match (&grown.source, shared.as_ref()) {
+            // The Film nodes sampled this picture already: the planes are made over it.
+            (GrownSource::Whole(_), Some(wide)) => {
+                encode_raster_planes_over(passes, &prepared, chain, wide, &job, Some(&grown.key))?
+            }
+            (GrownSource::Whole(input), None) => {
+                encode_raster_planes_kept(passes, &prepared, chain, &job, &grown.key, |passes| {
+                    let _span = perf::span(Stage::WideImage);
+                    input_image(ctx, passes, input)
+                })?
+            }
+            (GrownSource::Tiles(tiles), _) => {
+                let regions: Vec<RasterTile> = tiles.iter().map(|t| t.tile).collect();
+                encode_raster_planes_tiled(
+                    passes,
+                    &prepared,
+                    chain,
+                    &job,
+                    &grown.key,
+                    &regions,
+                    |i, passes| {
+                        let _span = perf::span(Stage::WideImage);
+                        input_image(ctx, passes, &tiles[i].input)
+                    },
+                )?
+            }
+        };
+        prepared = prepared.with_rasters(planes);
+    }
+    if let Some(wide) = shared {
+        let _ = passes.keep(wide.buf);
+    }
+    Ok(prepared)
 }
 
 /// Records the tail over a resident display: C13 of the whole view first when the photo does not fill
@@ -467,12 +801,16 @@ fn record_tail(
     ctx: &GpuContext,
     passes: &mut PassList<'_>,
     display: &GpuImage,
+    mask: Option<&GpuImage>,
     bounds: Option<Bounds>,
     tail: &TailWork,
     read: bool,
 ) -> Result<(Arc<PooledBuffer>, Option<ReadId>), GpuError> {
     if let Some(map) = &tail.magnify {
-        return record_magnified_tail(ctx, passes, display, bounds, tail, map, read);
+        return record_magnified_tail(ctx, passes, display, mask, bounds, tail, map, read);
+    }
+    if let (Some(mask), Some(accent)) = (mask, tail.overlay) {
+        return record_overlay_tail(ctx, passes, display, mask, accent, bounds, tail, read);
     }
     let (w, h) = tail.view;
     let halo = tail.halo;
@@ -524,6 +862,78 @@ fn record_tail(
     Ok((dst, read))
 }
 
+/// Records the tail of a view with the mask view's overlay (`docs/23` section 5.8): output sharpening over a
+/// copy of the display (the photo's bounding box in the view, or nothing when the view has no sharpening), the
+/// tint of the view's pixels with the mask image, then C13 of the view into the RGBA8 buffer, the letterbox
+/// painted. The same pixels as [`record_tail`]'s fused pass with the tint between the stage and C13: the fused
+/// pass is the chained pair bit for bit, and this is the pair with the tint in between.
+#[allow(clippy::too_many_arguments)] // the tail's own inputs and the overlay's
+fn record_overlay_tail(
+    ctx: &GpuContext,
+    passes: &mut PassList<'_>,
+    display: &GpuImage,
+    mask: &GpuImage,
+    accent: [f32; 3],
+    bounds: Option<Bounds>,
+    tail: &TailWork,
+    read: bool,
+) -> Result<(Arc<PooledBuffer>, Option<ReadId>), GpuError> {
+    let (w, h) = tail.view;
+    let halo = tail.halo;
+    let view_rect = Rect::new(halo, halo, w, h);
+    let bytes = (w * h * 4) as u64;
+    let dst = passes.keep(ctx.pool().acquire("view rgba8", bytes, IMAGE_USAGE)?);
+    let sharp = GpuImage::alloc(
+        ctx,
+        "view overlay source",
+        display.width,
+        display.height,
+        display.planes,
+        display.place,
+    )?;
+    passes
+        .encoder()
+        .copy_buffer_to_buffer(&display.buf, 0, &sharp.buf, 0, display.byte_len());
+    let window = bounds.map(|(x0, y0, x1, y1)| Rect::new(x0, y0, x1 - x0, y1 - y0));
+    let core = window
+        .map(|b| b.intersect(&view_rect))
+        .filter(|c| !c.is_empty());
+    if !tail.identity
+        && let (Some(window), Some(core)) = (window, core)
+    {
+        let sharpen = PreparedSharpen::new(ctx, &tail.sharpen, tail.scale)?;
+        sharpen.encode(passes, display, window, core, &sharp, (core.x, core.y))?;
+    }
+    encode_tint(
+        passes,
+        &sharp,
+        view_rect,
+        mask,
+        accent,
+        OVERLAY_WEIGHT as f32,
+    )?;
+    encode_c13(
+        passes,
+        &sharp,
+        view_rect,
+        Encoding::Rgba8 {
+            background: tail.background,
+        },
+        C13 {
+            space: tail.space,
+            dither: tail.dither,
+            origin: tail.origin,
+        },
+        &dst,
+        0,
+        0,
+    )?;
+    // The copy must outlive the submission.
+    let _ = passes.keep(sharp.buf);
+    let read = read.then(|| passes.read(&dst, 0, bytes)).transpose()?;
+    Ok((dst, read))
+}
+
 /// Records the tail of a view magnified above 100 % (`docs/17-gpu.md` section 16): the display is
 /// the 100 % picture under the view; output sharpening runs over the photo's bounding box in it at
 /// `s = 1` into a copy of it (the pixels outside the box stay as they are, as on the CPU), and the
@@ -535,6 +945,7 @@ fn record_magnified_tail(
     ctx: &GpuContext,
     passes: &mut PassList<'_>,
     display: &GpuImage,
+    mask: Option<&GpuImage>,
     bounds: Option<Bounds>,
     tail: &TailWork,
     map: &MagnifyMap,
@@ -560,6 +971,17 @@ fn record_magnified_tail(
         let window = Rect::new(x0, y0, x1 - x0, y1 - y0);
         let sharpen = PreparedSharpen::new(ctx, &tail.sharpen, tail.scale)?;
         sharpen.encode(passes, display, window, window, &sharp, (x0, y0))?;
+    }
+    // The mask view's overlay tints the sharpened 100 % picture before it is magnified.
+    if let (Some(mask), Some(accent)) = (mask, tail.overlay) {
+        encode_tint(
+            passes,
+            &sharp,
+            Rect::whole(sharp.width, sharp.height),
+            mask,
+            accent,
+            OVERLAY_WEIGHT as f32,
+        )?;
     }
     encode_magnify(
         passes,
@@ -600,6 +1022,10 @@ pub(super) struct PlainJob {
     pub origin: (usize, usize),
     /// Where the finished frame goes.
     pub output: FrameOutput,
+    /// The wider picture the raster masks and the Film nodes of the chain look at, when it has any.
+    pub rasters: Option<GrownInput>,
+    /// The Film nodes of the chain, when it has a live one.
+    pub film: Option<Arc<FilmStack>>,
 }
 
 /// The RGBA8 frame of a [`PlainJob`].
@@ -610,11 +1036,22 @@ pub(super) fn plain_job(
 ) -> Result<Rgba8, GpuError> {
     token.check()?;
     let mut passes = PassList::new(ctx, "view plain");
-    let sampled = input_image(ctx, &mut passes, &job.input)?;
-    let prepared = PreparedChain::new(ctx, &job.chain)?;
+    let sampled = {
+        let _span = perf::span(Stage::InputImage);
+        input_image(ctx, &mut passes, &job.input)?
+    };
+    let prepared = prepared_for(
+        ctx,
+        &mut passes,
+        &job.chain,
+        &job.input,
+        job.rasters.as_ref(),
+        job.film.as_deref(),
+    )?;
     let (w, h) = (sampled.width, sampled.height);
     let bytes = (w * h * 4) as u64;
     let dst = passes.keep(ctx.pool().acquire("view rgba8", bytes, IMAGE_USAGE)?);
+    let colour = perf::span(Stage::ColourRecord);
     prepared.encode_rgba8(
         &mut passes,
         &sampled,
@@ -627,6 +1064,7 @@ pub(super) fn plain_job(
         w,
         (0, 0),
     )?;
+    drop(colour);
     let read = (!keeps(job.output))
         .then(|| passes.read(&dst, 0, bytes))
         .transpose()?;
@@ -643,6 +1081,9 @@ pub(super) struct DisplayJob {
     pub bounds: Option<Bounds>,
     /// The colour chain.
     pub chain: Arc<ColorChain>,
+    /// The mask view's overlay: the chain compiled to the node's mask, run over the same sampled picture. Its
+    /// `m` is tinted onto the sharpened frame in the tail.
+    pub mask: Option<Arc<ColorChain>>,
     /// Output sharpening and C13 in the same job; `None` reads the display-linear frame back.
     pub tail: Option<TailWork>,
     /// Keep the display-linear frame resident (a tail job can sharpen it again).
@@ -651,6 +1092,13 @@ pub(super) struct DisplayJob {
     pub gpu: Weak<Gpu>,
     /// Where the RGBA8 frame of the tail goes.
     pub output: FrameOutput,
+    /// The wider picture the raster masks and the Film nodes of the chain (and of the mask chain) look at, when they have
+    /// any.
+    pub rasters: Option<GrownInput>,
+    /// The Film nodes of the chain, when it has a live one.
+    pub film: Option<Arc<FilmStack>>,
+    /// The Film nodes of the mask chain, when it has a live one.
+    pub mask_film: Option<Arc<FilmStack>>,
 }
 
 /// What a [`DisplayJob`] made.
@@ -662,6 +1110,9 @@ pub(super) struct DisplayOut {
     pub resident: Option<DeviceDisplay>,
     /// The display-linear frame read back (dense planar, `planes` planes), when the job had no tail.
     pub planar: Option<(usize, Vec<f32>)>,
+    /// The mask view's `m` for every pixel (one `f32` a pixel, planar order), when the job had a mask chain and no tail:
+    /// the CPU's tail tints the overlay with it.
+    pub mask: Option<Vec<f32>>,
 }
 
 /// Runs a [`DisplayJob`].
@@ -672,33 +1123,84 @@ pub(super) fn display_job(
 ) -> Result<DisplayOut, GpuError> {
     token.check()?;
     let mut passes = PassList::new(ctx, "view display");
-    let sampled = input_image(ctx, &mut passes, &job.input)?;
-    let prepared = PreparedChain::new(ctx, &job.chain)?;
+    let sampled = {
+        let _span = perf::span(Stage::InputImage);
+        input_image(ctx, &mut passes, &job.input)?
+    };
+    let prepared = prepared_for(
+        ctx,
+        &mut passes,
+        &job.chain,
+        &job.input,
+        job.rasters.as_ref(),
+        job.film.as_deref(),
+    )?;
     let (w, h) = (sampled.width, sampled.height);
+    // The frame has the pixels and the letterbox mask: the position planes of the sampled picture stay behind.
     let display = GpuImage::alloc(
         ctx,
         "view display",
         w,
         h,
-        sampled.planes,
+        sampled.planes.min(4),
         Placement::whole(w, h),
     )?;
-    prepared.encode_stage(
-        &mut passes,
-        &sampled,
-        Rect::whole(w, h),
-        Stop::C12,
-        &display,
-        (0, 0),
-    )?;
+    {
+        let _span = perf::span(Stage::ColourRecord);
+        prepared.encode_stage(
+            &mut passes,
+            &sampled,
+            Rect::whole(w, h),
+            Stop::C12,
+            &display,
+            (0, 0),
+        )?;
+    }
+    // The mask chain over the same pixels: `m` as grey code values in the planes of an image of its own.
+    let mask = job
+        .mask
+        .as_ref()
+        .map(|chain| -> Result<GpuImage, GpuError> {
+            let prepared = prepared_for(
+                ctx,
+                &mut passes,
+                chain,
+                &job.input,
+                job.rasters.as_ref(),
+                job.mask_film.as_deref(),
+            )?;
+            let image = GpuImage::alloc(
+                ctx,
+                "view mask",
+                w,
+                h,
+                sampled.planes.min(4),
+                Placement::whole(w, h),
+            )?;
+            {
+                let _span = perf::span(Stage::ColourRecord);
+                prepared.encode_stage(
+                    &mut passes,
+                    &sampled,
+                    Rect::whole(w, h),
+                    Stop::C13,
+                    &image,
+                    (0, 0),
+                )?;
+            }
+            Ok(image)
+        })
+        .transpose()?;
     let tail_read = job
         .tail
         .as_ref()
         .map(|tail| {
+            let _span = perf::span(Stage::TailRecord);
             record_tail(
                 ctx,
                 &mut passes,
                 &display,
+                mask.as_ref(),
                 job.bounds,
                 tail,
                 !keeps(job.output),
@@ -710,8 +1212,20 @@ pub(super) fn display_job(
     } else {
         None
     };
+    // Without a tail the CPU finishes the frame and needs the mask plane for its overlay.
+    let mask_read = match (&mask, job.tail.is_none()) {
+        (Some(image), true) => Some(image.encode_read(&mut passes)?),
+        _ => None,
+    };
     token.check()?;
-    let mut done = passes.submit()?.finish()?;
+    let pending = {
+        let _span = perf::span(Stage::Submit);
+        passes.submit()?
+    };
+    let mut done = {
+        let _span = perf::span(Stage::Wait);
+        pending.finish()?
+    };
     let mut out = DisplayOut::default();
     if let Some((dst, read)) = tail_read {
         out.rgba = Some(match read {
@@ -722,6 +1236,13 @@ pub(super) fn display_job(
     if let Some(read) = planar_read {
         let planes = display.planes;
         out.planar = Some((planes, display.take(&done, read)?));
+    }
+    if let (Some(read), Some(image)) = (mask_read, &mask) {
+        let n = image.width * image.height;
+        let mut planes = image.take(&done, read)?;
+        // The chain makes `[m, m, m]` for every pixel: the first plane is the mask.
+        planes.truncate(n);
+        out.mask = Some(planes);
     }
     if job.keep {
         out.resident = Some(DeviceDisplay {
@@ -751,14 +1272,17 @@ pub(super) fn tail_job(
 ) -> Result<Rgba8, GpuError> {
     token.check()?;
     let mut passes = PassList::new(ctx, "view tail");
+    let tail_span = perf::span(Stage::TailRecord);
     let (dst, read) = record_tail(
         ctx,
         &mut passes,
         &job.display.image,
+        None,
         job.display.bounds,
         &job.tail,
         !keeps(job.output),
     )?;
+    drop(tail_span);
     token.check()?;
     finish_rgba(passes, dst, read)
 }
@@ -803,6 +1327,107 @@ pub(super) fn gather_job(
         }
         at += part.byte_len();
     }
+    token.check()?;
+    finish_rgba(passes, dst, None)
+}
+
+/// One run of whole pixels copied from a strip of a level into the cell's frame ([`CropJob`]).
+pub(super) struct RowCopy {
+    /// The strip.
+    pub src: Arc<PooledBuffer>,
+    /// Where the run starts in the strip, in bytes.
+    pub src_at: u64,
+    /// Where it goes in the frame, in bytes.
+    pub dst_at: u64,
+    /// Its length in bytes (a whole number of pixels).
+    pub len: u64,
+}
+
+/// The window of a level (`frame::level`) as a cell-sized RGBA8 frame: buffer-to-buffer copies out of the level's strips.
+pub(super) struct CropJob {
+    /// The copies, in any order; together they cover the frame.
+    pub copies: Vec<RowCopy>,
+    /// The size of the frame in bytes.
+    pub bytes: u64,
+}
+
+/// Runs a [`CropJob`]. The copies move the bytes and change none, so the frame is the level's pixels bit for bit.
+pub(super) fn crop_job(
+    ctx: &GpuContext,
+    token: &CancelToken,
+    job: &CropJob,
+) -> Result<Rgba8, GpuError> {
+    token.check()?;
+    let covered: u64 = job.copies.iter().map(|c| c.len).sum();
+    if covered != job.bytes {
+        return Err(GpuError::InvalidInput(format!(
+            "the copies hold {covered} bytes, the frame {}",
+            job.bytes
+        )));
+    }
+    let mut passes = PassList::new(ctx, "level crop");
+    let dst = passes.keep(
+        ctx.pool()
+            .acquire("level crop rgba8", job.bytes, IMAGE_USAGE)?,
+    );
+    for c in &job.copies {
+        passes
+            .encoder()
+            .copy_buffer_to_buffer(&c.src, c.src_at, &dst, c.dst_at, c.len);
+    }
+    token.check()?;
+    finish_rgba(passes, dst, None)
+}
+
+/// The draft of a zoom (`frame::level`): a region of a level copied out of its strips and resampled into a cell-sized frame.
+pub(super) struct DraftJob {
+    /// The copies that put the region together, from the strips.
+    pub copies: Vec<RowCopy>,
+    /// The region's size in pixels.
+    pub region: (usize, usize),
+    /// Where the frame's pixels read in the region.
+    pub map: ym_gpu::kernels::level_draft::DraftMap,
+    /// The frame's size in pixels.
+    pub size: (usize, usize),
+}
+
+/// Runs a [`DraftJob`]: the region is gathered by buffer copies, then one kernel makes the frame.
+pub(super) fn draft_job(
+    ctx: &GpuContext,
+    token: &CancelToken,
+    job: &DraftJob,
+) -> Result<Rgba8, GpuError> {
+    token.check()?;
+    let region_bytes = 4 * (job.region.0 * job.region.1) as u64;
+    let covered: u64 = job.copies.iter().map(|c| c.len).sum();
+    if covered != region_bytes {
+        return Err(GpuError::InvalidInput(format!(
+            "the copies hold {covered} bytes, the region {region_bytes}"
+        )));
+    }
+    let mut passes = PassList::new(ctx, "level draft");
+    let region = passes.keep(
+        ctx.pool()
+            .acquire("draft region", region_bytes, IMAGE_USAGE)?,
+    );
+    for c in &job.copies {
+        passes
+            .encoder()
+            .copy_buffer_to_buffer(&c.src, c.src_at, &region, c.dst_at, c.len);
+    }
+    let dst = passes.keep(ctx.pool().acquire(
+        "draft rgba8",
+        4 * (job.size.0 * job.size.1) as u64,
+        IMAGE_USAGE,
+    )?);
+    ym_gpu::kernels::level_draft::encode_level_draft(
+        &mut passes,
+        &region,
+        job.region,
+        job.map,
+        &dst,
+        job.size,
+    )?;
     token.check()?;
     finish_rgba(passes, dst, None)
 }
@@ -884,24 +1509,6 @@ pub(super) fn interleave_display(
     (rgb, outside.filter(|_| any))
 }
 
-/// Rows of the view per band so that the four-plane frame of a band, grown by `halo` rows above and
-/// below, fits `band_bytes` of one storage binding, and how many bands that makes for `view_h` rows;
-/// `None` when the whole frame fits (no cut). The rule depends on the sizes alone, never on the device.
-pub(super) fn band_rows(
-    view_w: usize,
-    view_h: usize,
-    halo: usize,
-    band_bytes: u64,
-    min_bands: usize,
-) -> Option<usize> {
-    let row_bytes = 16 * (view_w + 2 * halo).next_multiple_of(2) as u64;
-    let fit_rows = (band_bytes / row_bytes.max(1)) as usize;
-    let core_rows = fit_rows.saturating_sub(2 * halo).max(1);
-    let by_size = view_h.div_ceil(core_rows);
-    let bands = by_size.max(min_bands).min(view_h.max(1));
-    (bands > 1).then(|| view_h.div_ceil(bands))
-}
-
 /// The view `spec` cut into horizontal bands of `rows` view rows: each band is a view of its own
 /// (its own pixels and its own grown frame), and the dither of a band counts its texels from the
 /// band's first row in the whole view.
@@ -958,23 +1565,6 @@ mod tests {
             ViewStages::of(GpuStages::RAW_CHAIN.union(GpuStages::EXPORT_TAIL)),
             none
         );
-    }
-
-    #[test]
-    fn a_frame_that_fits_one_binding_is_not_cut() {
-        // 128 MiB holds 8,388,608 pixels of four f32 planes.
-        assert_eq!(band_rows(2880, 1920, 17, 128 << 20, 1), None);
-        assert_eq!(band_rows(4000, 2000, 0, 128 << 20, 1), None);
-        // A 5K frame does not.
-        let rows = band_rows(5120, 2880, 17, 128 << 20, 1).expect("cut");
-        assert!(rows < 2880);
-        // Every band's grown frame fits.
-        let grown_bytes = 16 * (5120u64 + 34) * (rows as u64 + 34);
-        assert!(grown_bytes <= 128 << 20, "{grown_bytes}");
-        // The source can ask for more bands than the frame does.
-        assert_eq!(band_rows(100, 100, 0, 128 << 20, 4), Some(25));
-        // The cut never makes a band of no rows, however small the limit.
-        assert_eq!(band_rows(64, 5, 3, 1, 1), Some(1));
     }
 
     #[test]
@@ -1035,5 +1625,54 @@ mod tests {
         assert_eq!(interleave_display(2, 2, 4, &planar).1, None);
         // Three planes: no mask either.
         assert_eq!(interleave_display(2, 2, 3, &planar[..12]).1, None);
+    }
+
+    /// The sizes views are cut to (G-12): the device's binding and a share of its budget, not the design binding.
+    #[test]
+    fn views_are_cut_to_the_devices_limits() {
+        const MIB: u64 = 1 << 20;
+        // Lavapipe: a 128 MiB binding, a 4 GiB budget (170 MiB a picture): the binding.
+        let lavapipe = ViewLimits {
+            binding_bytes: 128 * MIB,
+            budget_bytes: 4096 * MIB,
+        };
+        assert_eq!(
+            view_bytes(lavapipe, u64::MAX, false, false),
+            (128 * MIB, 128 * MIB)
+        );
+        assert_eq!(
+            view_bytes(lavapipe, u64::MAX, true, false).0,
+            128 * MIB / 3 * 2
+        );
+        assert_eq!(
+            view_bytes(lavapipe, u64::MAX, false, true).0,
+            128 * MIB / 28 * 16
+        );
+        // The Mac of the owner's log: a binding of 2 GiB or more, the 4 GiB budget: a share of the budget.
+        let mac = ViewLimits {
+            binding_bytes: 2048 * MIB,
+            budget_bytes: 4096 * MIB,
+        };
+        let share = 4096 * MIB / ViewLimits::BUDGET_DIVISOR;
+        assert_eq!(view_bytes(mac, u64::MAX, false, false), (share, share));
+        // With raster masks and the pixels' places: the share, two thirds of it (the raster rule bounds the binding only).
+        assert_eq!(view_bytes(mac, u64::MAX, true, true).0, share / 3 * 2);
+        // The owner's view at 100 %: a Film reach of 640 and the masks' 75 around 2080 x 1387 is 9.9 million pixels, 158 MB
+        // at 16 bytes a pixel, and its 28-byte raster planes need a 277 MB binding: one piece.
+        let wide = 16 * (2080 + 2 * 715) * (1387 + 2 * 715);
+        assert!(wide <= view_bytes(mac, u64::MAX, true, true).0.max(share));
+        assert!(wide <= view_bytes(mac, u64::MAX, false, true).0);
+        // A cap lowers it, never raises it.
+        assert_eq!(view_bytes(mac, 10 * MIB, false, true), (10 * MIB, 10 * MIB));
+        assert_eq!(view_bytes(lavapipe, 1 << 40, false, false).0, 128 * MIB);
+        // A smaller budget (an 8 GB Mac: 2 GiB) shrinks the pieces.
+        let small = ViewLimits {
+            binding_bytes: 2048 * MIB,
+            budget_bytes: 2048 * MIB,
+        };
+        assert_eq!(
+            view_bytes(small, u64::MAX, false, false).0,
+            2048 * MIB / ViewLimits::BUDGET_DIVISOR
+        );
     }
 }

@@ -4,25 +4,32 @@
 use std::fmt::Write as _;
 
 use ym_color::consts::{
-    LOGC3_EI800, LOGC4, LOGC4_GRAY, LOGC4_STOP, REC709_LUMA_WEIGHTS, linalg::Mat3,
+    D65_XY, LOGC3_EI800, LOGC4, LOGC4_GRAY, LOGC4_STOP, REC709_LUMA_WEIGHTS, linalg::Mat3,
+    xy_to_xyz,
 };
-use ym_color::display::aces2_input_matrix;
-use ym_color::exposure::TARGET_GREY;
-use ym_color::exposure::white;
+use ym_color::display::BlendMode;
+use ym_color::display::cine;
 use ym_color::gamut::{awg4_luminance_row, matrices};
 use ym_color::grade::{
     BRIGHTNESS_SIGMA, COLOR_BALANCE_STRENGTH, CONTRAST_BLACK, CONTRAST_COLOR,
     CONTRAST_NEUTRAL_CHROMA, CONTRAST_TOP, E1, E2, SATURATION_CODE_LIMIT, ZONE_CONTROL_SIGMA,
     ZONE_SIGMA,
 };
+use ym_color::plan::{PLAN_KEYS, PLAN_REGISTERS};
 use ym_color::tone::HIGHLIGHT_GREY;
 use ym_color::warp::{
     WARP_EXP_LIMIT, WARP_MAX_PINS, WARP_MAX_STEPS, WARP_NEUTRAL_GUARD, WARP_TONE_HALF_WIDTH,
 };
 
-use super::aces;
-use super::color::{WARP_LOCK_ROWS, WARP_MOVE_ROWS};
+use super::color::{
+    J_AL, J_BASE, J_HEAD, J_IN, J_SPLIT, JOIN_COMBINER, JOIN_LAYER, JOIN_PARALLEL, JOIN_ROWS,
+    JOIN_SPLITTER, MASK_INVERT, MASK_ROW_VEC4, MASK_SUBTRACT, NODE_BLEND, NODE_CURVES, NODE_FILM,
+    NODE_FILM_LIVE, NODE_GRADE, NODE_INVERT, NODE_JOIN, NODE_LUMA, NODE_MAIN, NODE_NONE, NODE_SKIP,
+    NODE_TRIM, NODE_WARP, R_WARP_LK, REC_ROWS, REF_INDEX, REF_INPUT, REF_KEY, REF_PICTURE,
+    REF_REGISTER, REF_SHIFT, REF_SLOT, WARP_LOCK_ROWS, WARP_MOVE_ROWS, blend_code, record_rows,
+};
 use crate::device::StorageMode;
+use ym_color::mask::OpKind;
 
 /// The kernels of the crate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -99,6 +106,14 @@ pub enum KernelId {
     Encode,
     /// The Catmull-Rom magnification of a view above 100 % with the paper, C13 fused.
     Magnify,
+    /// The draft of a zoom: a rectangle of a finished RGBA8 picture resampled, bilinear, into a cell-sized RGBA8 frame.
+    LevelDraft,
+    /// The mask view's overlay: the accent tinted over a display-linear picture where a node's mask is 1,
+    /// in place, between output sharpening and C13.
+    Tint,
+    /// The raster masks' pass: the resample of a row's plane to the output grid, Grow, Feather, the guided
+    /// filter of Refine edges and the u16 planes the colour pass reads (one entry point, an op in the uniform).
+    MaskRaster,
     /// R1 normalise, R3 vignetting and R4 gains of a rectangle, from the resident raw words.
     Prep,
     /// The R1 clip bits of a rectangle (one bit per photosite) from the words and the steps.
@@ -111,6 +126,44 @@ pub enum KernelId {
     MosaicCa,
     /// R9 lens resampling.
     Lens,
+    /// L2, the lens's field optics: the box-reduced pyramid of the input, one level per dispatch.
+    LensFieldPyramid,
+    /// L2: the gather of every pixel's spread function (and the gain when there is no fringe shift).
+    LensFieldGather,
+    /// L2: each channel read at its fringe shift along the axis, times the gain.
+    LensFieldFinish,
+    /// L3, the lens's highlight optics: the restored light of the input (the clip test's boost).
+    LensFlareRestore,
+    /// L3: the nodes of the grids the slowly varying ghosts are drawn on (one dispatch per grid).
+    LensFlareNodes,
+    /// L3: the glow core, the tail plane and the drawn items of every pixel, mixed with Z.
+    LensFlare,
+    /// L1 and L2, the lens's field stages: the input with the colour of the light it holds.
+    LensLight,
+    /// L1, the lens's bokeh reshaping: the footprint means of the root colours of the blur map's cells (the upsampling's colour guide).
+    LensReshapeGuide,
+    /// L1, the lens's bokeh reshaping: the blur map at the pixels of the tile: the joint bilateral upsampling and its acceptance tests.
+    LensReshapeBlur,
+    /// L1, the lens's bokeh reshaping: the square root of the luminance, the field the sharp-edge test reads.
+    LensReshapeLumRoot,
+    /// L1, the lens's bokeh reshaping: the gradient energy of that field and of its 3 x 3 mean.
+    LensReshapeGrad,
+    /// L1, the lens's bokeh reshaping: the places whose 5 x 5 energy exceeds the mean's by the ratio of the sharp-edge test.
+    LensReshapeFlags,
+    /// L1, the lens's bokeh reshaping: the sharp flags dilated by 2 pixels.
+    LensReshapeDilate,
+    /// L1, the lens's bokeh reshaping: the balls' protection of their rim and light, the blur zeroed on the sharp places, the balls' floor and the occluded pixels.
+    LensReshapeProtect,
+    /// L1, the lens's bokeh reshaping: the horizontal counts of blurred pixels in the feather's window.
+    LensReshapeCover,
+    /// L1, the lens's bokeh reshaping: the stretch's ramp towards the border of the blur map.
+    LensReshapeRamp,
+    /// L1, the lens's bokeh reshaping: the picture with each ball's disc replaced by its ring's plane fit.
+    LensReshapeTakeOut,
+    /// L1, the lens's bokeh reshaping: the gather across the anamorphic axis.
+    LensReshapeVGather,
+    /// L1, the lens's bokeh reshaping: the gather along the tangent and the balls drawn back.
+    LensReshapeFinal,
     /// The half-resolution noise sigma plane, from the resident raw words.
     Sigma,
     /// The k x k mosaic binning of the fit view, with the vignetting gain at the binned pixels.
@@ -125,6 +178,28 @@ pub enum KernelId {
     SigmaExpand,
     /// The 5 x 5 opponent bilateral denoise of R6.
     Bilateral,
+    /// R6's single-frame denoise by method A, pass 1: the working encoding, Y/Cb/Cr and the zeroed
+    /// accumulators of the buffer.
+    BmDctPrep,
+    /// R6's single-frame denoise by method A: one pass of A.5 (block matching, the 3D transform, the hard
+    /// threshold and the aggregation of every reference of the pass).
+    BmDct,
+    /// R6's single-frame denoise by method A, the last pass: `acc / w`, RGB, the blend and the decoding.
+    BmDctOutput,
+    /// R6's false-colour suppression after method A, the gate: the luma of the working encoding.
+    FalseColorLuma,
+    /// The false-colour gate: the alternation of the luma and its row sums.
+    FalseColorRows,
+    /// The false-colour gate: the column sums and the stripe energy.
+    FalseColorEnergy,
+    /// The false-colour gate: the dilated energy, the weight and the blend with R7's colour guided filter.
+    FalseColorBlend,
+    /// R6's coarse colour pass after method A: the mean Y, Cb and Cr of every 4 x 4 cell.
+    CoarseChromaCells,
+    /// The coarse colour pass: the bilateral filter of the cells' colour, the correction of every cell.
+    CoarseChromaCorrect,
+    /// The coarse colour pass: the corrections interpolated to the pixels and applied to Cb and Cr.
+    CoarseChromaApply,
     /// The R7 chroma guided filter, pass 1: horizontal window means of the six quantities.
     Guided,
     /// The R7 chroma guided filter, pass 2: vertical means and the coefficients a and b.
@@ -152,6 +227,17 @@ pub enum KernelId {
     /// Copies a rectangle of a planar image into another (the crop of a tile, the parts of a
     /// cut demosaic core, the pieces of a window).
     Copy,
+    /// The Film node's P1: LogC4 / AWG4 to the raw exposure (the scene stage's gamut compression and T1).
+    FilmColourIn,
+    /// The Film node's Gaussians (P2's scatter and halation, the inhibitor's diffusion, the dye cloud): the rows and
+    /// columns of a direct sum, the cells of the coarse grid and their bilinear read back, the scale and the add.
+    FilmSpatial,
+    /// The Film node's P3: the curves without couplers, the per-pixel coupler step and the develop.
+    FilmDevelop,
+    /// The Film node's P4: the counter-based grain hash and the noise of the three sublayers.
+    FilmGrain,
+    /// The Film node's P5: T3a, the paper's curves, T3b′ and the per-pixel return of the cine rendering's inverse.
+    FilmColourOut,
     /// A permanent stub: the one placeholder that stays. It writes a NaN into its single
     /// storage binding and nothing else, so the tests of the pass list, the pool and a lost device,
     /// which need *a* dispatch with one binding, have one now that every other kernel is real.
@@ -165,11 +251,12 @@ impl KernelId {
     /// view of a mosaic photo (the reduced group: R1 to R5, the binning, the sigma, the light
     /// denoise, R9), the copy that puts the pieces of an image together, the view stages (the
     /// sampler, the colour chain, output sharpening, C13), the full-resolution raw chain (the
-    /// demosaic, the denoise, R7, capture sharpening, diffraction), the export tail's resize, and
-    /// last the spikes and the probe, which no render uses. [`KernelSet::kernels`] and `warm_up`
-    /// compile in this order, so that what the first frame of the first photo waits for is compiled
-    /// before what only a zoomed view or an export needs.
-    pub const ALL: [KernelId; 63] = [
+    /// demosaic, the single-frame denoise of method A and its false-colour suppression, R7, capture
+    /// sharpening, diffraction), the export tail's resize, and last the spikes and the probe, which
+    /// no render uses. [`KernelSet::kernels`] and `warm_up` compile in this order, so that what the
+    /// first frame of the first photo waits for is compiled before what only a zoomed view or an
+    /// export needs.
+    pub const ALL: [KernelId; 100] = [
         // The fit view of a mosaic photo.
         KernelId::Prep,
         KernelId::PrepMask,
@@ -185,6 +272,26 @@ impl KernelId {
         KernelId::Bilateral,
         KernelId::Lens,
         KernelId::Copy,
+        // The lens's field optics (L2), between the raw group and the colour pass.
+        KernelId::LensFieldPyramid,
+        KernelId::LensFieldGather,
+        KernelId::LensFieldFinish,
+        KernelId::LensFlareRestore,
+        KernelId::LensFlareNodes,
+        KernelId::LensLight,
+        KernelId::LensReshapeGuide,
+        KernelId::LensReshapeBlur,
+        KernelId::LensReshapeLumRoot,
+        KernelId::LensReshapeGrad,
+        KernelId::LensReshapeFlags,
+        KernelId::LensReshapeDilate,
+        KernelId::LensReshapeProtect,
+        KernelId::LensReshapeCover,
+        KernelId::LensReshapeRamp,
+        KernelId::LensReshapeTakeOut,
+        KernelId::LensReshapeVGather,
+        KernelId::LensReshapeFinal,
+        KernelId::LensFlare,
         // The view stages.
         KernelId::Sampler,
         KernelId::Color,
@@ -198,6 +305,15 @@ impl KernelId {
         KernelId::OutputSharpenTransfer,
         KernelId::Encode,
         KernelId::Magnify,
+        KernelId::LevelDraft,
+        KernelId::Tint,
+        KernelId::MaskRaster,
+        // The Film node's passes (docs/24 section 3.9).
+        KernelId::FilmColourIn,
+        KernelId::FilmSpatial,
+        KernelId::FilmDevelop,
+        KernelId::FilmGrain,
+        KernelId::FilmColourOut,
         // The full-resolution raw chain (the 100 % view and the exports).
         KernelId::AdaptiveRatioPrepare,
         KernelId::AdaptiveRatioGreen,
@@ -211,6 +327,16 @@ impl KernelId {
         KernelId::AdaptiveRatioMatch,
         KernelId::AdaptiveRatioExit,
         KernelId::LogGuided,
+        KernelId::BmDctPrep,
+        KernelId::BmDct,
+        KernelId::BmDctOutput,
+        KernelId::FalseColorLuma,
+        KernelId::FalseColorRows,
+        KernelId::FalseColorEnergy,
+        KernelId::FalseColorBlend,
+        KernelId::CoarseChromaCells,
+        KernelId::CoarseChromaCorrect,
+        KernelId::CoarseChromaApply,
         KernelId::Guided,
         KernelId::GuidedCols,
         KernelId::GuidedSmoothRows,
@@ -279,12 +405,34 @@ impl KernelId {
             KernelId::Sampler => "sampler",
             KernelId::Encode => "encode",
             KernelId::Magnify => "magnify",
+            KernelId::LevelDraft => "level_draft",
+            KernelId::Tint => "tint",
+            KernelId::MaskRaster => "mask_raster",
             KernelId::Prep => "prep",
             KernelId::PrepMask => "prep_mask",
             KernelId::HighlightsSuper => "highlights_super",
             KernelId::Highlights => "highlights",
             KernelId::MosaicCa => "mosaic_ca",
             KernelId::Lens => "lens",
+            KernelId::LensFieldPyramid => "lens_field_pyramid",
+            KernelId::LensFieldGather => "lens_field_gather",
+            KernelId::LensFieldFinish => "lens_field_finish",
+            KernelId::LensFlareRestore => "lens_flare_restore",
+            KernelId::LensFlareNodes => "lens_flare_nodes",
+            KernelId::LensFlare => "lens_flare",
+            KernelId::LensLight => "lens_light",
+            KernelId::LensReshapeGuide => "lens_reshape_guide",
+            KernelId::LensReshapeBlur => "lens_reshape_blur",
+            KernelId::LensReshapeLumRoot => "lens_reshape_lumroot",
+            KernelId::LensReshapeGrad => "lens_reshape_grad",
+            KernelId::LensReshapeFlags => "lens_reshape_flags",
+            KernelId::LensReshapeDilate => "lens_reshape_dilate",
+            KernelId::LensReshapeProtect => "lens_reshape_protect",
+            KernelId::LensReshapeCover => "lens_reshape_cover",
+            KernelId::LensReshapeRamp => "lens_reshape_ramp",
+            KernelId::LensReshapeTakeOut => "lens_reshape_takeout",
+            KernelId::LensReshapeVGather => "lens_reshape_vgather",
+            KernelId::LensReshapeFinal => "lens_reshape_final",
             KernelId::Sigma => "sigma",
             KernelId::Bin => "bin",
             KernelId::BinSigma => "bin_sigma",
@@ -292,6 +440,16 @@ impl KernelId {
             KernelId::ReduceFold => "reduce_fold",
             KernelId::SigmaExpand => "sigma_expand",
             KernelId::Bilateral => "bilateral",
+            KernelId::BmDctPrep => "bm_dct_prep",
+            KernelId::BmDct => "bm_dct",
+            KernelId::BmDctOutput => "bm_dct_output",
+            KernelId::FalseColorLuma => "false_color_luma",
+            KernelId::FalseColorRows => "false_color_rows",
+            KernelId::FalseColorEnergy => "false_color_energy",
+            KernelId::FalseColorBlend => "false_color_blend",
+            KernelId::CoarseChromaCells => "coarse_chroma_cells",
+            KernelId::CoarseChromaCorrect => "coarse_chroma_correct",
+            KernelId::CoarseChromaApply => "coarse_chroma_apply",
             KernelId::Guided => "guided",
             KernelId::GuidedCols => "guided_cols",
             KernelId::GuidedSmoothRows => "guided_smooth_rows",
@@ -305,6 +463,11 @@ impl KernelId {
             KernelId::RlOutput => "rl_output",
             KernelId::Resize => "resize",
             KernelId::Copy => "copy",
+            KernelId::FilmColourIn => "film_colour_in",
+            KernelId::FilmSpatial => "film_spatial",
+            KernelId::FilmDevelop => "film_develop",
+            KernelId::FilmGrain => "film_grain",
+            KernelId::FilmColourOut => "film_colour_out",
             KernelId::Probe => "probe",
         }
     }
@@ -344,7 +507,34 @@ impl KernelId {
             | KernelId::OutputSharpenTransfer
             | KernelId::Sampler
             | KernelId::Encode
-            | KernelId::Magnify => KernelSet::View,
+            | KernelId::Magnify
+            | KernelId::LevelDraft
+            | KernelId::Tint
+            | KernelId::MaskRaster
+            | KernelId::FilmColourIn
+            | KernelId::FilmSpatial
+            | KernelId::FilmDevelop
+            | KernelId::FilmGrain
+            | KernelId::FilmColourOut
+            | KernelId::LensFieldPyramid
+            | KernelId::LensFieldGather
+            | KernelId::LensFieldFinish
+            | KernelId::LensFlareRestore
+            | KernelId::LensFlareNodes
+            | KernelId::LensLight
+            | KernelId::LensReshapeGuide
+            | KernelId::LensReshapeBlur
+            | KernelId::LensReshapeLumRoot
+            | KernelId::LensReshapeGrad
+            | KernelId::LensReshapeFlags
+            | KernelId::LensReshapeDilate
+            | KernelId::LensReshapeProtect
+            | KernelId::LensReshapeCover
+            | KernelId::LensReshapeRamp
+            | KernelId::LensReshapeTakeOut
+            | KernelId::LensReshapeVGather
+            | KernelId::LensReshapeFinal
+            | KernelId::LensFlare => KernelSet::View,
             KernelId::Resize => KernelSet::Tail,
             _ => KernelSet::Raw,
         }
@@ -388,7 +578,18 @@ impl KernelId {
             KernelId::Sampler => super::sampler::body(),
             KernelId::Encode => super::encode::body(),
             KernelId::Magnify => super::magnify::body(),
+            KernelId::LevelDraft => super::level_draft::body(),
             KernelId::SigmaExpand | KernelId::Bilateral => super::bilateral::body(self),
+            KernelId::BmDctPrep | KernelId::BmDct | KernelId::BmDctOutput => {
+                super::bm_dct::body(self)
+            }
+            KernelId::FalseColorLuma
+            | KernelId::FalseColorRows
+            | KernelId::FalseColorEnergy
+            | KernelId::FalseColorBlend => super::false_color::body(self),
+            KernelId::CoarseChromaCells
+            | KernelId::CoarseChromaCorrect
+            | KernelId::CoarseChromaApply => super::coarse_chroma::body(self),
             KernelId::Guided
             | KernelId::GuidedCols
             | KernelId::GuidedSmoothRows
@@ -406,10 +607,36 @@ impl KernelId {
             | KernelId::ReduceFold => super::highlights::body(self),
             KernelId::MosaicCa => super::mosaic_ca::body(),
             KernelId::Lens => super::lens::body(),
+            KernelId::LensFieldPyramid | KernelId::LensFieldGather | KernelId::LensFieldFinish => {
+                super::lens_field::body(self)
+            }
+            KernelId::LensFlareRestore | KernelId::LensFlareNodes | KernelId::LensFlare => {
+                super::lens_flare::body(self)
+            }
+            KernelId::LensLight => super::lens_light::body(),
+            KernelId::LensReshapeGuide
+            | KernelId::LensReshapeBlur
+            | KernelId::LensReshapeLumRoot
+            | KernelId::LensReshapeGrad
+            | KernelId::LensReshapeFlags
+            | KernelId::LensReshapeDilate
+            | KernelId::LensReshapeProtect
+            | KernelId::LensReshapeCover
+            | KernelId::LensReshapeRamp
+            | KernelId::LensReshapeTakeOut
+            | KernelId::LensReshapeVGather
+            | KernelId::LensReshapeFinal => super::lens_reshape::body(self),
             KernelId::Sigma => super::sigma::body(),
             KernelId::Bin | KernelId::BinSigma => super::bin::body(self),
             KernelId::Resize => super::resize::body(),
             KernelId::Copy => super::copy::body(),
+            KernelId::FilmColourIn
+            | KernelId::FilmSpatial
+            | KernelId::FilmDevelop
+            | KernelId::FilmGrain
+            | KernelId::FilmColourOut => super::film::body(self),
+            KernelId::Tint => super::tint::body(),
+            KernelId::MaskRaster => include_str!("../shaders/mask_raster.wgsl").to_string(),
             KernelId::Probe => placeholder_body(self),
         }
     }
@@ -474,20 +701,14 @@ fn placeholder_body(id: KernelId) -> String {
     )
 }
 
-/// Offsets (in f32 elements) of the sections of the `tables` storage buffer of the colour kernel
-/// (the dither thresholds, then the ACES 2 tables of one output).
+/// Offsets (in f32 elements) of the sections of the `tables` storage buffer of the colour kernel (the dither
+/// thresholds; the four 1024-entry curve tables are a buffer of their own, so that a curve edit refills 16 KB
+/// and nothing else).
 pub(crate) mod table {
     /// Dither thresholds, 64 x 64.
     pub const DITHER: usize = 0;
     /// Entries of the dither section.
     pub const DITHER_ENTRIES: usize = 64 * 64;
-    /// First ACES 2 table: reach M. (The four 1024-entry curve tables are a buffer of their own, so
-    /// that a curve edit refills 16 KB and nothing else.)
-    pub const ACES: usize = DITHER_ENTRIES;
-    /// Entries per ACES 2 hue table (`ym_color`'s `TOTAL_TABLE_SIZE`: wrap entries included).
-    pub const ACES_ENTRIES: usize = ym_color::aces2::TOTAL_TABLE_SIZE;
-    /// Total f32 elements.
-    pub const TOTAL: usize = ACES + 5 * ACES_ENTRIES;
 }
 
 fn f(x: f64) -> String {
@@ -505,8 +726,25 @@ fn rows(name: &str, m: &Mat3) -> String {
     let mut s = String::new();
     for (i, r) in m.iter().enumerate() {
         let _ = writeln!(s, "const {name}_{i}: vec3<f32> = {};", vec3_row(r));
+        // The low part of each entry (the f64 value minus its f32 rounding), for the compensated products of `precise.wgsl`.
+        let lo = r.map(|v| v - f64::from(v as f32));
+        let _ = writeln!(s, "const {name}_{i}_LO: vec3<f32> = {};", vec3_row(&lo));
     }
     s
+}
+
+/// The rows of the chromatic distance of the cine rendering's luminance floor (step 2 of C12): `dX = X - XN Y`
+/// and `dZ = Z - ZN Y` as linear functions of the linear AWG4 triple `x`, `DX = row_X - XN row_Y` and
+/// `DZ = row_Z - ZN row_Y`, formed in f64. Returned as `[[DX_r, DX_b], [DZ_r, DZ_b]]`: AWG4's white maps to
+/// `(XN, 1, ZN)`, so each full row sums to 0 (to 2e-16) and `D . x = D . (x - x_g 1)` has no green entry. The
+/// kernel applies them to the channel differences `(r - g, b - g)`, so that a neutral gives exactly 0.
+pub(crate) fn cine_floor_rows() -> [[f64; 2]; 2] {
+    let m = matrices().awg4_to_xyz;
+    let d65 = xy_to_xyz(D65_XY);
+    // The same two quotients as `ym_color::display::cine` (`XN`, `ZN` of `kernel_scalars`).
+    let (xn, zn) = (d65[0] / d65[1], d65[2] / d65[1]);
+    let row = |k: usize, n: f64| [m[k][0] - n * m[1][0], m[k][2] - n * m[1][2]];
+    [row(0, xn), row(2, zn)]
 }
 
 /// The generated constants block.
@@ -540,13 +778,26 @@ fn constants() -> String {
         ("CONTRAST_NEUTRAL", CONTRAST_NEUTRAL_CHROMA),
         ("SAT_CODE_LIMIT", SATURATION_CODE_LIMIT),
         ("HIGHLIGHT_GREY", HIGHLIGHT_GREY),
-        ("WHITE_LIFT_KNEE", white::KNEE_EV),
-        ("WHITE_LIFT_GREY", TARGET_GREY),
         ("WARP_NEUTRAL_GUARD", WARP_NEUTRAL_GUARD),
         ("WARP_TONE_HALF_WIDTH", WARP_TONE_HALF_WIDTH),
         ("WARP_EXP_LIMIT", WARP_EXP_LIMIT),
     ] {
         let _ = writeln!(s, "const {n}: f32 = {};", f(v));
+    }
+    // LogC4 for the colour pass's accurate encode and decode (`precise.wgsl`): the low parts of the f32 constants and the
+    // two derived ones, B / 14 and its inverse, as hi + lo pairs, so that the pass's log and exp carry no rounding of the
+    // constants (docs/24 section 3.9c).
+    {
+        let pair = |name: &str, v: f64, s: &mut String| {
+            let hi = v as f32;
+            let _ = writeln!(s, "const {name}: f32 = {};", f(v));
+            let _ = writeln!(s, "const {name}_LO: f32 = {};", f(v - f64::from(hi)));
+        };
+        pair("LC4P_A", LOGC4.a, &mut s);
+        pair("LC4P_C", LOGC4.c, &mut s);
+        pair("LC4P_BB", LOGC4.b / 14.0, &mut s);
+        pair("LC4P_IBB", 14.0 / LOGC4.b, &mut s);
+        pair("LC4P_64_OVER_A", 64.0 / LOGC4.a, &mut s);
     }
     // The colour warp's pin count, the sizes of its rows in the colour kernel's uniform block
     // (`kernels::color`, `ChainU`) and the most flow steps a frame takes.
@@ -558,8 +809,71 @@ fn constants() -> String {
     ] {
         let _ = writeln!(s, "const {n}: u32 = {v}u;");
     }
-    // The luma of C7's highlight range (`ym_color::tone::luma`) and of the white lift
-    // (`ym_color::exposure::white::drive_luma`, the same weights).
+    // The plan loop (`kernels::color`, `docs/23` section 5.4): the registers and key slots a pass has, the bits of a
+    // node record, the references to a value (kind in the top four bits, index below) and "not written".
+    for (n, v) in [
+        ("PLAN_REGISTERS", PLAN_REGISTERS as u32),
+        ("PLAN_KEYS", PLAN_KEYS as u32),
+        ("NODE_NONE", NODE_NONE),
+        ("N_SKIP", NODE_SKIP),
+        ("N_TRIM", NODE_TRIM),
+        ("N_GRADE", NODE_GRADE),
+        ("N_WARP", NODE_WARP),
+        ("N_CURVES", NODE_CURVES),
+        ("N_MAIN", NODE_MAIN),
+        ("N_BLEND", NODE_BLEND),
+        ("N_INVERT", NODE_INVERT),
+        ("N_LUMA", NODE_LUMA),
+        ("N_FILM", NODE_FILM),
+        ("N_FILM_LIVE", NODE_FILM_LIVE),
+        ("N_JOIN", NODE_JOIN),
+        ("JK_PARALLEL", JOIN_PARALLEL),
+        ("JK_LAYER", JOIN_LAYER),
+        ("JK_SPLITTER", JOIN_SPLITTER),
+        ("JK_COMBINER", JOIN_COMBINER),
+        ("J_HEAD", J_HEAD),
+        ("J_IN", J_IN),
+        ("J_AL", J_AL),
+        ("J_BASE", J_BASE),
+        ("J_SPLIT", J_SPLIT),
+        ("JOIN_ROWS", JOIN_ROWS as u32),
+        ("BM_NORMAL", blend_code(BlendMode::Normal)),
+        ("BM_ADD", blend_code(BlendMode::Add)),
+        ("BM_SUBTRACT", blend_code(BlendMode::Subtract)),
+        ("BM_MULTIPLY", blend_code(BlendMode::Multiply)),
+        ("BM_LIGHTEN", blend_code(BlendMode::Lighten)),
+        ("BM_DARKEN", blend_code(BlendMode::Darken)),
+        ("BM_DIFFERENCE", blend_code(BlendMode::Difference)),
+        ("REF_SHIFT", REF_SHIFT),
+        ("REF_INPUT", REF_INPUT),
+        ("REF_INDEX", REF_INDEX),
+        ("REF_REGISTER", REF_REGISTER),
+        ("REF_PICTURE", REF_PICTURE),
+        ("REF_SLOT", REF_SLOT),
+        ("REF_KEY", REF_KEY),
+    ] {
+        let _ = writeln!(s, "const {n}: u32 = {v}u;");
+    }
+    // The node records are raw `vec4` rows (`kernels::color`, `NodeRecU`): where each field is, and the mask rows that follow
+    // the records (`MaskOpU`: the kinds of `ym_color::mask::OpKind`, the flags of a row).
+    let _ = writeln!(s, "const REC_ROWS: u32 = {REC_ROWS}u;");
+    for (n, v) in record_rows() {
+        let _ = writeln!(s, "const {n}: u32 = {v}u;");
+    }
+    let _ = writeln!(s, "const R_WARP_LK: u32 = {R_WARP_LK}u;");
+    let _ = writeln!(s, "const MASK_ROW_VEC4: u32 = {MASK_ROW_VEC4}u;");
+    let _ = writeln!(s, "const MF_SUBTRACT: u32 = {MASK_SUBTRACT}u;");
+    let _ = writeln!(s, "const MF_INVERT: u32 = {MASK_INVERT}u;");
+    for (n, k) in [
+        ("MK_LINEAR", OpKind::Linear),
+        ("MK_RADIAL", OpKind::Radial),
+        ("MK_COLOR", OpKind::Color),
+        ("MK_BRIGHTNESS", OpKind::Brightness),
+        ("MK_RASTER", OpKind::Raster),
+    ] {
+        let _ = writeln!(s, "const {n}: u32 = {}u;", k.code());
+    }
+    // The luma of C7's highlight range (`ym_color::tone::luma`).
     let _ = writeln!(
         s,
         "const LUMA_709: vec3<f32> = {};",
@@ -572,28 +886,41 @@ fn constants() -> String {
         "const Y_AWG4: vec3<f32> = {};",
         vec3_row(&awg4_luminance_row())
     );
+    // The cine rendering (C12, `ym_color::display::cine`): its constants from the generated Rust table, the numeric
+    // settings and the values the equations derive from them, and the six hue-harmonic arrays as two vec3 each.
+    for (n, v) in cine::kernel_scalars() {
+        let _ = writeln!(s, "const CINE_{n}: f32 = {};", f(v));
+    }
+    for (n, k) in cine::kernel_harmonics() {
+        let _ = writeln!(
+            s,
+            "const CINE_{n}_A: vec3<f32> = vec3<f32>({}, {}, {});",
+            f(k[0]),
+            f(k[1]),
+            f(k[2])
+        );
+        let _ = writeln!(
+            s,
+            "const CINE_{n}_B: vec3<f32> = vec3<f32>({}, {}, {});",
+            f(k[3]),
+            f(k[4]),
+            f(k[5])
+        );
+    }
+    // The rows of the cine luminance floor's chromatic distance, on the differences to the green channel.
+    for (n, r) in ["DX", "DZ"].into_iter().zip(cine_floor_rows()) {
+        let _ = writeln!(
+            s,
+            "const CINE_{n}: vec2<f32> = vec2<f32>({}, {});",
+            f(r[0]),
+            f(r[1])
+        );
+    }
+    s.push_str(&rows("AWG4_TO_XYZ", &m.awg4_to_xyz));
+    s.push_str(&rows("XYZ_TO_AWG4", &m.xyz_to_awg4));
     s.push_str(&rows("AWG4_TO_AWG3", &m.awg4_to_awg3));
     s.push_str(&rows("AWG3_TO_AWG4", &m.awg3_to_awg4));
-    // The ACES 2 path's input matrix: AWG4 to AP0 with the display placement 2^k folded in
-    // (`docs/02` C12 step 1a). The only use of this constant is `display_ours`, so the CPU reference
-    // (`PreparedDisplay`) and the kernel apply the same numbers from one Rust constant.
-    s.push_str(&rows("AWG4_TO_AP0", &aces2_input_matrix()));
-    s.push_str(&rows("AP0_TO_AP1", &aces::ap0_to_ap1()));
-    s.push_str(&rows("AP1_TO_AP0", &aces::ap1_to_ap0()));
     let _ = writeln!(s, "const T_DITHER: u32 = {}u;", table::DITHER);
-    let _ = writeln!(s, "const T_ACES: u32 = {}u;", table::ACES);
-    let _ = writeln!(s, "const T_ACES_N: u32 = {}u;", table::ACES_ENTRIES);
-    // The geometry of the ACES 2 hue tables, from the CPU reference that builds them.
-    let _ = writeln!(
-        s,
-        "const BASE_INDEX: u32 = {}u;",
-        ym_color::aces2::BASE_INDEX
-    );
-    let _ = writeln!(
-        s,
-        "const UPPER_WRAP_INDEX: u32 = {}u;",
-        ym_color::aces2::UPPER_WRAP_INDEX
-    );
     s
 }
 
@@ -669,4 +996,265 @@ pub fn shader_source(mode: StorageMode, id: KernelId) -> String {
     s.push('\n');
     s.push_str(&expand(&id.body(), mode));
     s
+}
+
+#[cfg(test)]
+mod tests {
+    //! The luminance floor of the cine rendering (step 2 of C12, `cine.wgsl`) in a CPU model of the kernel's f32
+    //! arithmetic, with the constants parsed from the generated shader text. Metal fuses `a * b + c` into a
+    //! multiply-add and re-associates sums (`docs/17-gpu.md` section 13); the model rounds the sums of products
+    //! three ways (`Fuse`) to show that the result of the new form does not depend on which one the compiler
+    //! picks.
+
+    use super::*;
+    use crate::device::StorageMode;
+
+    /// The numbers of `const NAME: type = value;` in the generated text (a scalar or the arguments of a vector).
+    fn numbers(src: &str, name: &str) -> Vec<f32> {
+        let head = format!("const {name}: ");
+        let at = src
+            .find(&head)
+            .unwrap_or_else(|| panic!("{name} is not generated"));
+        let value = src[at + head.len()..]
+            .split_once('=')
+            .and_then(|(_, v)| v.split_once(';'))
+            .map(|(v, _)| v.trim())
+            .expect("a constant with a value");
+        let inner = value
+            .split_once('(')
+            .map_or(value, |(_, r)| r.trim_end_matches(')'));
+        inner
+            .split(',')
+            .map(|t| t.trim().parse().expect("a float literal"))
+            .collect()
+    }
+
+    /// How the compiler rounds a sum of products.
+    #[derive(Clone, Copy, Debug)]
+    enum Fuse {
+        /// Every product and every sum rounded (IEEE, lavapipe).
+        Strict,
+        /// A chain of multiply-adds from the first term to the last.
+        Forward,
+        /// A chain of multiply-adds from the last term to the first.
+        Backward,
+    }
+
+    const FUSES: [Fuse; 3] = [Fuse::Strict, Fuse::Forward, Fuse::Backward];
+
+    fn dot<const N: usize>(r: [f32; N], v: [f32; N], fuse: Fuse) -> f32 {
+        match fuse {
+            Fuse::Strict => r.iter().zip(v).fold(0.0, |acc, (a, b)| acc + a * b),
+            Fuse::Forward => (1..N).fold(r[0] * v[0], |acc, i| r[i].mul_add(v[i], acc)),
+            Fuse::Backward => (0..N - 1)
+                .rev()
+                .fold(r[N - 1] * v[N - 1], |acc, i| r[i].mul_add(v[i], acc)),
+        }
+    }
+
+    /// The f32 constants the kernel uses for step 2.
+    struct Step2 {
+        rows: [[f32; 3]; 3],
+        xn: f32,
+        zn: f32,
+        dx: [f32; 2],
+        dz: [f32; 2],
+        rho: f32,
+        wfrac: f32,
+        eps_floor: f32,
+        y_min: f32,
+    }
+
+    impl Step2 {
+        fn new() -> Self {
+            let src = constants();
+            let one = |n: &str| numbers(&src, n)[0];
+            let pair = |n: &str| <[f32; 2]>::try_from(numbers(&src, n)).expect("two numbers");
+            let row = |n: &str| <[f32; 3]>::try_from(numbers(&src, n)).expect("three numbers");
+            Self {
+                rows: [
+                    row("AWG4_TO_XYZ_0"),
+                    row("AWG4_TO_XYZ_1"),
+                    row("AWG4_TO_XYZ_2"),
+                ],
+                xn: one("CINE_XN"),
+                zn: one("CINE_ZN"),
+                dx: pair("CINE_DX"),
+                dz: pair("CINE_DZ"),
+                rho: one("CINE_RHO"),
+                wfrac: one("CINE_WFRAC"),
+                eps_floor: one("CINE_EPS_FLOOR"),
+                y_min: one("CINE_Y_MIN"),
+            }
+        }
+
+        /// The smooth maximum and the clamp of the kernel, from `Y` and the floor `yf`.
+        fn ys(&self, y: f32, yf: f32) -> f32 {
+            let w = self.wfrac * yf;
+            let dy = y - yf;
+            let root = (dy * dy + w * w).sqrt();
+            let smooth_max = if dy < 0.0 {
+                yf + 0.5 * w * w / (root - dy)
+            } else {
+                0.5 * (y + yf + root)
+            };
+            smooth_max.max(self.y_min)
+        }
+
+        fn yf(&self, dx: f32, dz: f32) -> f32 {
+            self.rho * (dx * dx + dz * dz + self.eps_floor).sqrt()
+        }
+
+        /// The form before the fix: `dX = X - XN Y` from the triple's XYZ. `(dX, dZ, Ys)`.
+        fn old(&self, x: [f32; 3], fuse: Fuse) -> (f32, f32, f32) {
+            let [xx, y, zz] = self.rows.map(|r| dot(r, x, fuse));
+            let (dx, dz) = match fuse {
+                Fuse::Strict => (xx - self.xn * y, zz - self.zn * y),
+                _ => ((-self.xn).mul_add(y, xx), (-self.zn).mul_add(y, zz)),
+            };
+            (dx, dz, self.ys(y, self.yf(dx, dz)))
+        }
+
+        /// The kernel's form: the rows `DX`, `DZ` on the differences to the green channel.
+        fn new_form(&self, x: [f32; 3], fuse: Fuse) -> (f32, f32, f32) {
+            let d = [x[0] - x[1], x[2] - x[1]];
+            let (dx, dz) = (dot(self.dx, d, fuse), dot(self.dz, d, fuse));
+            let y = dot(self.rows[1], x, fuse);
+            (dx, dz, self.ys(y, self.yf(dx, dz)))
+        }
+    }
+
+    const MAGNITUDES: [f32; 4] = [1e3, 1e4, 1e5, 1e6];
+
+    #[test]
+    fn the_floor_rows_sum_to_zero_and_are_the_chromatic_distance() {
+        let m = matrices().awg4_to_xyz;
+        let d65 = xy_to_xyz(D65_XY);
+        let (xn, zn) = (d65[0] / d65[1], d65[2] / d65[1]);
+        let scalars = cine::kernel_scalars();
+        let scalar = |n: &str| scalars.iter().find(|(k, _)| *k == n).expect("a scalar").1;
+        assert_eq!(scalar("XN"), xn);
+        assert_eq!(scalar("ZN"), zn);
+        // AWG4's white is D65: the full rows (with the green entry) sum to 0, so dropping the green entry costs
+        // at most 2e-16 of the green channel, under the f64 reference's own rounding at the scene limit.
+        let full = |k: usize, n: f64| [0, 1, 2].map(|j| m[k][j] - n * m[1][j]);
+        for (row, rows) in [(full(0, xn), 0), (full(2, zn), 1)] {
+            let sum: f64 = row.iter().sum();
+            assert!(sum.abs() < 1e-15, "row {rows} sums to {sum:e}");
+            assert_eq!(cine_floor_rows()[rows], [row[0], row[2]]);
+        }
+        // dX and dZ of a colour, from the differences and from X - XN Y.
+        for x in [[0.18, 0.2, 0.05], [-3.0, 0.4, 7.0], [1e5, -2e4, 3e3]] {
+            let g = x[1];
+            let rows = cine_floor_rows();
+            let (xyz_x, xyz_y, xyz_z) = (
+                (0..3).map(|j| m[0][j] * x[j]).sum::<f64>(),
+                (0..3).map(|j| m[1][j] * x[j]).sum::<f64>(),
+                (0..3).map(|j| m[2][j] * x[j]).sum::<f64>(),
+            );
+            let scale = x.iter().map(|v| v.abs()).fold(0.0, f64::max);
+            let from_diff = |r: [f64; 2]| r[0] * (x[0] - g) + r[1] * (x[2] - g);
+            assert!((from_diff(rows[0]) - (xyz_x - xn * xyz_y)).abs() < 1e-15 * scale);
+            assert!((from_diff(rows[1]) - (xyz_z - zn * xyz_y)).abs() < 1e-15 * scale);
+        }
+        // The kernel text uses them.
+        let src = shader_source(StorageMode::F32, KernelId::Color);
+        assert!(
+            src.contains("let dx = dot(CINE_DX, d);") && src.contains("let dz = dot(CINE_DZ, d);")
+        );
+        assert!(!src.contains("CINE_XN * xyz.y"));
+    }
+
+    #[test]
+    fn a_neutral_gives_exactly_zero_in_every_rounding_of_step_2() {
+        let k = Step2::new();
+        for sign in [-1.0f32, 1.0] {
+            for mag in MAGNITUDES {
+                let v = sign * mag;
+                for fuse in FUSES {
+                    let (dx, dz, ys) = k.new_form([v, v, v], fuse);
+                    assert!(
+                        dx == 0.0 && dz == 0.0,
+                        "{v:e} {fuse:?}: dX {dx:e}, dZ {dz:e}"
+                    );
+                    // A negative neutral is at the bottom of the tone curve, a positive one keeps its luminance.
+                    let y = dot(k.rows[1], [v; 3], fuse);
+                    assert_eq!(ys, if v < 0.0 { k.y_min } else { y }, "{v:e} {fuse:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_old_form_left_rounding_noise_that_decided_the_luminance() {
+        // The model of the form before the fix: for a negative neutral Ys is the floor yf = rho * noise, which
+        // is above Y_MIN by orders of magnitude as soon as the products are fused or the sums ordered
+        // differently. (The strict model happens to cancel at -1e3 to -1e5 and not at -1e6; lavapipe's own sums
+        // are not the model's, and it passed the gate at the fixture's -1e5.) This test keeps the model
+        // honest: it must show the failure.
+        let k = Step2::new();
+        for mag in MAGNITUDES {
+            let v = -mag;
+            for fuse in FUSES {
+                let (dx, dz, ys) = k.old([v, v, v], fuse);
+                eprintln!(
+                    "old form, neutral {v:+.0e} {fuse:?}: dX {dx:+.2e} dZ {dz:+.2e} Ys {ys:.2e} (Y_MIN {:.0e})",
+                    k.y_min
+                );
+                if !matches!(fuse, Fuse::Strict) {
+                    assert!(ys > 100.0 * k.y_min, "{v:e} {fuse:?}: Ys {ys:e}");
+                }
+            }
+        }
+        assert!(k.old([-1e6; 3], Fuse::Strict).2 > 1e-3);
+        // At -1e5 the noise puts Ys at 2e-4 to 5e-4, the luminance behind the 1.6e-8 of the Mac failure
+        // (the tone curve there is about Ys^4.3).
+        assert!(k.old([-1e5; 3], Fuse::Forward).2 > 1e-4);
+    }
+
+    #[test]
+    fn a_near_neutral_has_dx_and_dz_with_an_error_relative_to_its_own_differences() {
+        let k = Step2::new();
+        let m = matrices().awg4_to_xyz;
+        let d65 = xy_to_xyz(D65_XY);
+        let (xn, zn) = (d65[0] / d65[1], d65[2] / d65[1]);
+        let mut worst = 0.0f64;
+        for sign in [-1.0f32, 1.0] {
+            for mag in MAGNITUDES {
+                let v = sign * mag;
+                for e in [1e-2f32, 1e-3, 1e-5, 1e-7] {
+                    let triples = [
+                        [v, v * (1.0 + e), v],
+                        [v, v, v * (1.0 - e)],
+                        [v * (1.0 + e), v, v * (1.0 - 2.0 * e)],
+                        [v * (1.0 - e), v * (1.0 + e), v * (1.0 + 3.0 * e)],
+                    ];
+                    for x in triples {
+                        let xd = x.map(f64::from);
+                        let xyz = m.map(|r| (0..3).map(|j| r[j] * xd[j]).sum::<f64>());
+                        let want = [xyz[0] - xn * xyz[1], xyz[2] - zn * xyz[1]];
+                        // The size of the two terms the kernel adds: the error is relative to them.
+                        let d = [xd[0] - xd[1], xd[2] - xd[1]];
+                        let rows = cine_floor_rows();
+                        let scale = [0, 1]
+                            .map(|i| rows[i][0].abs() * d[0].abs() + rows[i][1].abs() * d[1].abs());
+                        for fuse in FUSES {
+                            let (dx, dz, _) = k.new_form(x, fuse);
+                            for (got, want, scale) in
+                                [(dx, want[0], scale[0]), (dz, want[1], scale[1])]
+                            {
+                                let err = (f64::from(got) - want).abs();
+                                worst = worst.max(err / scale.max(f64::MIN_POSITIVE));
+                                assert!(
+                                    err <= 5e-7 * scale + 1e-15 * mag as f64,
+                                    "{x:?} {fuse:?}: {got:e} against {want:e} (terms {scale:e})"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        eprintln!("near-neutrals: worst error {worst:.2e} of the size of the terms of dX and dZ");
+    }
 }

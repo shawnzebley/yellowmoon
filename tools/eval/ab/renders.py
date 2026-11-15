@@ -1,12 +1,13 @@
-"""The pictures of the blind A/B of Apple Auto: the `ym` renders with Apple Auto on and off, and the camera's embedded
-JPEG (with --with-camera). Stdlib only.
+"""The pictures of the blind A/B of an Auto provider: the `ym` renders with the provider and with Default Auto, and the
+camera's embedded JPEG (with --with-camera). Stdlib only.
 
 Every `ym` call gets a new, empty home folder (so the user's preferences and imported looks cannot change a
 picture), the `--cpu` renderer, the built-in default look and every setting at Auto. The two renders differ only in
-`--apple-auto on` (`apple`) and `--apple-auto off` (`rule`, Yellowmoon's own Auto). Each photo is handled on its own:
+`--auto-provider <p>` (`apple`; `<p>` is `apple`, `claude` or `agy`, `Pictures.provider`) and `--auto-provider
+yellowmoon` (`rule`, Default Auto). Each photo is handled on its own:
 
-1. the `apple` render, whose `--json` record says what Apple's model answered (`apple_auto`: state, steps, scene, plan,
-   and the instructions it read);
+1. the `apple` render, whose `--json` record says what the provider answered (`auto_advisor`, or `apple_auto` of an
+   older `ym`: state, steps, scene, plan, and the instructions it read);
 2. a photo whose answer failed is left out with its reason; a photo whose answer changes nothing (every step it set is
    keep or none; a step left empty sets nothing) gives no trial, because its picture is the rule's (docs/19 section 5:
    with every step at 0 the chain is today's Auto, bit for bit);
@@ -16,7 +17,17 @@ picture), the `--cpu` renderer, the built-in default look and every setting at A
    renders.
 
 The `ym` records are kept under `records/` in the out folder (part of the key, like `plan.json`) so that `--resume`
-can keep a render without asking Apple's model again. The originals are only ever read.
+can keep a render without asking the provider again. The originals are only ever read.
+
+The crop test (`prepare --test crop`, docs/20 section 12) makes two renders of each photo, both at the defaults with
+`--auto-provider yellowmoon`, so that only the framing differs (`process_crop_photo`):
+
+1. the `crop` render, with `--auto-crop=original`, whose `--json` record says what Auto crop proposed (`auto_crop`:
+   the straighten kind and angle, the frames, `keep`, the subject's source, or an `error`);
+2. a photo where Auto crop failed is left out with its reason (its picture is the original framing); a photo where it
+   changed nothing (`keep` and an angle of 0: the whole photo, not turned) **kept its frame** and gives no trial;
+3. otherwise the `original` render, without the flag; when the two pictures are the same pixels after all, the photo
+   gives no trial either.
 """
 
 from __future__ import annotations
@@ -30,6 +41,7 @@ import struct
 import subprocess
 import tempfile
 import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, List, Mapping, Optional, Sequence, Tuple
@@ -37,6 +49,8 @@ from typing import Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 from plan import (
     ANSWER_FIELDS,
     COLOR_FIELDS,
+    CROP_ASPECT,
+    CROP_TEST,
     NO_STEPS,
     STEP_RANGE,
     STRENGTH_RANGE,
@@ -54,12 +68,42 @@ RECORDS_DIR = "records"
 #: The variables of the caller's environment that reach `ym`. Every other YELLOWMOON_ variable is dropped, so the
 #: caller's shell cannot change a picture; the test advisor (docs/19 section 11) passes, for tests and smoke runs, and
 #: the plan then names it as the model.
-PASS_THROUGH: Tuple[str, ...] = ("YELLOWMOON_TEST_APPLE_AUTO",)
-#: The flags each rendered variant adds to the shared render flags.
+PASS_THROUGH: Tuple[str, ...] = (
+    "YELLOWMOON_TEST_APPLE_AUTO",
+    # The two programs (docs/22 section 15.3, for tests and smoke runs) and the developer variables that choose a model
+    # and an effort for one run (docs/22 D18; the plan records the model that answered).
+    "YELLOWMOON_TEST_AUTO_PROVIDERS",
+    "YELLOWMOON_CLAUDE_MODEL",
+    "YELLOWMOON_CLAUDE_EFFORT",
+    "YELLOWMOON_AGY_MODEL",
+    "YELLOWMOON_AGY_EFFORT",
+)
+#: The providers the test can grade with (`prepare --provider`, docs/22 section 17), and what the person calls them.
+PROVIDERS: Mapping[str, str] = {"apple": "Apple Auto", "claude": "Claude Code", "agy": "Antigravity"}
+DEFAULT_PROVIDER = "apple"
+#: The flag of `ym render` that gives each photo the crop the app's Auto would give (docs/20 section 8).
+AUTO_CROP_FLAG = "--auto-crop"
+#: The flags each rendered variant adds to the shared render flags. The crop test's two renders (`crop`, `original`)
+#: both have Apple Auto off, so only the framing differs.
+#: The `apple` render is made with `--auto-provider <the provider under test>` (`Pictures.provider`, apple by default);
+#: the others use Default Auto.
 RENDER_FLAGS: Mapping[str, Tuple[str, ...]] = {
-    "apple": ("--apple-auto", "on"),
-    "rule": ("--apple-auto", "off"),
+    "apple": ("--auto-provider", DEFAULT_PROVIDER),
+    "rule": ("--auto-provider", "yellowmoon"),
+    "crop": ("--auto-provider", "yellowmoon", f"{AUTO_CROP_FLAG}={CROP_ASPECT}"),
+    "original": ("--auto-provider", "yellowmoon"),
 }
+#: The renders made with Default Auto, whose record must say that Default Auto made them.
+RULE_RENDERS: Tuple[str, ...] = ("rule", "crop", "original")
+#: What Auto crop's straightener answered (docs/20 section 3), and why a photo it did not turn was not turned.
+STRAIGHTEN_KINDS: Mapping[str, str] = {
+    "level": "already level",
+    "rotate": "not turned",
+    "unsure": "no horizon or straight lines found",
+}
+#: Where Auto crop's subject came from (docs/20 section 3).
+SUBJECT_SOURCES: Tuple[str, ...] = ("camera", "picture")
+RECT_FIELDS: Tuple[str, ...] = ("x", "y", "width", "height")
 #: Why Apple Auto is not available, in the words of docs/19 section 8 (`UnavailableReason::words`).
 UNAVAILABLE_WORDS: Mapping[str, str] = {
     "not_a_mac": "this is not a Mac",
@@ -86,7 +130,7 @@ FAILURE_WORDS: Mapping[str, str] = {
     "bad_answer": "the answer could not be read",
     "other": "an error",
 }
-#: The Auto values of a render that the plan keeps for the diagnostics (`auto` of `ym render --json`).
+#: The Auto values of a render that the plan keeps for the diagnostics (`auto.input` and `auto.main` of `ym render --json`).
 AUTO_VALUES: Tuple[str, ...] = (
     "exposure_ev",
     "kelvin",
@@ -113,19 +157,68 @@ class PictureError(Exception):
     """A picture could not be made. The message says why; the photo is then left out of the test."""
 
 
-def unavailable_words(reason: object) -> str:
-    """Why Apple Auto is not available, in words; the wire name when it is one this kit does not know."""
+#: Why Claude Code or Antigravity is not available, as the clause of docs/22 section 3.4 (`unavailable_words` of
+#: `ym_core::auto_provider`); `{name}` is the program's name and `{version}` its version with a leading space.
+PROGRAM_UNAVAILABLE_WORDS: Mapping[str, str] = {
+    "signed_out": "{name} isn't signed in",
+    "too_old": "{name}{version} is too old",
+    "probe_failed": "{name} didn't answer its check",
+    "unsafe_launcher": "{name} was found only as a script that Yellowmoon can't run safely",
+    "not_installed": "{name} isn't installed",
+    "checking": "Yellowmoon is still checking",
+    "not_consented": "you haven't agreed to send photos to {name} yet",
+}
+
+
+def unavailable_words(reason: object, provider: str = DEFAULT_PROVIDER, tool_version: object = None) -> str:
+    """Why a provider is not available, in words (for Apple Auto the words of docs/19 section 8, for the two programs
+    the clause of docs/22 section 3.4); the wire name when it is one this kit does not know."""
     if reason is None:
         return "no reason given"
+    if provider != DEFAULT_PROVIDER and str(reason) in PROGRAM_UNAVAILABLE_WORDS:
+        version = f" {tool_version}" if isinstance(tool_version, str) and tool_version else ""
+        return PROGRAM_UNAVAILABLE_WORDS[str(reason)].format(name=PROVIDERS.get(provider, provider), version=version)
     return UNAVAILABLE_WORDS.get(str(reason), str(reason))
 
 
-def failure_words(kind: object, message: object = None) -> str:
-    """Why an answer failed, in words, with Apple's message for a failure of kind `other`."""
-    words = FAILURE_WORDS.get(str(kind), str(kind))
-    if kind == "other" and isinstance(message, str) and message.strip():
+#: Why an answer of Claude Code or Antigravity failed, in the words of docs/22 section 9.1 (`failure_words`); the kinds
+#: they do not use read as Apple's.
+PROGRAM_FAILURE_WORDS: Mapping[str, Mapping[str, str]] = {
+    "claude": {
+        "unavailable": "Claude Code stopped being available",
+        "rate_limited": "Claude Code reported a rate limit",
+        "timeout": "no answer within 90 seconds",
+        "refused": "Claude refused",
+        "not_signed_in": "Claude Code isn't signed in",
+        "cli_failed": "Claude Code reported an error",
+    },
+    "agy": {
+        "unavailable": "Antigravity stopped being available",
+        "rate_limited": "Antigravity reported a rate limit",
+        "timeout": "no answer within 120 seconds",
+        "refused": "Antigravity refused",
+        "not_signed_in": "Antigravity isn't signed in",
+        "cli_failed": "Antigravity reported an error",
+    },
+}
+
+
+def failure_words(kind: object, message: object = None, provider: str = DEFAULT_PROVIDER) -> str:
+    """Why an answer failed, in words, with the program's message for a failure of kind `other` or `cli_failed`."""
+    words = PROGRAM_FAILURE_WORDS.get(provider, {}).get(str(kind)) or FAILURE_WORDS.get(str(kind), str(kind))
+    if kind in ("other", "cli_failed") and isinstance(message, str) and message.strip():
         return f"{words}: {message.strip()}"
     return words
+
+
+def advisor_record(record: Mapping[str, object]) -> Optional[Mapping[str, object]]:
+    """What the provider said about a photo: `auto_advisor` of a record (docs/22 section 14.1), else the deprecated
+    `apple_auto` of a `ym` that has only that (Apple's view). None when no provider acted on the photo."""
+    for key in ("auto_advisor", "apple_auto"):
+        value = record.get(key)
+        if isinstance(value, dict):
+            return value
+    return None
 
 
 @dataclass(frozen=True)
@@ -158,18 +251,21 @@ class Pictures:
     #: is kept only with its record (an `apple` render only when its answer arrived).
     resume: bool = False
     #: A text file of instructions for Apple's model (`prepare --instructions`), passed to the `apple` render as
-    #: `--apple-auto-instructions`; None for the default instructions (each `ym` call has an empty home folder, so the
+    #: `--auto-instructions`; None for the default instructions (each `ym` call has an empty home folder, so the
     #: app's own instructions never reach the test).
     instructions: Optional[Path] = None
     #: The digest of the instructions the `apple` renders must report (`instructions_sha256`): with --resume, an `apple`
     #: render made with other instructions is made again. None does not check.
     instructions_sha256: Optional[str] = None
+    #: The provider under test (`prepare --provider`): the `apple` render is made with `--auto-provider <provider>`.
+    provider: str = DEFAULT_PROVIDER
 
 
 @dataclass
 class Outcome:
     """What happened to one photo. `status` is `trial` (it is in the test), `unchanged` (Apple's answer changed
-    nothing: no trial), `failed` (Apple's answer failed: left out) or `error` (a render failed: left out)."""
+    nothing, or in the crop test the photo kept its frame: no trial), `failed` (Apple's answer or Auto crop failed:
+    left out) or `error` (a render failed: left out)."""
 
     status: str
     reason: str = ""
@@ -183,6 +279,13 @@ class Outcome:
     has_camera: bool = False
     #: Why the camera's JPEG could not be copied (--with-camera); the photo then gives only the trial against the rule.
     camera_problem: str = ""
+    #: In the crop test, what Auto crop proposed (the summary of `crop_answer`), when it answered.
+    crop: Optional[Dict[str, object]] = None
+    #: How long the provider's render took (the whole `ym` call, the picture included), in seconds; None for a render
+    #: kept by --resume, which asked nothing.
+    seconds: Optional[float] = None
+    #: The model that answered (`model` of `auto_advisor`: for Claude Code the id the service served), when it answered.
+    model: Optional[str] = None
 
 
 def ym_environment(data: Optional[Path], home: Path, base: Optional[Mapping[str, str]] = None) -> Dict[str, str]:
@@ -291,7 +394,8 @@ def picture_is_made(path: Path) -> bool:
 
 def kept_record(pictures: Pictures, variant: str, job: PhotoJob) -> Optional[Dict[str, object]]:
     """With --resume, the record of a render an earlier run made, when its picture is there and the record can be used
-    again: the rule's always, Apple's only when its answer arrived (a failure is asked again)."""
+    again: the rule's and the original framing's always, Apple's only when its answer arrived and Auto crop's only when
+    it answered (a failure is asked again)."""
     if not pictures.resume or not picture_is_made(picture_path(pictures, variant, job)):
         return None
     try:
@@ -301,27 +405,35 @@ def kept_record(pictures: Pictures, variant: str, job: PhotoJob) -> Optional[Dic
     if not isinstance(record, dict):
         return None
     if variant == "apple":
-        apple = record.get("apple_auto")
+        apple = advisor_record(record)
         if not (isinstance(apple, dict) and apple.get("state") == "answered"):
+            return None
+        if apple.get("provider", DEFAULT_PROVIDER) != pictures.provider:
             return None
         wanted = pictures.instructions_sha256
         if wanted is not None and apple.get("instructions_sha256") != wanted:
             return None
     elif record.get("auto_source") != "rule":
         return None
+    elif variant == "crop" and not crop_answer(record).answered:
+        return None
     return record
 
 
 def instructions_flag(pictures: Pictures, variant: str) -> List[str]:
-    """`--apple-auto-instructions FILE` for an `apple` render with instructions of its own, else nothing."""
+    """`--auto-instructions FILE` for an `apple` render with instructions of its own, else nothing."""
     if variant != "apple" or pictures.instructions is None:
         return []
-    return ["--apple-auto-instructions", str(pictures.instructions)]
+    return ["--auto-instructions", str(pictures.instructions)]
 
 
-def render_picture(pictures: Pictures, job: PhotoJob, variant: str) -> Dict[str, object]:
-    """Renders one photo with Apple Auto on (`apple`) or off (`rule`) and returns `ym`'s record of it, which is also
-    kept under `records/`. With --resume, a render an earlier run made is kept and its record returned."""
+def render_picture(
+    pictures: Pictures, job: PhotoJob, variant: str, seconds: Optional[List[float]] = None
+) -> Dict[str, object]:
+    """Renders one photo with the provider under test (`apple`; Apple Auto unless `Pictures.provider` says otherwise)
+    or with Default Auto (`rule`), or for the crop test with Auto crop (`crop`) or without (`original`), and returns
+    `ym`'s record of it, which is also kept under `records/`. With --resume, a render an earlier run made is kept and
+    its record returned. When `seconds` is given, the time `ym` took is appended to it (nothing for a kept render)."""
     kept = kept_record(pictures, variant, job)
     if kept is not None:
         return kept
@@ -343,15 +455,18 @@ def render_picture(pictures: Pictures, job: PhotoJob, variant: str) -> Dict[str,
         picture_name(job.number, job.stem),
         "--out",
         str(target.parent),
-        *RENDER_FLAGS[variant],
+        *(("--auto-provider", pictures.provider) if variant == "apple" else RENDER_FLAGS[variant]),
         *instructions_flag(pictures, variant),
         str(job.raw),
     ]
+    started = time.monotonic()
     record = run_ym(pictures, args)
+    if seconds is not None:
+        seconds.append(time.monotonic() - started)
     if not target.is_file() or target.stat().st_size == 0:
         raise PictureError(f"ym wrote no picture to {target.name}")
-    if variant == "rule" and record.get("auto_source") != "rule":
-        raise PictureError("the render with Apple Auto off did not use Yellowmoon's own Auto")
+    if variant in RULE_RENDERS and record.get("auto_source") != "rule":
+        raise PictureError("the render with Default Auto did not use Default Auto")
     blob = (json.dumps(record, indent=2, sort_keys=True, ensure_ascii=False) + "\n").encode("utf-8")
     write_atomically(record_path(pictures, variant, job), blob)
     return record
@@ -363,11 +478,18 @@ def auto_values(record: Mapping[str, object]) -> Dict[str, object]:
     auto = record.get("auto")
     if not isinstance(auto, dict):
         return {}
-    return {key: auto.get(key) for key in AUTO_VALUES if key in auto}
+    # `auto` is grouped by the node each number is for (`input` and `main`, `docs/23` section 3.9; a flat `auto` is
+    # the form of Yellowmoon 0.1).
+    flat = dict(auto)
+    for group in ("input", "main"):
+        part = auto.get(group)
+        if isinstance(part, dict):
+            flat.update(part)
+    return {key: flat.get(key) for key in AUTO_VALUES if key in flat}
 
 
 def without_final_break(text: str) -> str:
-    """The instructions of a file as `ym --apple-auto-instructions` reads them: without the file's final line break
+    """The instructions of a file as `ym --auto-instructions` reads them: without the file's final line break
     (`\\n` or `\\r\\n`), which text editors add."""
     if text.endswith("\n"):
         text = text[:-1]
@@ -388,7 +510,7 @@ def instructions_digest(text: str, default_sha256: str) -> str:
 
 @dataclass(frozen=True)
 class AppleAnswer:
-    """What Apple's model did for one photo, read from the `apple` render's record."""
+    """What the provider under test did for one photo, read from the `apple` render's record."""
 
     answered: bool
     reason: str = ""
@@ -421,44 +543,49 @@ def instructions_of(apple: Mapping[str, object]) -> Optional[Tuple[str, str]]:
     return None
 
 
-def apple_answer(record: Mapping[str, object]) -> AppleAnswer:
-    """Reads Apple's answer from the record of an `apple` render (docs/19 section 8, `apple_auto`).
+def apple_answer(record: Mapping[str, object], provider: str = DEFAULT_PROVIDER) -> AppleAnswer:
+    """Reads the provider's answer from the record of an `apple` render (`auto_advisor`, docs/22 section 14.1; Apple's
+    deprecated `apple_auto`, docs/19 section 8, for a `ym` that has only that). `provider` names it in the reasons.
 
-    Without an `apple_auto` object Apple Auto did not act on the photo: it was not available for the run (the record's
+    Without such an object the provider did not act on the photo: it was not available for the run (the record's
     `auto.apple` says why). A failure gives its reason in words; steps outside their range count as a bad answer, and so
     does an answer that set nothing (the core reports that as a failure already). A step left empty (`null`) sets
     nothing: it is kept as None.
     """
-    apple = record.get("apple_auto")
+    name = PROVIDERS.get(provider, provider)
+    apple = advisor_record(record)
     if not isinstance(apple, dict):
         auto = record.get("auto")
         inner = auto.get("apple") if isinstance(auto, dict) else None
         state = inner.get("state") if isinstance(inner, dict) else None
         if state == "unavailable":
-            words = unavailable_words(inner.get("reason"))  # type: ignore[union-attr]
-            return AppleAnswer(False, f"Apple Auto was not available ({words})")
-        return AppleAnswer(False, f"Apple Auto did not act on the photo (its state: {state or 'unknown'})")
+            words = unavailable_words(inner.get("reason"), provider)  # type: ignore[union-attr]
+            return AppleAnswer(False, f"{name} was not available ({words})")
+        return AppleAnswer(False, f"{name} did not act on the photo (its state: {state or 'unknown'})")
     state = apple.get("state")
+    if state == "unavailable":
+        words = unavailable_words(apple.get("reason"), provider, apple.get("tool_version"))
+        return AppleAnswer(False, f"{name} was not available ({words})")
     if state == "failed":
         auto = record.get("auto")
         inner = auto.get("apple") if isinstance(auto, dict) else None
         message = inner.get("message") if isinstance(inner, dict) else None
-        return AppleAnswer(False, f"Apple Auto failed ({failure_words(apple.get('reason'), message)})")
+        return AppleAnswer(False, f"{name} failed ({failure_words(apple.get('reason'), message, provider)})")
     if state == "pending":
-        return AppleAnswer(False, "Apple Auto failed (the answer had not arrived when ym stopped)")
+        return AppleAnswer(False, f"{name} failed (the answer had not arrived when ym stopped)")
     if state != "answered":
-        return AppleAnswer(False, f"Apple Auto did not answer (its state: {state})")
+        return AppleAnswer(False, f"{name} did not answer (its state: {state})")
     raw_steps = apple.get("steps")
     if not isinstance(raw_steps, dict):
-        return AppleAnswer(False, f"Apple Auto failed ({FAILURE_WORDS['bad_answer']})")
+        return AppleAnswer(False, f"{name} failed ({FAILURE_WORDS['bad_answer']})")
     steps: List[StepValue] = []
-    for name in ANSWER_FIELDS:
-        valid, value = _step_value(name, raw_steps.get(name))
+    for field_name in ANSWER_FIELDS:
+        valid, value = _step_value(field_name, raw_steps.get(field_name))
         if not valid:
-            return AppleAnswer(False, f"Apple Auto failed ({FAILURE_WORDS['bad_answer']})")
+            return AppleAnswer(False, f"{name} failed ({FAILURE_WORDS['bad_answer']})")
         steps.append(value)
     if all(value is None for value in steps):
-        return AppleAnswer(False, f"Apple Auto failed ({FAILURE_WORDS['bad_answer']})")
+        return AppleAnswer(False, f"{name} failed ({FAILURE_WORDS['bad_answer']})")
     scene, plan = apple.get("scene"), apple.get("plan")
     return AppleAnswer(
         True,
@@ -467,6 +594,58 @@ def apple_answer(record: Mapping[str, object]) -> AppleAnswer:
         plan=plan if isinstance(plan, str) else "",
         instructions=instructions_of(apple),
     )
+
+
+@dataclass(frozen=True)
+class CropAnswer:
+    """What Auto crop did for one photo, read from the `crop` render's record (`auto_crop`, docs/20 section 3).
+
+    `answered` is False when it failed (`reason` says why; the picture is then the original framing). `kept` is True
+    when it changed nothing: the whole frame kept (`keep`) and an angle of 0. `summary` is what the plan records."""
+
+    answered: bool
+    reason: str = ""
+    kept: bool = False
+    summary: Optional[Dict[str, object]] = None
+
+
+def _is_number(value: object) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and value == value  # not NaN
+
+
+def crop_answer(record: Mapping[str, object]) -> CropAnswer:
+    """Reads Auto crop's answer from the record of a `crop` render: `{"error": "<sentence>"}` is a failure with that
+    sentence; an answer gives its straighten kind, angle, `keep`, the subject's source and the first frame (the frame
+    the photo got). An answer that is missing or cannot be read is a failure too."""
+    value = record.get("auto_crop")
+    if not isinstance(value, dict):
+        return CropAnswer(False, "Auto crop failed: ym did not report it (is this ym older than Auto crop?)")
+    if "error" in value:
+        message = value.get("error")
+        words = message.strip() if isinstance(message, str) and message.strip() else "no reason given"
+        return CropAnswer(False, f"Auto crop failed: {words}")
+    unreadable = CropAnswer(False, "Auto crop failed: its answer could not be read")
+    straighten, angle, keep = value.get("straighten"), value.get("angle_deg"), value.get("keep")
+    subject, frames = value.get("subject"), value.get("frames")
+    if straighten not in STRAIGHTEN_KINDS or not _is_number(angle) or not isinstance(keep, bool):
+        return unreadable
+    if subject not in SUBJECT_SOURCES or not isinstance(frames, list) or not frames:
+        return unreadable
+    first = frames[0]
+    rect = first.get("rect") if isinstance(first, dict) else None
+    if not isinstance(rect, dict) or not all(_is_number(rect.get(name)) for name in RECT_FIELDS):
+        return unreadable
+    if not (rect["width"] > 0 and rect["height"] > 0) or not _is_number(first.get("score")):
+        return unreadable
+    summary: Dict[str, object] = {
+        "straighten": straighten,
+        "angle_deg": angle,
+        "keep": keep,
+        "subject": subject,
+        "rect": {name: rect[name] for name in RECT_FIELDS},
+        "score": first["score"],
+    }
+    return CropAnswer(True, kept=keep and angle == 0, summary=summary)
 
 
 def jpeg_pixel_digest(path: Path) -> Optional[str]:
@@ -571,11 +750,11 @@ def raw_turns(path: Path) -> int:
 
 def camera_picture(pictures: Pictures, job: PhotoJob) -> None:
     """Copies the camera's embedded JPEG, byte for byte, from the raw file (its offset and length from `ym info`, run
-    with Apple Auto off: the copy needs no answer)."""
+    with Default Auto: the copy needs no answer)."""
     target = picture_path(pictures, "camera", job)
     if pictures.resume and picture_is_made(target):
         return
-    record = run_ym(pictures, ["info", "--json", "--apple-auto", "off", str(job.raw)])
+    record = run_ym(pictures, ["info", "--json", "--auto-provider", "yellowmoon", str(job.raw)])
     preview = record.get("preview")
     try:
         offset = int(preview["offset"])  # type: ignore[index]
@@ -598,24 +777,36 @@ def _problem(exc: BaseException) -> str:
 
 def process_photo(pictures: Pictures, job: PhotoJob, apple_gate: threading.Semaphore) -> Outcome:
     """Makes the pictures of one photo and says what became of it (`Outcome`). `apple_gate` limits how many renders
-    wait for Apple's model at the same time."""
+    wait for the provider's answer at the same time."""
+    name = PROVIDERS.get(pictures.provider, pictures.provider)
+    taken: List[float] = []
     try:
         with apple_gate:
-            record = render_picture(pictures, job, "apple")
+            record = render_picture(pictures, job, "apple", taken)
     except (PictureError, OSError, ValueError) as exc:
-        return Outcome("error", f"with Apple Auto on: {_problem(exc)}")
-    answer = apple_answer(record)
+        return Outcome("error", f"with {name} on: {_problem(exc)}")
+    answer = apple_answer(record, pictures.provider)
     values: Dict[str, Dict[str, object]] = {"apple": auto_values(record)}
+    seconds = taken[0] if taken else None
     if not answer.answered:
-        return Outcome("failed", answer.reason, values=values)
-    said = {"steps": answer.steps, "scene": answer.scene, "plan": answer.plan, "instructions": answer.instructions}
+        return Outcome("failed", answer.reason, values=values, seconds=seconds)
+    advisor = advisor_record(record) or {}
+    model = advisor.get("model")
+    said = {
+        "steps": answer.steps,
+        "scene": answer.scene,
+        "plan": answer.plan,
+        "instructions": answer.instructions,
+        "seconds": seconds,
+        "model": model if isinstance(model, str) and model else None,
+    }
     if not changed_fields(answer.steps):
         why = "every step it set is keep or none"
         return Outcome("unchanged", why, values=values, **said)  # type: ignore[arg-type]
     try:
         rule = render_picture(pictures, job, "rule")
     except (PictureError, OSError, ValueError) as exc:
-        why = f"with Apple Auto off: {_problem(exc)}"
+        why = f"with Default Auto: {_problem(exc)}"
         return Outcome("error", why, values=values, **said)  # type: ignore[arg-type]
     values["rule"] = auto_values(rule)
     if same_pixels(picture_path(pictures, "apple", job), picture_path(pictures, "rule", job)):
@@ -630,20 +821,48 @@ def process_photo(pictures: Pictures, job: PhotoJob, apple_gate: threading.Semap
     return outcome
 
 
+def process_crop_photo(pictures: Pictures, job: PhotoJob) -> Outcome:
+    """Makes the pictures of one photo for the crop test, with Auto crop and without, and says what became of it."""
+    try:
+        record = render_picture(pictures, job, "crop")
+    except (PictureError, OSError, ValueError) as exc:
+        return Outcome("error", f"with Auto crop: {_problem(exc)}")
+    answer = crop_answer(record)
+    if not answer.answered:
+        return Outcome("failed", answer.reason)
+    if answer.kept:
+        straighten = str((answer.summary or {}).get("straighten"))
+        return Outcome("unchanged", STRAIGHTEN_KINDS.get(straighten, ""), crop=answer.summary)
+    try:
+        render_picture(pictures, job, "original")
+    except (PictureError, OSError, ValueError) as exc:
+        return Outcome("error", f"without Auto crop: {_problem(exc)}", crop=answer.summary)
+    if same_pixels(picture_path(pictures, "crop", job), picture_path(pictures, "original", job)):
+        return Outcome("unchanged", "the two pictures are the same", crop=answer.summary)
+    return Outcome("trial", "", crop=answer.summary)
+
+
 def make_pictures(
     pictures: Pictures,
     jobs: Sequence[PhotoJob],
     workers: int,
     apple_workers: int,
     log: Callable[[str], None],
+    test: str = "apple",
 ) -> Dict[int, Outcome]:
     """Makes the pictures of every photo on a pool of `workers` threads (each thread waits on one `ym` process at a
-    time), with at most `apple_workers` renders waiting for Apple's model at once. Returns each photo's outcome."""
+    time), with at most `apple_workers` renders waiting for the provider's answer at once. Returns each photo's outcome.
+    With `test` "crop" the pictures are the crop test's (`process_crop_photo`), which never wait for a provider."""
     outcomes: Dict[int, Outcome] = {}
     gate = threading.Semaphore(max(1, apple_workers))
     words = {"trial": "in the test", "unchanged": "unchanged", "failed": "left out", "error": "left out"}
+    if test == CROP_TEST.name:
+        words["unchanged"] = "kept its frame"
     with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
-        pending = {pool.submit(process_photo, pictures, job, gate): job for job in jobs}
+        if test == CROP_TEST.name:
+            pending = {pool.submit(process_crop_photo, pictures, job): job for job in jobs}
+        else:
+            pending = {pool.submit(process_photo, pictures, job, gate): job for job in jobs}
         for finished, future in enumerate(concurrent.futures.as_completed(pending), start=1):
             job = pending[future]
             outcome = future.result()

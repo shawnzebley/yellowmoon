@@ -92,6 +92,39 @@ pub enum ViewportMode {
     },
 }
 
+/// How the mask view shows a node's mask (`docs/23` section 5.8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MaskStyle {
+    /// The mask tinted in the mask accent over the photo as it is.
+    Overlay,
+    /// The mask as grey: the code value after C13 is `m`.
+    MaskOnly,
+}
+
+/// The mask view of the viewport: a corrector's mask shown in the frame instead of, or over, the photo
+/// (`viewport_set_mode`'s second argument). It belongs to the viewport, not to the photo's settings: nothing of
+/// it is saved, exported or copied, and the Before view, thumbnails, look tiles and the pixel readout never show
+/// it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct MaskView {
+    /// The corrector whose mask is shown (a live or a dead node).
+    pub node: u32,
+    /// Overlay or Mask only.
+    pub style: MaskStyle,
+    /// The row of the node whose own mask is shown instead of the node's (its place in the node's list, off rows
+    /// included): the row as it enters the node's fold (`docs/23` section 5.8). `None` shows the node's mask. A
+    /// row the node does not have shows the node's mask.
+    #[serde(default)]
+    pub row: Option<u32>,
+    /// Show depth (`docs/23` section 4.8): with `row` naming a Depth row of the node, the frame shows the photo's depth map
+    /// as grey, white for near, whole and not cut to the row's band (`ym_color::mask_depth::DepthMap::show_plane`), whatever
+    /// `style` says. It is a Mask only view of that row's map, so it goes the way of every other mask view, on the device
+    /// and on the CPU. A `row` that is not a Depth row shows the row's own mask as usual.
+    #[serde(default)]
+    pub depth: bool,
+}
+
 /// Pointer input over the photo (`viewport_input`). Coordinates are CSS pixels in the cell.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -128,6 +161,18 @@ pub enum ViewportInput {
     },
 }
 
+/// Which side of `viewport_map_points` the points are given in (`docs/23` section 9).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MapFrom {
+    /// Points `[x, y]` in the photo frame (`docs/23` section 3.6), answered as CSS pixels from the cell's corner,
+    /// which may lie outside the cell.
+    Photo,
+    /// Points in CSS pixels from the cell's corner, answered as photo-frame fractions, `None` for a point on the
+    /// paper (outside the photo, or in the empty corner a straightening leaves).
+    Cell,
+}
+
 /// What an input did.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum InputOutcome {
@@ -153,6 +198,8 @@ pub struct ViewportState {
     pub centre: [f64; 2],
     /// Whether the photo is shown before the look and the display transform.
     pub before: bool,
+    /// The mask view, when the node view shows a node's mask. Never part of the Before view.
+    pub mask_view: Option<MaskView>,
 }
 
 impl ViewportState {
@@ -164,6 +211,7 @@ impl ViewportState {
             mode: ViewportMode::Fit,
             centre: [0.5, 0.5],
             before: false,
+            mask_view: None,
         }
     }
 
@@ -206,6 +254,12 @@ impl ViewportState {
     /// pixel, so the frame is a window on the image and not a resample of it half a pixel off (a
     /// pan, or a cell of odd size, would otherwise leave the origin between pixels and soften every
     /// edge, at the zoom people use to judge sharpness).
+    ///
+    /// At every other zoom the origin of an axis the image fills is snapped to a whole *device*
+    /// pixel (`round(o * z) / z`), so a frame is a whole-pixel window of the picture rendered at
+    /// that zoom: that is what lets a pan at one zoom be a crop of a level kept on the device
+    /// ([`super::frame::level`]). The shift is at most half a device pixel. An axis the image does
+    /// not fill is centred and left as it is.
     #[must_use]
     pub fn view_to_final(&self, image: (usize, usize)) -> Affine {
         let (dw, dh) = self.device_size();
@@ -214,6 +268,11 @@ impl ViewportState {
         let origin = |centre: f64, view: usize, size: usize| {
             let o = centre - view as f64 * 0.5 / z;
             if (z - 1.0).abs() > 1e-9 {
+                let level = (size as f64 * z).round();
+                if level > view as f64 {
+                    let n = (o * z).round().clamp(0.0, level - view as f64);
+                    return n / z;
+                }
                 return o;
             }
             let whole = o.round();
@@ -259,6 +318,27 @@ impl ViewportState {
         let (x, y) = self.view_to_final(image).apply(css.0 * s, css.1 * s);
         let inside = x >= 0.0 && y >= 0.0 && x <= image.0 as f64 && y <= image.1 as f64;
         inside.then_some((x, y))
+    }
+
+    /// The CSS point of the cell where a point of the final image (pixels at full resolution) is drawn:
+    /// the inverse of [`ViewportState::final_point_at`], without its inside test, so a point of the image
+    /// that the zoom and pan keep out of the cell (or one outside the image) lies outside the cell. `None`
+    /// for a point that is not a number.
+    #[must_use]
+    pub fn css_point_at(
+        &self,
+        image: (usize, usize),
+        final_point: (f64, f64),
+    ) -> Option<(f64, f64)> {
+        if !(final_point.0.is_finite() && final_point.1.is_finite()) {
+            return None;
+        }
+        let s = self.rect.scale;
+        let (x, y) = self
+            .view_to_final(image)
+            .inverse()?
+            .apply(final_point.0, final_point.1);
+        (s.is_finite() && s > 0.0).then_some((x / s, y / s))
     }
 
     /// Sets the zoom and keeps `image` point `anchor` (final-image pixels) under the device point
@@ -399,7 +479,10 @@ mod tests {
         assert!(!v.is_fit(IMAGE));
         assert!((v.zoom(IMAGE) - 0.8).abs() < 1e-9);
         let after = v.final_point_at(IMAGE, (450.0, 100.0)).expect("inside");
-        assert!((before.0 - after.0).abs() < 1e-6 && (before.1 - after.1).abs() < 1e-6);
+        // The origin is snapped to a whole device pixel (at most half a device pixel, 0.625 image
+        // pixels at 80 %).
+        let half_px = 0.5 / v.zoom(IMAGE) + 1e-6;
+        assert!((before.0 - after.0).abs() <= half_px && (before.1 - after.1).abs() <= half_px);
         // Zooming back out below the fit returns to Fit and the middle.
         v.input(
             &ViewportInput::Zoom {
@@ -431,6 +514,33 @@ mod tests {
         let (dw, dh) = v.device_size();
         let c = v.centre_px(IMAGE);
         assert_eq!(c, (dw as f64 / 2.0, dh as f64 / 2.0));
+    }
+
+    #[test]
+    fn the_origin_is_a_whole_device_pixel_at_every_zoom() {
+        let (dw, dh) = state().device_size();
+        for value in [30.0, 50.0, 75.0, 100.0, 130.0, 150.0] {
+            let mut v = state();
+            v.set_mode(ViewportMode::Percent { value }, IMAGE);
+            for (dx, dy) in [(0.0, 0.0), (7.3, 3.1), (-123.456, 55.5), (1e9, -1e9)] {
+                v.input(&ViewportInput::Pan { dx, dy }, IMAGE);
+                let z = v.zoom(IMAGE);
+                let m = v.view_to_final(IMAGE);
+                let (ox, oy) = m.apply(0.0, 0.0);
+                for (o, size, view) in [(ox, IMAGE.0, dw), (oy, IMAGE.1, dh)] {
+                    if (size as f64 * z).round() > view as f64 {
+                        let n = o * z;
+                        assert!(
+                            (n - n.round()).abs() < 1e-6,
+                            "{value}%: origin {o} is not whole"
+                        );
+                        // The window stays inside the level of this zoom.
+                        let level = (size as f64 * z).round();
+                        assert!(n.round() >= 0.0 && n.round() + view as f64 <= level);
+                    }
+                }
+            }
+        }
     }
 
     #[test]

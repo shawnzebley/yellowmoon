@@ -136,19 +136,34 @@ fn json_has_one_object_per_file_in_the_documented_shape_and_order() {
     assert_eq!(v["camera"]["body"], "Sony A7R IV");
     assert_eq!(v["camera"]["model_id"], 375);
     assert_eq!(v["camera"]["profile"], "sony-ilce-7rm4");
-    assert_eq!(v["camera"]["profile_version"], "1.0.0");
+    assert_eq!(v["camera"]["profile_version"], "1.2.0");
     assert_eq!(v["camera"]["match"], "exact");
     assert_eq!(
         v["look"],
         json!({ "id": "builtin:signature", "intensity": 100 })
     );
+    // The numbers Auto resolves to are grouped by the node they are for (`docs/23` section 3.9).
     for key in [
         "exposure_ev",
         "kelvin",
         "tint",
-        "light_class",
-        "light_confidence",
+        "sharpen",
+        "noise_reduction",
     ] {
+        assert!(!v["auto"]["input"][key].is_null(), "auto.input.{key}");
+    }
+    for key in [
+        "contrast",
+        "saturation",
+        "highlights",
+        "shadows",
+        "black",
+        "balance_shadows",
+        "balance_highlights",
+    ] {
+        assert!(!v["auto"]["main"][key].is_null(), "auto.main.{key}");
+    }
+    for key in ["light_class", "light_confidence"] {
         assert!(!v["auto"][key].is_null(), "auto.{key}");
     }
     assert!(v["auto"]["noise"]["a"].is_number() && v["auto"]["noise"]["b"].is_number());
@@ -157,10 +172,13 @@ fn json_has_one_object_per_file_in_the_documented_shape_and_order() {
     }
     assert!(v["pipeline_version"].is_string());
     // The settings are what the file's `ym:Settings` says: Auto exposure written as its number.
-    assert_eq!(v["settings"]["exposure"]["kind"], "manual");
-    assert_eq!(v["settings"]["exposure"]["ev"], v["auto"]["exposure_ev"]);
-    assert_eq!(v["settings"]["white_balance"]["kind"], "auto");
-    assert_eq!(v["settings"]["look"], "builtin:signature");
+    assert_eq!(common::node(&v, "input")["exposure"]["kind"], "manual");
+    assert_eq!(
+        common::node(&v, "input")["exposure"]["ev"],
+        v["auto"]["input"]["exposure_ev"]
+    );
+    assert_eq!(common::node(&v, "input")["white_balance"]["kind"], "auto");
+    assert_eq!(common::node(&v, "output")["look"], "builtin:signature");
 }
 
 #[test]
@@ -421,39 +439,52 @@ fn flags_become_settings_and_the_exposure_offset_is_relative_to_each_photos_auto
     let objects = json_lines(&out.get_output().stdout);
     assert_eq!(objects.len(), 2);
     for o in &objects {
-        let auto_ev = o["auto"]["exposure_ev"].as_f64().expect("auto ev");
-        let s = &o["settings"];
-        let ev = s["exposure"]["ev"].as_f64().expect("exposure");
+        let auto_ev = o["auto"]["input"]["exposure_ev"].as_f64().expect("auto ev");
+        let (input, grade) = (common::node(o, "input"), &common::node(o, 1)["grade"]);
+        let ev = input["exposure"]["ev"].as_f64().expect("exposure");
         assert!(
             (ev - (auto_ev - 0.5)).abs() < 1e-9,
             "{ev} vs {auto_ev} - 0.5"
         );
         // Contrast and saturation are Auto or manual (docs/19 section 5): a number is manual.
-        assert_eq!(s["contrast"], json!({ "kind": "manual", "value": 20.0 }));
-        assert_eq!(s["saturation"], json!({ "kind": "manual", "value": -15.0 }));
         assert_eq!(
-            s["white_balance"],
+            grade["contrast"],
+            json!({ "kind": "manual", "value": 20.0 })
+        );
+        assert_eq!(
+            grade["saturation"],
+            json!({ "kind": "manual", "value": -15.0 })
+        );
+        assert_eq!(
+            input["white_balance"],
             json!({ "kind": "manual", "kelvin": 5200.0, "tint": 3.0 })
         );
-        assert_eq!(s["light_source"], "day");
+        assert_eq!(input["light_source"], "day");
         assert_eq!(
-            s["sharpen"],
+            input["sharpen"],
             json!({ "kind": "manual", "amount": 120.0, "radius_px": 1.1 })
         );
         assert_eq!(
-            s["noise_reduction"],
+            input["noise_reduction"],
             json!({ "kind": "manual", "luminance": 10.0, "color": 20.0, "detail": 30.0 })
         );
-        assert_eq!(s["decode"]["chromatic_aberration"], false);
-        assert_eq!(s["decode"]["neural_demosaic"], true);
-        assert_eq!(s["rolloff"], json!({ "highlights": 0.3, "low_light": 0.7 }));
+        assert_eq!(input["decode"]["chromatic_aberration"], false);
+        assert_eq!(input["decode"]["neural_demosaic"], true);
+        assert_eq!(
+            input["rolloff"],
+            json!({ "highlights": 0.3, "low_light": 0.7 })
+        );
         assert_eq!(o["look"]["intensity"], 80);
     }
     // Auto exposure is the camera's gain whatever the photo (docs/02, interim rule of 2026-10-14), so the two photos
     // have one automatic exposure and the offset lands on one number: the offset is relative to it, not absolute.
     let evs: Vec<f64> = objects
         .iter()
-        .map(|o| o["settings"]["exposure"]["ev"].as_f64().expect("ev"))
+        .map(|o| {
+            common::node(o, "input")["exposure"]["ev"]
+                .as_f64()
+                .expect("ev")
+        })
         .collect();
     let want = ym_color::exposure::CAMERA_GAIN_EV - 0.5;
     for ev in &evs {
@@ -477,8 +508,6 @@ fn the_remaining_flags_of_docs_10_reach_the_settings_of_the_file() {
             "22",
             "--white",
             "33",
-            "--white-offset",
-            "-0.5",
             "--no-neural",
             "--no-highlight-recovery",
             "--no-lens",
@@ -488,14 +517,16 @@ fn the_remaining_flags_of_docs_10_reach_the_settings_of_the_file() {
         .success();
     let objects = json_lines(&out.get_output().stdout);
     assert_eq!(objects.len(), 1);
-    let s = &objects[0]["settings"];
-    assert_eq!(s["brightness"], 11.0);
+    let (input, grade) = (
+        common::node(&objects[0], "input"),
+        &common::node(&objects[0], 1)["grade"],
+    );
+    assert_eq!(grade["brightness"], 11.0);
     // Shadows is Auto or a manual value (`docs/19` section 5): a number is Manual.
-    assert_eq!(s["shadows"], json!({ "kind": "manual", "value": 22.0 }));
-    assert_eq!(s["white"], 33.0);
-    assert_eq!(s["white_offset_ev"], -0.5);
+    assert_eq!(grade["shadows"], json!({ "kind": "manual", "value": 22.0 }));
+    assert_eq!(grade["white"], 33.0);
     assert_eq!(
-        s["decode"],
+        input["decode"],
         json!({
             "neural_demosaic": false,
             "highlight_recovery": false,
@@ -507,11 +538,15 @@ fn the_remaining_flags_of_docs_10_reach_the_settings_of_the_file() {
     // saturation are pinned to the 0 they resolve to without Apple Auto, and the shadows and
     // highlights wheels to the centre (docs/19 section 5).
     for key in ["highlights", "black", "contrast", "saturation"] {
-        assert_eq!(s[key], json!({ "kind": "manual", "value": 0.0 }), "{key}");
+        assert_eq!(
+            grade[key],
+            json!({ "kind": "manual", "value": 0.0 }),
+            "{key}"
+        );
     }
     for key in ["shadows", "highlights"] {
         assert_eq!(
-            s["color_balance"][key],
+            grade["color_balance"][key],
             json!({ "kind": "manual", "point": [0.0, 0.0] }),
             "{key}"
         );
@@ -530,15 +565,15 @@ fn an_absolute_exposure_and_a_kelvin_without_a_tint() {
         .success();
     let o = &json_lines(&out.get_output().stdout)[0];
     assert_eq!(
-        o["settings"]["exposure"],
+        common::node(o, "input")["exposure"],
         json!({ "kind": "manual", "ev": -1.25 })
     );
     // The tint keeps the automatic value.
-    assert_eq!(o["settings"]["white_balance"]["kelvin"], 6100.0);
-    let tint = o["settings"]["white_balance"]["tint"]
+    assert_eq!(common::node(o, "input")["white_balance"]["kelvin"], 6100.0);
+    let tint = common::node(o, "input")["white_balance"]["tint"]
         .as_f64()
         .expect("tint");
-    assert!((tint - o["auto"]["tint"].as_f64().expect("auto tint")).abs() < 1e-9);
+    assert!((tint - o["auto"]["input"]["tint"].as_f64().expect("auto tint")).abs() < 1e-9);
 }
 
 #[test]
@@ -549,7 +584,10 @@ fn a_settings_file_applies_to_every_photo_and_flags_override_it() {
     let file = sb.root().join("settings.json");
     std::fs::write(
         &file,
-        r#"{ "contrast": 30, "saturation": 10, "exposure": {"kind": "manual", "ev": 0.25} }"#,
+        r#"{ "nodes": { "items": [
+            { "id": "input", "exposure": {"kind": "manual", "ev": 0.25} },
+            { "id": 1, "grade": { "contrast": {"kind": "manual", "value": 30},
+                                  "saturation": {"kind": "manual", "value": 10} } } ] } }"#,
     )
     .expect("write");
     let out = sb
@@ -560,9 +598,13 @@ fn a_settings_file_applies_to_every_photo_and_flags_override_it() {
         .assert()
         .success();
     for o in json_lines(&out.get_output().stdout) {
-        assert_eq!(o["settings"]["contrast"]["value"], 30.0);
-        assert_eq!(o["settings"]["saturation"]["value"], -20.0, "the flag wins");
-        assert_eq!(o["settings"]["exposure"]["ev"], 0.25);
+        assert_eq!(common::node(&o, 1)["grade"]["contrast"]["value"], 30.0);
+        assert_eq!(
+            common::node(&o, 1)["grade"]["saturation"]["value"],
+            -20.0,
+            "the flag wins"
+        );
+        assert_eq!(common::node(&o, "input")["exposure"]["ev"], 0.25);
     }
 }
 
@@ -575,7 +617,9 @@ fn a_settings_object_keyed_by_file_name_gives_each_photo_its_own() {
     let file = sb.root().join("per-file.json");
     std::fs::write(
         &file,
-        r#"{ "a.ARW": { "contrast": 40 }, "B.arw": { "contrast": -40 }, "z.ARW": { "contrast": 1 } }"#,
+        r#"{ "a.ARW": { "nodes": { "items": [ { "id": 1, "grade": { "contrast": {"kind": "manual", "value": 40} } } ] } },
+            "B.arw": { "nodes": { "items": [ { "id": 1, "grade": { "contrast": {"kind": "manual", "value": -40} } } ] } },
+            "z.ARW": { "nodes": { "items": [ { "id": 1, "grade": { "contrast": {"kind": "manual", "value": 1} } } ] } } }"#,
     )
     .expect("write");
     let out = sb
@@ -594,7 +638,7 @@ fn a_settings_object_keyed_by_file_name_gives_each_photo_its_own() {
             .iter()
             .find(|o| o["input"].as_str().is_some_and(|i| i.ends_with(name)))
             .map(|o| {
-                o["settings"]["contrast"]["value"]
+                common::node(o, 1)["grade"]["contrast"]["value"]
                     .as_f64()
                     .expect("contrast")
             })
@@ -613,6 +657,512 @@ fn a_settings_object_keyed_by_file_name_gives_each_photo_its_own() {
     );
 }
 
+/// A settings file with one corrector, node 2, with these mask rows.
+fn masked_file(rows: &str) -> String {
+    format!(
+        r#"{{ "nodes": {{ "items": [ {{ "id": 2, "kind": "corrector", "pos": [1, 0], "trim": {{ "exposure_ev": 0.7 }},
+            "masks": {{ "invert": false, "items": [ {rows} ] }} }} ],
+            "links": [
+              {{ "from": {{ "node": "input", "port": "picture" }}, "to": {{ "node": 1, "port": "picture" }} }},
+              {{ "from": {{ "node": 1, "port": "picture" }}, "to": {{ "node": 2, "port": "picture" }} }},
+              {{ "from": {{ "node": 2, "port": "picture" }}, "to": {{ "node": "output", "port": "picture" }} }}
+            ] }} }}"#
+    )
+}
+
+/// A raster mask this computer cannot make (`docs/10` *Settings*, `docs/23` section 3.10) stops that photo with
+/// `error.kind` `mask`, a sentence that names the node and the kind, and exit 1; the other photos go on and the
+/// photo is never written without its mask.
+#[test]
+fn a_photo_that_needs_a_mask_this_computer_cannot_make_fails_with_the_mask_error_and_the_rest_go_on()
+ {
+    let sb = Sandbox::new();
+    sb.arw("a_plain.ARW");
+    sb.arw("b_subject.ARW");
+    sb.arw("c_people.ARW");
+    sb.arw("d_background.ARW");
+    sb.arw("e_off.ARW");
+    let file = sb.root().join("per-file.json");
+    let doc = |rows: &str| serde_json::from_str::<Value>(&masked_file(rows)).expect("a document");
+    let doc_text = serde_json::json!({
+        "b_subject.ARW": doc(r#"{ "kind": "subject" }"#),
+        "c_people.ARW": doc(r#"{ "kind": "people" }"#),
+        "d_background.ARW": doc(r#"{ "kind": "background" }"#),
+        // The eye is off: the row is absent, the photo renders.
+        "e_off.ARW": doc(r#"{ "kind": "subject", "enabled": false }"#),
+    });
+    std::fs::write(&file, doc_text.to_string()).expect("write");
+    let out = sb
+        .ym()
+        .args(["render", "--json", "--settings"])
+        .arg(&file)
+        .arg(sb.photos())
+        .assert()
+        .code(1);
+    let objects = json_lines(&out.get_output().stdout);
+    assert_eq!(objects.len(), 5);
+    let find = |name: &str| {
+        objects
+            .iter()
+            .find(|o| o["input"].as_str().is_some_and(|i| i.ends_with(name)))
+            .unwrap_or_else(|| panic!("no record for {name}"))
+    };
+    // The Object row's own sentence, which depends on the weights, is `an_object_row_without_the_model_is_the_mask_error_and_with_it_the_photo_renders`.
+    // Subject and People: the sentences of `docs/23` section 3.10 on every computer (the sandbox's `ym` says Vision is not supported).
+    for (name, sentence) in [
+        (
+            "b_subject.ARW",
+            "Node 2 has a Subject mask, and this computer cannot make one. Use a Mac that supports Subject masks, or remove the mask.",
+        ),
+        (
+            "c_people.ARW",
+            "Node 2 has a People mask, and this computer cannot make one. Use a Mac that supports People masks, or remove the mask.",
+        ),
+    ] {
+        let o = find(name);
+        assert_eq!(o["status"], "error", "{name}");
+        assert_eq!(o["output"], Value::Null, "{name}");
+        assert_eq!(o["error"]["kind"], "mask", "{name}");
+        assert_eq!(o["error"]["message"], sentence, "{name}");
+        // The record still says what the photo was.
+        assert!(
+            o["camera"].is_object() && o["settings"].is_object(),
+            "{name}"
+        );
+        assert!(
+            !sb.default_export()
+                .join(format!("{}_signature.jpg", name.trim_end_matches(".ARW")))
+                .exists(),
+            "{name} was written without its mask"
+        );
+    }
+    assert_eq!(find("a_plain.ARW")["status"], "ok");
+    assert_eq!(find("e_off.ARW")["status"], "ok");
+    // A Background row is made from the photo's own blur map (N-15): it renders.
+    assert_eq!(find("d_background.ARW")["status"], "ok");
+    assert!(sb.default_export().join("a_plain_signature.jpg").exists());
+    assert!(sb.default_export().join("e_off_signature.jpg").exists());
+    assert!(
+        sb.default_export()
+            .join("d_background_signature.jpg")
+            .exists()
+    );
+}
+
+/// The same settings file on a computer that supports Subject and People (the fake Vision: `YELLOWMOON_TEST_VISION=fake`): both
+/// photos render, the rows act (the picture is not the one of the node without them), and the report says what the settings were.
+/// The same file twice gives the same bytes (`docs/23` section 5.10).
+#[test]
+fn subject_and_people_rows_render_where_this_computer_supports_them_and_act() {
+    let sb = Sandbox::new();
+    sb.arw("a_subject.ARW");
+    sb.arw("b_people.ARW");
+    sb.arw("c_none.ARW");
+    let doc = |rows: &str| serde_json::from_str::<Value>(&masked_file(rows)).expect("a document");
+    let file = sb.root().join("per-file.json");
+    let doc_text = serde_json::json!({
+        "a_subject.ARW": doc(r#"{ "kind": "subject", "feather": 0.2 }"#),
+        "b_people.ARW": doc(r#"{ "kind": "people" }"#),
+        "c_none.ARW": doc(""),
+    });
+    std::fs::write(&file, doc_text.to_string()).expect("write");
+    let run = |out: &str| {
+        let out = sb
+            .ym_fake_vision()
+            .args([
+                "render",
+                "--cpu",
+                "--json",
+                "--format",
+                "tiff",
+                "--bits",
+                "16",
+                "--settings",
+            ])
+            .arg(&file)
+            .args(["--out", out])
+            .arg(sb.photos())
+            .assert()
+            .success();
+        json_lines(&out.get_output().stdout)
+    };
+    let first = run("out-1");
+    assert_eq!(first.len(), 3);
+    for o in &first {
+        assert_eq!(o["status"], "ok", "{o}");
+    }
+    let path = |dir: &str, name: &str| sb.root().join(dir).join(format!("{name}_signature.tif"));
+    let bytes = |p: std::path::PathBuf| {
+        std::fs::read(&p).unwrap_or_else(|e| panic!("{}: {e}", p.display()))
+    };
+    // The rows act: the mask is a part of the picture, the trim of 0.7 stop reaches that part only, so the same photo with an empty
+    // node is another file.
+    let none = bytes(path("out-1", "c_none"));
+    assert_ne!(
+        bytes(path("out-1", "a_subject")),
+        none,
+        "Subject changed no pixel"
+    );
+    assert_ne!(
+        bytes(path("out-1", "b_people")),
+        none,
+        "People changed no pixel"
+    );
+    // The same file again: the same bytes.
+    let second = run("out-2");
+    assert_eq!(second.len(), 3);
+    for name in ["a_subject", "b_people", "c_none"] {
+        assert_eq!(
+            bytes(path("out-1", name)),
+            bytes(path("out-2", name)),
+            "{name} is not the same file twice"
+        );
+    }
+}
+
+/// A copy of Yellowmoon with no Object model (`data/models/sam2` is not there, or does not load): an Object row stops that photo with
+/// `error.kind` `mask` and "This copy of Yellowmoon has no Object model. Reinstall the app.", exit 1, nothing written; `ym doctor` says
+/// `weights_missing`; and a photo with the eye of the row off, or no Object row, goes on (`docs/10`, `docs/23` section 9, N-18). With the
+/// weights (the shipped data folder, where `tools/fetch/sam2.sh` has fetched them) the same file renders.
+#[cfg(unix)]
+#[test]
+fn an_object_row_without_the_model_is_the_mask_error_and_with_it_the_photo_renders() {
+    let sb = Sandbox::new();
+    sb.arw("a_object.ARW");
+    sb.arw("b_off.ARW");
+    let doc = |rows: &str| serde_json::from_str::<Value>(&masked_file(rows)).expect("a document");
+    let file = sb.root().join("per-file.json");
+    let doc_text = serde_json::json!({
+        "a_object.ARW": doc(r#"{ "kind": "object", "points": [[0.5, 0.5, true]] }"#),
+        "b_off.ARW": doc(r#"{ "kind": "object", "enabled": false }"#),
+    });
+    std::fs::write(&file, doc_text.to_string()).expect("write");
+    let without = sb.data_without_the_sam_weights();
+    let out = sb
+        .ym_data(&without)
+        .args(["render", "--cpu", "--json", "--settings"])
+        .arg(&file)
+        .arg(sb.photos())
+        .assert()
+        .code(1);
+    let objects = json_lines(&out.get_output().stdout);
+    assert_eq!(objects.len(), 2);
+    let find = |name: &str| {
+        objects
+            .iter()
+            .find(|o| o["input"].as_str().is_some_and(|i| i.ends_with(name)))
+            .unwrap_or_else(|| panic!("no record for {name}"))
+    };
+    let o = find("a_object.ARW");
+    assert_eq!(o["status"], "error");
+    assert_eq!(o["output"], Value::Null);
+    assert_eq!(o["error"]["kind"], "mask");
+    assert_eq!(
+        o["error"]["message"],
+        "This copy of Yellowmoon has no Object model. Reinstall the app."
+    );
+    assert!(o["camera"].is_object() && o["settings"].is_object());
+    assert!(!sb.default_export().join("a_object_signature.jpg").exists());
+    assert_eq!(find("b_off.ARW")["status"], "ok");
+    // The doctor says so, and Object is not on offer.
+    let out = sb
+        .ym_data(&without)
+        .args(["doctor", "--json"])
+        .assert()
+        .success();
+    let v: Value = serde_json::from_slice(&out.get_output().stdout).expect("JSON");
+    assert_eq!(v["masks"]["unavailable"]["object"], "weights_missing");
+    assert!(
+        !v["masks"]["kinds"]
+            .as_array()
+            .expect("kinds")
+            .iter()
+            .any(|k| k == "object")
+    );
+    let text = sb.ym_data(&without).arg("doctor").assert().success();
+    let text = String::from_utf8_lossy(&text.get_output().stdout).into_owned();
+    assert!(
+        text.contains("Object (the SAM weights are missing)"),
+        "the Masks row names the reason:\n{text}"
+    );
+    // With the weights the same file renders, and the record's settings hold the row.
+    if ym_core::pipeline::ObjectModel::probe(&common::data_dir()).is_some_and(|m| m.sam().is_ok()) {
+        let out = sb
+            .ym()
+            .args(["render", "--cpu", "--json", "--settings"])
+            .arg(&file)
+            .arg(sb.photos())
+            .assert()
+            .success();
+        let objects = json_lines(&out.get_output().stdout);
+        let o = objects
+            .iter()
+            .find(|o| {
+                o["input"]
+                    .as_str()
+                    .is_some_and(|i| i.ends_with("a_object.ARW"))
+            })
+            .expect("a record");
+        assert_eq!(o["status"], "ok");
+        assert!(sb.default_export().join("a_object_signature.jpg").exists());
+    } else {
+        assert!(
+            std::env::var_os("YM_REQUIRE_SAM2").is_none(),
+            "YM_REQUIRE_SAM2 is set and data/models/sam2 is missing"
+        );
+        eprintln!(
+            "\n* the half of this test that renders with the weights was SKIPPED: no SAM weights\n"
+        );
+    }
+}
+
+/// A Background row renders from `--settings` (`docs/10`, N-15): the blur map is made from the photo itself, the
+/// photo is written, and a Level that lets everything count (the formula gives at least one half at Level 100) is
+/// not the photo without the row. The settings the record prints hold the row.
+#[test]
+fn a_background_row_renders_from_a_settings_file() {
+    let sb = Sandbox::new();
+    let arw = sb.arw_bokeh("lights.ARW", 640, 480, 4);
+    let row =
+        r#"{ "kind": "background", "mode": "add", "level": 1, "softness": 0.4, "feather": 0.1 }"#;
+    let with = sb.root().join("background.json");
+    std::fs::write(&with, masked_file(row)).expect("write");
+    let without = sb.root().join("none.json");
+    std::fs::write(&without, masked_file("")).expect("write");
+    let render = |settings: &std::path::Path, dir: &str| {
+        let out_dir = sb.root().join(dir);
+        let out = sb
+            .ym()
+            .args([
+                "render",
+                "--cpu",
+                "--json",
+                "--format",
+                "tiff",
+                "--settings",
+            ])
+            .arg(settings)
+            .arg("--out")
+            .arg(&out_dir)
+            .arg(&arw)
+            .assert()
+            .success();
+        let o = json_lines(&out.get_output().stdout).remove(0);
+        assert_eq!(o["status"], "ok");
+        let path = o["output"].as_str().expect("output").to_owned();
+        (o, std::fs::read(path).expect("the file"))
+    };
+    let (o, a) = render(&with, "with");
+    let (_, b) = render(&without, "without");
+    assert_ne!(a, b, "the Background row changed no pixel");
+    let rows = &common::node(&o, 2)["masks"]["items"];
+    assert_eq!(rows[0]["kind"], "background");
+    assert_eq!(rows[0]["level"], 1.0);
+    assert_eq!(rows[0]["softness"], 0.4);
+    assert_eq!(rows[0]["refine"], 0.5);
+}
+
+/// A copy of Yellowmoon with no Depth model (`data/models/depth` is not there): a Depth row stops that photo with `error.kind` `mask` and
+/// "This copy of Yellowmoon has no Depth model. Reinstall the app.", exit 1, nothing written; `ym doctor` says `weights_missing` and names
+/// the depth weights; and a photo with the eye of the row off, or no Depth row, goes on (`docs/10`, `docs/23` section 3.10a, D-04).
+#[cfg(unix)]
+#[test]
+fn a_depth_row_without_the_model_is_the_mask_error_and_the_other_photos_go_on() {
+    let sb = Sandbox::new();
+    sb.arw("a_depth.ARW");
+    sb.arw("b_off.ARW");
+    sb.arw("c_plain.ARW");
+    let doc = |rows: &str| serde_json::from_str::<Value>(&masked_file(rows)).expect("a document");
+    let file = sb.root().join("per-file.json");
+    let doc_text = serde_json::json!({
+        "a_depth.ARW": doc(r#"{ "kind": "depth", "far": 0.4 }"#),
+        "b_off.ARW": doc(r#"{ "kind": "depth", "enabled": false }"#),
+        "c_plain.ARW": doc(""),
+    });
+    std::fs::write(&file, doc_text.to_string()).expect("write");
+    let without = sb.data_without_the_depth_weights();
+    let out = sb
+        .ym_data(&without)
+        .args(["render", "--cpu", "--json", "--settings"])
+        .arg(&file)
+        .arg(sb.photos())
+        .assert()
+        .code(1);
+    let objects = json_lines(&out.get_output().stdout);
+    assert_eq!(objects.len(), 3);
+    let find = |name: &str| {
+        objects
+            .iter()
+            .find(|o| o["input"].as_str().is_some_and(|i| i.ends_with(name)))
+            .unwrap_or_else(|| panic!("no record for {name}"))
+    };
+    let o = find("a_depth.ARW");
+    assert_eq!(o["status"], "error");
+    assert_eq!(o["output"], Value::Null);
+    assert_eq!(o["error"]["kind"], "mask");
+    assert_eq!(
+        o["error"]["message"],
+        "This copy of Yellowmoon has no Depth model. Reinstall the app."
+    );
+    assert!(o["camera"].is_object() && o["settings"].is_object());
+    assert!(!sb.default_export().join("a_depth_signature.jpg").exists());
+    assert_eq!(find("b_off.ARW")["status"], "ok");
+    assert_eq!(find("c_plain.ARW")["status"], "ok");
+    // The doctor says so, and Depth is not on offer.
+    let out = sb
+        .ym_data(&without)
+        .args(["doctor", "--json"])
+        .assert()
+        .success();
+    let v: Value = serde_json::from_slice(&out.get_output().stdout).expect("JSON");
+    assert_eq!(v["masks"]["unavailable"]["depth"], "weights_missing");
+    assert!(
+        !v["masks"]["kinds"]
+            .as_array()
+            .expect("kinds")
+            .iter()
+            .any(|k| k == "depth")
+    );
+    let text = sb.ym_data(&without).arg("doctor").assert().success();
+    let text = String::from_utf8_lossy(&text.get_output().stdout).into_owned();
+    assert!(
+        text.contains("Depth (the depth weights are missing)"),
+        "the Masks row names the reason:\n{text}"
+    );
+}
+
+/// A Depth row renders from `--settings` (`docs/10`, D-04) with the fake depth model (`YELLOWMOON_TEST_DEPTH=fake`): the map is made from
+/// the photo's own picture, the photo is written, and the row changes pixels. The same file twice gives the same bytes, a `far` outside
+/// 0.02 to 1 is held to it, the old `near` and `softness` are refused like any unknown field, and the settings the record prints
+/// hold the row with its defaults and its numbers.
+#[test]
+fn a_depth_row_renders_from_a_settings_file_with_the_fake_model() {
+    let sb = Sandbox::new();
+    let arw = sb.arw("a.ARW");
+    let row = r#"{ "kind": "depth", "mode": "add", "far": 0.7, "feather": 0.1 }"#;
+    let with = sb.root().join("depth.json");
+    std::fs::write(&with, masked_file(row)).expect("write");
+    let beyond = sb.root().join("beyond.json");
+    std::fs::write(&beyond, masked_file(r#"{ "kind": "depth", "far": 5 }"#)).expect("write");
+    let whole = sb.root().join("whole.json");
+    std::fs::write(&whole, masked_file(r#"{ "kind": "depth", "far": 1 }"#)).expect("write");
+    let under = sb.root().join("under.json");
+    std::fs::write(&under, masked_file(r#"{ "kind": "depth", "far": 0 }"#)).expect("write");
+    let least = sb.root().join("least.json");
+    std::fs::write(&least, masked_file(r#"{ "kind": "depth", "far": 0.02 }"#)).expect("write");
+    let old = sb.root().join("old.json");
+    std::fs::write(
+        &old,
+        masked_file(r#"{ "kind": "depth", "near": 0.1, "far": 0.7, "softness": 0.2 }"#),
+    )
+    .expect("write");
+    let defaults = sb.root().join("defaults.json");
+    std::fs::write(&defaults, masked_file(r#"{ "kind": "depth" }"#)).expect("write");
+    let without = sb.root().join("none.json");
+    std::fs::write(&without, masked_file("")).expect("write");
+    let render = |settings: &std::path::Path, dir: &str| {
+        let out_dir = sb.root().join(dir);
+        let out = sb
+            .ym_fake_depth()
+            .args([
+                "render",
+                "--cpu",
+                "--json",
+                "--format",
+                "tiff",
+                "--settings",
+            ])
+            .arg(settings)
+            .arg("--out")
+            .arg(&out_dir)
+            .arg(&arw)
+            .assert()
+            .success();
+        let o = json_lines(&out.get_output().stdout).remove(0);
+        assert_eq!(o["status"], "ok", "{o}");
+        let path = o["output"].as_str().expect("output").to_owned();
+        (o, std::fs::read(path).expect("the file"))
+    };
+    let (o, a) = render(&with, "with");
+    let (_, again) = render(&with, "again");
+    let (_, b) = render(&without, "without");
+    assert_ne!(a, b, "the Depth row changed no pixel");
+    assert_eq!(a, again, "the same file twice is the same bytes");
+    let rows = &common::node(&o, 2)["masks"]["items"];
+    assert_eq!(rows[0]["kind"], "depth");
+    assert_eq!(rows[0]["far"], 0.7);
+    assert!(rows[0].get("near").is_none() && rows[0].get("softness").is_none());
+    assert_eq!(rows[0]["feather"], 0.1);
+    assert_eq!(rows[0]["refine"], 0.5);
+    // The defaults of `docs/10`.
+    let (d, _) = render(&defaults, "defaults");
+    let rows = &common::node(&d, 2)["masks"]["items"];
+    assert_eq!(
+        (&rows[0]["far"], &rows[0]["grow"]),
+        (&Value::from(1.0), &Value::from(0.0))
+    );
+    // A `far` outside 0.02 to 1 is held to it: 5 is the whole depth, 0 is the least limit.
+    let (_, b5) = render(&beyond, "beyond");
+    let (_, b1) = render(&whole, "whole");
+    assert_eq!(b5, b1, "5 is 1");
+    let (_, b0) = render(&under, "under");
+    let (_, b02) = render(&least, "least");
+    assert_eq!(b0, b02, "0 is 0.02");
+    // The band is gone: `near` and `softness` are unknown fields, refused with their name.
+    sb.ym_fake_depth()
+        .args(["render", "--cpu", "--settings"])
+        .arg(&old)
+        .arg(&arw)
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("near"));
+}
+
+/// A Brush row renders from `--settings` (`docs/10`): the photo is written, and it is not the photo without the
+/// brush.
+#[test]
+fn a_brush_row_renders_from_a_settings_file() {
+    let sb = Sandbox::new();
+    let arw = sb.arw("a.ARW");
+    let brush = r#"{ "kind": "brush", "mode": "add", "feather": 0.2, "grow": 0.2, "refine": 0.4,
+        "strokes": [ { "size": 0.2, "hardness": 0.5, "erase": false, "points": [[0.3, 0.4], [0.6, 0.55]] } ] }"#;
+    let with = sb.root().join("brush.json");
+    std::fs::write(&with, masked_file(brush)).expect("write");
+    let without = sb.root().join("none.json");
+    std::fs::write(&without, masked_file("")).expect("write");
+    let render = |settings: &std::path::Path, dir: &str| {
+        let out_dir = sb.root().join(dir);
+        let out = sb
+            .ym()
+            .args([
+                "render",
+                "--cpu",
+                "--json",
+                "--format",
+                "tiff",
+                "--settings",
+            ])
+            .arg(settings)
+            .arg("--out")
+            .arg(&out_dir)
+            .arg(&arw)
+            .assert()
+            .success();
+        let o = json_lines(&out.get_output().stdout).remove(0);
+        assert_eq!(o["status"], "ok");
+        let path = o["output"].as_str().expect("output").to_owned();
+        (o, std::fs::read(path).expect("the file"))
+    };
+    let (o, a) = render(&with, "with");
+    let (_, b) = render(&without, "without");
+    assert_ne!(a, b, "the brush changed no pixel");
+    // The settings the record prints hold the strokes.
+    let rows = &common::node(&o, 2)["masks"]["items"];
+    assert_eq!(rows[0]["kind"], "brush");
+    assert_eq!(rows[0]["strokes"][0]["points"][1][0], 0.6);
+    assert_eq!(rows[0]["refine"], 0.4);
+}
+
 #[test]
 fn settings_can_come_from_stdin_and_values_out_of_range_are_limited_with_a_warning() {
     let sb = Sandbox::new();
@@ -621,12 +1171,14 @@ fn settings_can_come_from_stdin_and_values_out_of_range_are_limited_with_a_warni
         .ym()
         .args(["render", "--json", "--settings", "-"])
         .arg(&arw)
-        .write_stdin(r#"{ "contrast": 500 }"#)
+        .write_stdin(r#"{ "nodes": { "items": [ { "id": 1, "grade": { "contrast": { "kind": "manual", "value": 500 } } } ] } }"#)
         .assert()
         .success()
-        .stderr(predicate::str::contains("out-of-range values for contrast"));
+        .stderr(predicate::str::contains(
+            "out-of-range values for 1.grade.contrast",
+        ));
     assert_eq!(
-        json_lines(&out.get_output().stdout)[0]["settings"]["contrast"]["value"],
+        common::node(&json_lines(&out.get_output().stdout)[0], 1)["grade"]["contrast"]["value"],
         100.0
     );
 }
@@ -640,7 +1192,43 @@ fn a_settings_file_that_does_not_parse_is_a_usage_error_and_nothing_is_rendered(
         ("{ \"contrsat\": 3 }", "contrsat"),
         ("not json", "not valid JSON"),
         ("[1, 2]", "JSON object"),
-        (r#"{ "contrast": 1, "a.ARW": {} }"#, "mixes"),
+        (r#"{ "nodes": {}, "a.ARW": {} }"#, "mixes"),
+        // A rule of the graph is refused with its plain sentence.
+        (
+            r#"{ "nodes": { "links": [] } }"#,
+            "The output needs one picture link.",
+        ),
+        (
+            r#"{ "nodes": { "items": [ { "id": 2, "kind": "outside" } ] } }"#,
+            "This settings file has a node of a kind (“outside”)",
+        ),
+        // The rules of a mixer (docs/25 section 2.3), each with its sentence after the usual words.
+        (
+            r#"{ "nodes": { "items": [ { "id": 7, "kind": "layer" } ], "links": [
+                { "from": { "node": "input", "port": "picture" }, "to": { "node": 1, "port": "picture" } },
+                { "from": { "node": 1, "port": "picture" }, "to": { "node": 7, "port": "picture.1" } },
+                { "from": { "node": 1, "port": "picture" }, "to": { "node": 7, "port": "picture.3" } },
+                { "from": { "node": 7, "port": "picture" }, "to": { "node": "output", "port": "picture" } } ] } }"#,
+            "The settings file can't be used: Node 7 has a link on input 3 and none on input 2. A mixer's inputs are numbered from 1 with no gap.",
+        ),
+        (
+            r#"{ "nodes": { "items": [ { "id": 7, "kind": "parallel" } ], "links": [
+                { "from": { "node": "input", "port": "picture" }, "to": { "node": 1, "port": "picture" } },
+                { "from": { "node": 1, "port": "picture" }, "to": { "node": 7, "port": "picture.9" } },
+                { "from": { "node": 7, "port": "picture" }, "to": { "node": "output", "port": "picture" } } ] } }"#,
+            "The settings file can't be used: A mixer can have up to 8 inputs.",
+        ),
+        (
+            r#"{ "nodes": { "items": [ { "id": 7, "kind": "layer" } ], "links": [
+                { "from": { "node": "input", "port": "picture" }, "to": { "node": 1, "port": "picture" } },
+                { "from": { "node": 1, "port": "picture" }, "to": { "node": 7, "port": "picture" } },
+                { "from": { "node": 7, "port": "picture" }, "to": { "node": "output", "port": "picture" } } ] } }"#,
+            "The settings file can't be used: Node 7 has no port called “picture”.",
+        ),
+        (
+            r#"{ "nodes": { "items": [ { "id": 7, "kind": "splitter", "masks": {} } ] } }"#,
+            "A splitter has no field called “masks”.",
+        ),
         // A typo whose value is an object must not pass for a photo's file name.
         (
             r#"{ "color_ballance": { "shadows": [0.1, 0.0] } }"#,
@@ -648,7 +1236,7 @@ fn a_settings_file_that_does_not_parse_is_a_usage_error_and_nothing_is_rendered(
         ),
         (
             r#"{ "curve2": {} }"#,
-            "not a setting or the name of an ARW file",
+            "not `nodes` or the name of an ARW file",
         ),
     ] {
         std::fs::write(&file, content).expect("write");
@@ -667,6 +1255,44 @@ fn a_settings_file_that_does_not_parse_is_a_usage_error_and_nothing_is_rendered(
         .assert()
         .code(2)
         .stderr(predicate::str::contains("Couldn't read the settings file"));
+}
+
+/// A settings file with a Layer is read, checked and rendered (`docs/25` task X-04): the photo is written, and the record carries the
+/// settings as the file held them, with the new kind.
+#[test]
+fn a_settings_file_with_a_mixer_is_read_and_the_photo_renders() {
+    let sb = Sandbox::new();
+    let arw = sb.arw("a.ARW");
+    let file = sb.root().join("layer.json");
+    std::fs::write(
+        &file,
+        r#"{ "nodes": {
+            "items": [ { "id": 2, "kind": "layer", "mode": "add", "opacity": 0.5 } ],
+            "links": [
+                { "from": { "node": "input", "port": "picture" }, "to": { "node": 1, "port": "picture" } },
+                { "from": { "node": 1, "port": "picture" }, "to": { "node": 2, "port": "picture.1" } },
+                { "from": { "node": 2, "port": "picture" }, "to": { "node": "output", "port": "picture" } } ] } }"#,
+    )
+    .expect("write");
+    let out = sb
+        .ym()
+        .args(["render", "--json", "--settings"])
+        .arg(&file)
+        .arg(&arw)
+        .assert()
+        .success();
+    let objects = json_lines(&out.get_output().stdout);
+    assert_eq!(objects.len(), 1);
+    let o = &objects[0];
+    assert_eq!(o["status"], "ok");
+    let path = o["output"].as_str().expect("output");
+    assert!(std::path::Path::new(path).exists(), "the photo was written");
+    let items = o["settings"]["nodes"]["items"].as_array().expect("items");
+    assert!(
+        items
+            .iter()
+            .any(|i| i["kind"] == "layer" && i["mode"] == "add")
+    );
 }
 
 #[test]
@@ -699,8 +1325,7 @@ fn exit_code_2_for_usage_errors() {
         (vec!["--output-sharpening", "-5"], "between 0 and 200"),
         (vec!["--output-sharpening", "a lot"], "is not a number"),
         (vec!["--no-such-flag"], "unexpected argument"),
-        (vec!["--white-offset", "3.5"], "between -3 and 3"),
-        (vec!["--white-offset", "a lot"], "is not a number"),
+        (vec!["--white-offset", "0.5"], "unexpected argument"),
         (vec!["--rolloff", "1.5,0.5"], "the highlight range"),
         (vec!["--rolloff", "0.5,-1"], "the low-light toe"),
     ];
@@ -773,11 +1398,20 @@ fn the_output_sharpening_option_is_in_the_settings_the_json_reports() {
     };
     // The default is 100, and it is in the settings an export records.
     let default = run(&[], "default");
-    assert_eq!(default["settings"]["output_sharpening"], json!(100.0));
+    assert_eq!(
+        common::node(&default, "output")["output_sharpening"],
+        json!(100.0)
+    );
     let set = run(&["--output-sharpening", "35"], "set");
-    assert_eq!(set["settings"]["output_sharpening"], json!(35.0));
+    assert_eq!(
+        common::node(&set, "output")["output_sharpening"],
+        json!(35.0)
+    );
     let off = run(&["--output-sharpening", "0"], "off");
-    assert_eq!(off["settings"]["output_sharpening"], json!(0.0));
+    assert_eq!(
+        common::node(&off, "output")["output_sharpening"],
+        json!(0.0)
+    );
     // The three files have three different pictures.
     let file = |dir: &str| std::fs::read(sb.root().join(dir).join("a_signature.png")).expect("png");
     let (a, b, c) = (file("default"), file("set"), file("off"));
@@ -810,10 +1444,10 @@ fn a_colour_warp_in_a_settings_file_moves_colours_and_locked_pins_alone_do_not()
     // same in every file.
     let render = |warp: Value, dir: &str| {
         let file = sb.root().join(format!("{dir}.json"));
-        let doc = json!({
+        let doc = common::field_doc(json!({
             "white_balance": { "kind": "manual", "kelvin": 2500, "tint": 30 },
             "color_warp": warp,
-        });
+        }));
         std::fs::write(&file, doc.to_string()).expect("write");
         let out = sb
             .ym()
@@ -831,7 +1465,10 @@ fn a_colour_warp_in_a_settings_file_moves_colours_and_locked_pins_alone_do_not()
         (o, pixels)
     };
     let (none, plain) = render(json!({ "pins": [] }), "none");
-    assert_eq!(none["settings"]["color_warp"], json!({ "pins": [] }));
+    assert_eq!(
+        common::node(&none, 1)["grade"]["color_warp"],
+        json!({ "pins": [] })
+    );
     // One pin on the neutral axis with the largest range moves every colour of the photo (neutrals
     // themselves never move). The file names only the source, target and range; the settings the
     // JSON reports (and the file records) have every field.
@@ -840,11 +1477,29 @@ fn a_colour_warp_in_a_settings_file_moves_colours_and_locked_pins_alone_do_not()
         "moved",
     );
     assert_eq!(
-        moved["settings"]["color_warp"]["pins"][0],
+        common::node(&moved, 1)["grade"]["color_warp"]["pins"][0],
         json!({ "source": [0.0, 0.0], "target": [0.06, 0.04], "locked": false, "range": 0.25,
-            "shadows": 1.0, "highlights": 1.0, "pivot_ev": 0.0, "exposure_ev": 0.0 })
+            "shadows": 1.0, "highlights": 1.0, "pivot_ev": 0.0, "exposure_ev": 0.0,
+            "saturation": 0.0 })
     );
     assert_ne!(warped, plain, "the warp moves the photo's colours");
+    // A pin that stays and only changes saturation is not skipped as a still pin: it changes the
+    // photo, and the settings the JSON reports keep the number. At saturation 0 (or left out) it is
+    // a still pin and the picture is the plain one, byte for byte.
+    let (saturated, more) = render(
+        json!({ "pins": [{ "source": [0.0, 0.0], "range": 0.25, "saturation": 0.6 }] }),
+        "saturated",
+    );
+    assert_eq!(
+        common::node(&saturated, 1)["grade"]["color_warp"]["pins"][0]["saturation"],
+        json!(0.6)
+    );
+    assert_ne!(more, plain, "saturation alone changes the photo's colours");
+    let (_, zero) = render(
+        json!({ "pins": [{ "source": [0.0, 0.0], "range": 0.25, "saturation": 0 }] }),
+        "zero",
+    );
+    assert_eq!(zero, plain, "a pin that changes nothing is no warp");
     // Locked pins alone change nothing, byte for byte.
     let (_, locked) = render(
         json!({ "pins": [{ "source": [0.1, 0.0], "locked": true }, { "source": [-0.05, -0.1], "locked": true, "range": 0.2 }] }),
@@ -855,7 +1510,10 @@ fn a_colour_warp_in_a_settings_file_moves_colours_and_locked_pins_alone_do_not()
     let file = sb.root().join("wild.json");
     std::fs::write(
         &file,
-        json!({ "color_warp": { "pins": [{ "source": [0.9, 0.0], "range": 3 }] } }).to_string(),
+        common::field_doc(
+            json!({ "color_warp": { "pins": [{ "source": [0.9, 0.0], "range": 3 }] } }),
+        )
+        .to_string(),
     )
     .expect("write");
     let out = sb
@@ -869,12 +1527,15 @@ fn a_colour_warp_in_a_settings_file_moves_colours_and_locked_pins_alone_do_not()
         .success();
     let o = json_lines(&out.get_output().stdout).remove(0);
     assert_eq!(
-        o["settings"]["color_warp"]["pins"][0]["source"],
+        common::node(&o, 1)["grade"]["color_warp"]["pins"][0]["source"],
         json!([0.5, 0.0])
     );
-    assert_eq!(o["settings"]["color_warp"]["pins"][0]["range"], json!(0.25));
+    assert_eq!(
+        common::node(&o, 1)["grade"]["color_warp"]["pins"][0]["range"],
+        json!(0.25)
+    );
     let err = text(&out.get_output().stderr);
-    assert!(err.contains("color_warp"), "{err}");
+    assert!(err.contains("1.grade.color_warp"), "{err}");
 }
 
 #[test]
@@ -892,7 +1553,11 @@ fn exit_code_3_when_a_look_is_missing() {
     assert!(!sb.default_export().exists());
     // A look named in the settings file that is not there fails that photo with the look code.
     let file = sb.root().join("s.json");
-    std::fs::write(&file, r#"{ "look": "user:gone" }"#).expect("write");
+    std::fs::write(
+        &file,
+        r#"{ "nodes": { "items": [ { "id": "output", "look": "user:gone" } ] } }"#,
+    )
+    .expect("write");
     let out = sb
         .ym()
         .args(["render", "--json", "--settings"])
@@ -940,6 +1605,42 @@ fn exit_code_5_when_there_is_nothing_to_render() {
     let o = &json_lines(&out.get_output().stdout)[0];
     assert_eq!(o["status"], "error");
     assert_eq!(o["error"]["kind"], "not_found");
+}
+
+/// A folder with mode 000 is not "no files to render" (exit 5): it is a failure (exit 1) that names the
+/// folder, and `--json` carries the problem with kind `unreadable` (`docs/26` H-02). Skipped as root, which
+/// can read the folder anyway (the logic is covered by unit tests with an injected read error).
+#[cfg(unix)]
+#[test]
+fn an_unreadable_folder_is_exit_1_and_named_not_exit_5() {
+    use std::os::unix::fs::PermissionsExt;
+    let sb = Sandbox::new();
+    let locked = sb.root().join("Locked");
+    std::fs::create_dir_all(&locked).expect("folder");
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+    if std::fs::read_dir(&locked).is_ok() {
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        eprintln!("skipped: this user can read a folder with mode 000 (root)");
+        return;
+    }
+    sb.ym()
+        .arg("render")
+        .arg(&locked)
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains(
+            "Yellowmoon can't read the folder Locked.",
+        ));
+    let out = sb
+        .ym()
+        .args(["render", "--json"])
+        .arg(&locked)
+        .assert()
+        .code(1);
+    let o = &json_lines(&out.get_output().stdout)[0];
+    assert_eq!(o["status"], "error");
+    assert_eq!(o["error"]["kind"], "unreadable");
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).expect("chmod");
 }
 
 #[test]
@@ -1341,6 +2042,7 @@ fn a_reader_that_goes_away_does_not_stop_the_export() {
         .env("YELLOWMOON_HOME", sb.home())
         .env("YELLOWMOON_DATA", common::data_dir())
         .env(common::NO_APPLE_AUTO.0, common::NO_APPLE_AUTO.1)
+        .env(common::NO_AUTO_PROVIDERS.0, common::NO_AUTO_PROVIDERS.1)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -1368,6 +2070,7 @@ fn ctrl_c_ends_the_run_with_130_and_deletes_the_partial_file() {
         .env("YELLOWMOON_HOME", sb.home())
         .env("YELLOWMOON_DATA", common::data_dir())
         .env(common::NO_APPLE_AUTO.0, common::NO_APPLE_AUTO.1)
+        .env(common::NO_AUTO_PROVIDERS.0, common::NO_AUTO_PROVIDERS.1)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -1408,7 +2111,7 @@ fn a_photo_whose_settings_are_refused_is_reported_and_not_exported_with_its_defa
     sb.arw_clipped("white.ARW");
     let file = sb.root().join("pick.json");
     // A white picked on a clipped patch is refused by the colour chain.
-    std::fs::write(&file, r#"{ "white.ARW": { "white_pick": [0.5, 0.5] } }"#).expect("write");
+    std::fs::write(&file, r#"{ "white.ARW": { "nodes": { "items": [ { "id": "input", "white_pick": [0.5, 0.5] } ] } } }"#).expect("write");
     let out = sb
         .ym()
         .args(["render", "--json", "--settings"])
@@ -1430,35 +2133,47 @@ fn a_photo_whose_settings_are_refused_is_reported_and_not_exported_with_its_defa
     assert_eq!(names_in(&sb.default_export()), ["good_signature.jpg"]);
 }
 
+/// Owner's decision of 2026-10-29: ARRI's display LUT is not a rendering Yellowmoon offers, so
+/// `--display` is gone. It is a usage error that says what to do, not clap's "unexpected argument",
+/// whatever it was given and before any photo is read.
 #[test]
-fn display_options_that_cannot_be_met_say_so() {
+fn the_display_option_is_gone_and_the_error_says_what_to_do() {
     let sb = Sandbox::new();
     let arw = sb.arw("a.ARW");
-    // No ARRI display LUT is imported: a look that is missing, exit code 3.
+    for words in [
+        vec!["--display", "aces2"],
+        vec!["--display", "arri"],
+        vec!["--display", "arri-display:logc4:rec709-g24"],
+        vec!["--display=bogus"],
+    ] {
+        sb.ym()
+            .arg("render")
+            .args(&words)
+            .arg(&arw)
+            .assert()
+            .code(2)
+            .stdout(predicate::str::is_empty())
+            .stderr(predicate::str::contains(
+                "--display was removed. Yellowmoon always uses its own display rendering, so there is nothing to choose. Leave the option out. To change how photos look, use --look.",
+            ));
+    }
+    // With no value at all, the photo that follows is still a photo, and it is not read either.
     sb.ym()
-        .args(["render", "--display", "arri"])
-        .arg(&arw)
-        .assert()
-        .code(3)
-        .stderr(predicate::str::contains(
-            "No ARRI display LUTs are imported",
-        ));
-    sb.ym()
-        .args(["render", "--display", "arri-display:logc4:rec709-g24"])
-        .arg(&arw)
-        .assert()
-        .code(3)
-        .stderr(predicate::str::contains("no imported display LUT"));
-    sb.ym()
-        .args(["render", "--display", "bogus"])
+        .args(["render", "--display"])
         .arg(&arw)
         .assert()
         .code(2)
-        .stderr(predicate::str::contains("is not a display rendering"));
-    assert!(!sb.default_export().exists());
-    // ACES 2 is the default and can be asked for.
+        .stderr(predicate::str::contains("--display was removed"));
+    assert!(!sb.default_export().exists(), "nothing was rendered");
+    // The option is not in the help any more.
     sb.ym()
-        .args(["render", "--display", "ACES2", "--jobs", "1"])
+        .args(["render", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--display").not());
+    // Without it the run is the same as ever.
+    sb.ym()
+        .args(["render", "--jobs", "1"])
         .arg(&arw)
         .assert()
         .success();
@@ -1475,6 +2190,7 @@ fn the_first_ctrl_c_ends_a_run_that_is_waiting_for_stdin() {
         .env("YELLOWMOON_HOME", sb.home())
         .env("YELLOWMOON_DATA", common::data_dir())
         .env(common::NO_APPLE_AUTO.0, common::NO_APPLE_AUTO.1)
+        .env(common::NO_AUTO_PROVIDERS.0, common::NO_AUTO_PROVIDERS.1)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1516,7 +2232,7 @@ fn an_exposure_offset_that_passes_the_limit_is_limited_and_said_so() {
             "the exposure is limited to +4.00 EV",
         ));
     let o = &json_lines(&out.get_output().stdout)[0];
-    assert_eq!(o["settings"]["exposure"]["ev"], 4.0);
+    assert_eq!(common::node(o, "input")["exposure"]["ev"], 4.0);
     // An offset that fits says nothing.
     sb.ym()
         .args(["render", "--overwrite", "--exposure-offset", "0.25"])
@@ -1575,5 +2291,106 @@ fn choices_are_accepted_in_any_case_like_looks_are() {
         .success();
     let o = &json_lines(&out.get_output().stdout)[0];
     assert!(o["output"].as_str().expect("output").ends_with(".tif"));
-    assert_eq!(o["settings"]["light_source"], "day");
+    assert_eq!(common::node(o, "input")["light_source"], "day");
+}
+
+/// `--auto-crop` (`docs/20-auto-crop.md` section 8): the record carries the proposal, the photo's
+/// crop is its first frame and angle with `auto`, and the same crop given as settings (what the
+/// Crop panel's Done sends) writes the same bytes.
+#[test]
+fn auto_crop_applies_the_panels_answer_and_reports_it() {
+    let sb = Sandbox::new();
+    let arw = sb.arw("a.ARW");
+    let by_flag = sb.root().join("by flag");
+    let out = sb
+        .ym()
+        .args(["render", "--json", "--cpu", "--auto-crop=1:1", "--out"])
+        .arg(&by_flag)
+        .arg(&arw)
+        .assert()
+        .success();
+    let record = json_lines(&out.get_output().stdout)
+        .into_iter()
+        .find(|o| o["status"] == "ok")
+        .expect("a record");
+    let proposal = &record["auto_crop"];
+    let frames = proposal["frames"].as_array().expect("frames");
+    assert!(!frames.is_empty() && frames.len() <= 3, "{proposal}");
+    // Square on a 4:3 photo is never the whole photo, so there is a crop.
+    let crop = &common::node(&record, "input")["crop"];
+    assert_eq!(crop["auto"], true, "{crop}");
+    assert_eq!(crop["aspect"], "square");
+    assert_eq!(crop["rect"], frames[0]["rect"]);
+    assert_eq!(crop["angle_deg"], proposal["angle_deg"]);
+
+    let settings = sb.root().join("crop.json");
+    std::fs::write(
+        &settings,
+        common::field_doc(json!({ "crop": crop })).to_string(),
+    )
+    .expect("write");
+    let by_settings = sb.root().join("by settings");
+    sb.ym()
+        .args(["render", "--cpu", "--settings"])
+        .arg(&settings)
+        .arg("--out")
+        .arg(&by_settings)
+        .arg(&arw)
+        .assert()
+        .success();
+    let name = "a_signature.jpg";
+    assert_eq!(
+        std::fs::read(by_flag.join(name)).expect("by flag"),
+        std::fs::read(by_settings.join(name)).expect("by settings"),
+        "the same crop, the same bytes"
+    );
+}
+
+#[test]
+fn auto_crop_keeps_the_whole_photo_as_no_crop_and_replaces_a_crop_from_settings() {
+    let sb = Sandbox::new();
+    let arw = sb.arw("a.ARW");
+    let settings = sb.root().join("crop.json");
+    std::fs::write(
+        &settings,
+        r#"{ "nodes": { "items": [ { "id": "input", "crop": { "rect": { "x": 0.1, "y": 0.1, "width": 0.5, "height": 0.5 }, "angle_deg": 0, "aspect": "free" } } ] } }"#,
+    )
+    .expect("write");
+    let out = sb
+        .ym()
+        .args(["render", "--json", "--cpu", "--auto-crop", "--settings"])
+        .arg(&settings)
+        .arg(&arw)
+        .assert()
+        .success();
+    let record = json_lines(&out.get_output().stdout)
+        .into_iter()
+        .find(|o| o["status"] == "ok")
+        .expect("a record");
+    let proposal = &record["auto_crop"];
+    let first = &proposal["frames"][0]["rect"];
+    let whole = first["width"].as_f64() == Some(1.0)
+        && first["height"].as_f64() == Some(1.0)
+        && proposal["angle_deg"].as_f64() == Some(0.0);
+    if whole {
+        assert_eq!(
+            common::node(&record, "input")["crop"],
+            Value::Null,
+            "{record}"
+        );
+    } else {
+        assert_eq!(common::node(&record, "input")["crop"]["rect"], *first);
+    }
+}
+
+#[test]
+fn auto_crop_takes_only_known_aspects() {
+    let sb = Sandbox::new();
+    let arw = sb.arw("a.ARW");
+    sb.ym()
+        .args(["render", "--auto-crop=2:3"])
+        .arg(&arw)
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("2:3 is not an aspect"));
 }

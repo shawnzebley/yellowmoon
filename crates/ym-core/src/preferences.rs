@@ -1,5 +1,5 @@
-//! `preferences.json` under the app data folder: the default look, the display rendering, the
-//! export defaults and the other persisted choices. This list is exhaustive (`docs/01-architecture.md`
+//! `preferences.json` under the app data folder: the default look, the export defaults and the
+//! other persisted choices. This list is exhaustive (`docs/01-architecture.md`
 //! section Persistence, hard rule 4 of `AGENTS.md`): nothing about a photo is ever saved.
 //!
 //! # Where
@@ -14,7 +14,10 @@
 //! Reading never fails and never crashes the app:
 //!
 //! * a missing file is the defaults (and is not created until something is changed);
-//! * a field that is missing takes its default; a field this version does not know is ignored;
+//! * a field that is missing takes its default; a field this version does not know is ignored,
+//!   without a warning (a file written by an earlier version may hold `display_rendering`, the
+//!   choice of ARRI's display LUT that Yellowmoon no longer offers: it is read as nothing and left
+//!   out of the file the next time a preference changes);
 //! * a field with a value that does not fit (a JPEG quality of 12, a look id that is not an id) takes
 //!   its default and the rest of the file is kept;
 //! * a file that is not JSON, or not an object, is all defaults.
@@ -32,6 +35,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use crate::apple_auto::{DEFAULT_INSTRUCTIONS, check_instructions};
+use crate::auto_provider::{AutoConsent, AutoProvider};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -49,21 +53,6 @@ pub const DEFAULT_LOOK: &str = "builtin:signature";
 /// The id of Neutral, the identity look. It exists in code whatever the data folder holds, so it is
 /// the look to fall back on when the default look cannot be used.
 pub const NEUTRAL_LOOK: &str = "builtin:neutral";
-
-/// Preferences › Display rendering: our ACES 2 output transform, or an imported ARRI display LUT
-/// (`src/api/types.ts`: `DisplayRendering`).
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum DisplayRendering {
-    /// Ours: the ACES 2 output transform.
-    #[default]
-    Aces2,
-    /// An imported ARRI display LUT, by its id (`arri-display:logc4:rec709-g24`).
-    ArriDisplay {
-        /// The display LUT.
-        id: LookId,
-    },
-}
 
 /// Folders remembered between runs (`LastUsedFolders` in `src/api/types.ts`).
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -83,8 +72,6 @@ pub struct LastUsedFolders {
 pub struct Preferences {
     /// The look new photos get ([`DEFAULT_LOOK`], Signature, out of the box).
     pub default_look: LookId,
-    /// ACES 2 or an imported ARRI display LUT.
-    pub display_rendering: DisplayRendering,
     /// Format, quality, bits, compression, colour space, size, destination, name template and
     /// what to do when the file exists.
     pub export_defaults: ExportOptions,
@@ -96,28 +83,41 @@ pub struct Preferences {
     pub watch_downloads_during_import: bool,
     /// The folders used last.
     pub last_used_folders: LastUsedFolders,
-    /// "Auto with Apple Intelligence" (`docs/19` section 2): on by default, and a file without the
-    /// field reads as on. Read on every platform; it acts only where Apple Auto is available.
-    pub apple_auto: bool,
-    /// "Instructions for Apple Intelligence" (`docs/19` section 2): the person's own instructions for
-    /// Apple Auto's model, at most [`crate::apple_auto::INSTRUCTIONS_MAX_CHARS`] characters; `""` (absent, empty or only
+    /// "Auto grading" (`docs/22` section 10.1): who grades each photo's Auto, Apple Intelligence by
+    /// default. A provider that is not available (or not agreed to, [`Preferences::auto_consent`]) at
+    /// run time acts as Default Auto, and the choice stays saved. A file from before
+    /// providers has `apple_auto` instead, which reads as this field (`false` is `yellowmoon`) and is
+    /// never written again.
+    pub auto_provider: AutoProvider,
+    /// Whether the person agreed to send photos through Claude Code and through Antigravity
+    /// (`docs/22` section 10.2). Both false by default; saved together with the choice that needs
+    /// it, and a patch cannot choose a cloud provider without it.
+    pub auto_consent: AutoConsent,
+    /// "Instructions" for the Auto grading (`docs/19` section 2, one text for every provider,
+    /// `docs/22` D1): the person's own instructions for the model, at most
+    /// [`crate::apple_auto::INSTRUCTIONS_MAX_CHARS`] characters; `""` (absent, empty or only
     /// white space) is the default, [`crate::apple_auto::DEFAULT_INSTRUCTIONS`]. Saved as `""` when
     /// it equals the default.
     pub apple_auto_instructions: String,
+    /// "Single-key shortcuts" (`docs/28` A-P11): on (the default) keeps P, Z, C, W, N, F, B, M, A,
+    /// `\`, 1 to 9, Delete and Backspace as shortcuts outside a text box; off leaves them to speech
+    /// input and screen readers, and every action stays in the menu bar. The webview reads it.
+    pub single_key_shortcuts: bool,
 }
 
 impl Default for Preferences {
     fn default() -> Self {
         Self {
             default_look: LookId::factory_default(),
-            display_rendering: DisplayRendering::Aces2,
             export_defaults: ExportOptions::default(),
             remove_location_from_exports: false,
             check_for_updates_automatically: true,
             watch_downloads_during_import: false,
             last_used_folders: LastUsedFolders::default(),
-            apple_auto: true,
+            auto_provider: AutoProvider::Apple,
+            auto_consent: AutoConsent::default(),
             apple_auto_instructions: String::new(),
+            single_key_shortcuts: true,
         }
     }
 }
@@ -131,9 +131,6 @@ pub struct PreferencesPatch {
     /// Replaces `default_look`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_look: Option<LookId>,
-    /// Replaces `display_rendering`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub display_rendering: Option<DisplayRendering>,
     /// Replaces `export_defaults`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub export_defaults: Option<ExportOptions>,
@@ -149,13 +146,20 @@ pub struct PreferencesPatch {
     /// Replaces `last_used_folders`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_used_folders: Option<LastUsedFolders>,
-    /// Replaces `apple_auto`.
+    /// Replaces `auto_provider`. Choosing Claude Code or Antigravity needs its `auto_consent` to be
+    /// true after the patch ([`PreferencesPatch::check_against`]).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub apple_auto: Option<bool>,
+    pub auto_provider: Option<AutoProvider>,
+    /// Replaces the whole `auto_consent`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auto_consent: Option<AutoConsent>,
     /// Replaces `apple_auto_instructions` (`""` or the default text: the default). Checked by
     /// [`PreferencesPatch::check`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub apple_auto_instructions: Option<String>,
+    /// Replaces `single_key_shortcuts`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub single_key_shortcuts: Option<bool>,
 }
 
 impl PreferencesPatch {
@@ -164,9 +168,6 @@ impl PreferencesPatch {
         let before = prefs.clone();
         if let Some(v) = &self.default_look {
             prefs.default_look = v.clone();
-        }
-        if let Some(v) = &self.display_rendering {
-            prefs.display_rendering = v.clone();
         }
         if let Some(v) = &self.export_defaults {
             prefs.export_defaults = v.clone();
@@ -183,17 +184,24 @@ impl PreferencesPatch {
         if let Some(v) = &self.last_used_folders {
             prefs.last_used_folders = v.clone();
         }
-        if let Some(v) = self.apple_auto {
-            prefs.apple_auto = v;
+        if let Some(v) = self.auto_provider {
+            prefs.auto_provider = v;
+        }
+        if let Some(v) = self.auto_consent {
+            prefs.auto_consent = v;
         }
         if let Some(v) = &self.apple_auto_instructions {
             prefs.apple_auto_instructions = own_instructions(v);
         }
+        if let Some(v) = self.single_key_shortcuts {
+            prefs.single_key_shortcuts = v;
+        }
         *prefs != before
     }
 
-    /// Checks the values the core refuses rather than saves: instructions for Apple Intelligence
-    /// longer than [`crate::apple_auto::INSTRUCTIONS_MAX_CHARS`] characters.
+    /// Checks the values the core refuses rather than saves, those that can be judged from the patch
+    /// alone: instructions longer than [`crate::apple_auto::INSTRUCTIONS_MAX_CHARS`] characters. The
+    /// consent rule needs the saved preferences too ([`PreferencesPatch::check_against`]).
     ///
     /// # Errors
     ///
@@ -203,6 +211,31 @@ impl PreferencesPatch {
             check_instructions(text).map_err(PreferencesError::Invalid)?;
         }
         Ok(())
+    }
+
+    /// [`PreferencesPatch::check`] and the consent rule of `docs/22` section 10.2: a patch that makes
+    /// `auto_provider` Claude Code or Antigravity is refused when `auto_consent` for it is not true
+    /// after the patch is applied to `current` ("Say yes to sending photos to Claude Code first.").
+    /// Choosing Default Auto or Apple Intelligence is always allowed, available or not.
+    /// [`PreferencesStore::update`] calls this against the file's current content.
+    ///
+    /// # Errors
+    ///
+    /// [`PreferencesError::Invalid`] with the message to show.
+    pub fn check_against(&self, current: &Preferences) -> Result<(), PreferencesError> {
+        self.check()?;
+        let Some(provider) = self.auto_provider.filter(|p| p.is_cloud()) else {
+            return Ok(());
+        };
+        let consent = self.auto_consent.unwrap_or(current.auto_consent);
+        if consent.get(provider) {
+            Ok(())
+        } else {
+            Err(PreferencesError::Invalid(format!(
+                "Say yes to sending photos to {} first.",
+                provider.name()
+            )))
+        }
     }
 
     /// A patch that sets only the default look.
@@ -226,6 +259,12 @@ pub fn own_instructions(text: &str) -> String {
     }
 }
 
+/// The folder a preferences file is in, for the sentence (the file's own name means nothing to the
+/// person).
+fn folder_of(path: &std::path::Path) -> String {
+    path.parent().unwrap_or(path).display().to_string()
+}
+
 /// Why preferences could not be changed or saved. The text is plain words with a next step.
 #[derive(Debug, thiserror::Error)]
 pub enum PreferencesError {
@@ -234,8 +273,8 @@ pub enum PreferencesError {
     NoHome(#[from] LibraryError),
     /// The file could not be written.
     #[error(
-        "Couldn't save your preferences to {}: {source}. Check that the folder is writable and has free space.",
-        path.display()
+        "Yellowmoon couldn't save your preferences. Check that the disk has free space and that you can save to {}.",
+        folder_of(path)
     )]
     Write {
         /// The file.
@@ -329,6 +368,33 @@ where
     Some(serde_json::from_value(Value::Object(merged)).unwrap_or_default())
 }
 
+/// Reads `auto_consent` (`docs/22` section 10.1): a missing key is false, keys of other names are
+/// dropped, a value that is not a boolean is false with a warning, and a value that is not an object
+/// is all false with a warning.
+fn parse_consent(value: Value, warnings: &mut Vec<String>) -> AutoConsent {
+    let Value::Object(fields) = value else {
+        warnings.push(
+            "Preference \"auto_consent\" is not a group of settings, so no consent is used."
+                .to_owned(),
+        );
+        return AutoConsent::default();
+    };
+    let mut read = |name: &str| match fields.get(name) {
+        None => false,
+        Some(Value::Bool(b)) => *b,
+        Some(_) => {
+            warnings.push(format!(
+                "Preference \"auto_consent.{name}\" has a value that can't be used, so its default is used."
+            ));
+            false
+        }
+    };
+    AutoConsent {
+        claude: read("claude"),
+        agy: read("agy"),
+    }
+}
+
 /// Reads the text of a preferences file (see the module documentation for what is forgiven).
 #[must_use]
 pub fn parse(text: &str) -> ParsedPreferences {
@@ -359,9 +425,6 @@ pub fn parse(text: &str) -> ParsedPreferences {
     if let Some(v) = take(&mut map, "default_look", &mut warnings) {
         p.default_look = v;
     }
-    if let Some(v) = take(&mut map, "display_rendering", &mut warnings) {
-        p.display_rendering = v;
-    }
     if let Some(v) = take_struct(&mut map, "export_defaults", &mut warnings) {
         p.export_defaults = v;
     }
@@ -374,8 +437,40 @@ pub fn parse(text: &str) -> ParsedPreferences {
     if let Some(v) = take(&mut map, "watch_downloads_during_import", &mut warnings) {
         p.watch_downloads_during_import = v;
     }
-    if let Some(v) = take(&mut map, "apple_auto", &mut warnings) {
-        p.apple_auto = v;
+    if let Some(v) = take(&mut map, "single_key_shortcuts", &mut warnings) {
+        p.single_key_shortcuts = v;
+    }
+    // The provider: a valid `auto_provider` wins; a file from before providers has `apple_auto`
+    // (`false` is Default Auto, `true` or absent is Apple); `apple_auto` is never written
+    // again (`docs/22` section 10.1, decision D15).
+    let legacy = map.remove("apple_auto");
+    let provider = match map.remove("auto_provider") {
+        None => None,
+        Some(value) => match serde_json::from_value::<AutoProvider>(value) {
+            Ok(v) => Some(v),
+            Err(_) => {
+                warnings.push(
+                    "Preference \"auto_provider\" can't be used, so the default is used."
+                        .to_owned(),
+                );
+                None
+            }
+        },
+    };
+    p.auto_provider = match (provider, legacy) {
+        (Some(v), _) => v,
+        (None, Some(Value::Bool(false))) => AutoProvider::Yellowmoon,
+        (None, Some(Value::Bool(true)) | None) => AutoProvider::Apple,
+        (None, Some(_)) => {
+            warnings.push(
+                "Preference \"apple_auto\" has a value that can't be used, so its default is used."
+                    .to_owned(),
+            );
+            AutoProvider::Apple
+        }
+    };
+    if let Some(v) = map.remove("auto_consent") {
+        p.auto_consent = parse_consent(v, &mut warnings);
     }
     if let Some(v) = take::<String>(&mut map, "apple_auto_instructions", &mut warnings) {
         // Longer than the model takes (a file edited by hand): the default, with a warning.
@@ -520,12 +615,16 @@ impl PreferencesStore {
     ///
     /// # Errors
     ///
-    /// [`PreferencesError::Invalid`] for export defaults the writers cannot use,
+    /// [`PreferencesError::Invalid`] for export defaults the writers cannot use, for too long
+    /// instructions and for a cloud provider without its consent,
     /// [`PreferencesError::Write`] or [`PreferencesError::Encode`] when the file cannot be saved.
     /// Nothing changes on an error.
     pub fn update(&self, patch: &PreferencesPatch) -> Result<Preferences, PreferencesError> {
         patch.check()?;
         self.modify(|prefs| {
+            // The consent rule reads the file's current consent, which a patch without
+            // `auto_consent` leaves as it is.
+            patch.check_against(prefs)?;
             patch.apply(prefs);
             Ok(())
         })
@@ -595,40 +694,229 @@ mod tests {
         assert_eq!(p.default_look.as_str(), DEFAULT_LOOK);
         assert_eq!(DEFAULT_LOOK, "builtin:signature");
         assert_eq!(NEUTRAL_LOOK, "builtin:neutral");
-        assert_eq!(p.display_rendering, DisplayRendering::Aces2);
         assert_eq!(p.export_defaults, ExportOptions::default());
         assert!(!p.remove_location_from_exports);
         assert!(p.check_for_updates_automatically);
         assert!(!p.watch_downloads_during_import);
         assert_eq!(p.last_used_folders, LastUsedFolders::default());
+        assert_eq!(
+            p.auto_provider,
+            AutoProvider::Apple,
+            "Apple Intelligence is the default where it is available (docs/22 O3)"
+        );
+        assert_eq!(p.auto_consent, AutoConsent::default());
+        assert_eq!(p.apple_auto_instructions, "");
         assert!(
-            p.apple_auto,
-            "Apple Auto is on by default (docs/19 section 2)"
+            p.single_key_shortcuts,
+            "single-key shortcuts are on by default (docs/28 A-P11)"
         );
     }
 
     #[test]
-    fn apple_auto_is_on_unless_the_file_says_off() {
-        // A file from before Apple Auto has no field: on. A value that is not a switch costs only
-        // that value. A patch turns it off and on.
-        assert!(
-            parse(r#"{ "remove_location_from_exports": true }"#)
-                .preferences
-                .apple_auto
+    fn the_provider_migrates_from_the_old_switch() {
+        let provider = |text: &str| parse(text).preferences.auto_provider;
+        // Nothing, or the old switch on: Apple Intelligence. The old switch off: Default Auto.
+        assert_eq!(provider("{}"), AutoProvider::Apple);
+        assert_eq!(
+            provider(r#"{ "remove_location_from_exports": true }"#),
+            AutoProvider::Apple
         );
-        assert!(!parse(r#"{ "apple_auto": false }"#).preferences.apple_auto);
-        let bad = parse(r#"{ "apple_auto": "yes", "remove_location_from_exports": true }"#);
-        assert!(bad.preferences.apple_auto && bad.preferences.remove_location_from_exports);
-        assert_eq!(bad.warnings.len(), 1);
-        let mut p = Preferences::default();
-        let off = PreferencesPatch {
-            apple_auto: Some(false),
+        assert_eq!(provider(r#"{ "apple_auto": true }"#), AutoProvider::Apple);
+        assert_eq!(
+            provider(r#"{ "apple_auto": false }"#),
+            AutoProvider::Yellowmoon
+        );
+        // A valid `auto_provider` wins over the old switch, which is ignored.
+        for (text, want) in [
+            (
+                r#"{ "auto_provider": "claude", "apple_auto": false }"#,
+                AutoProvider::Claude,
+            ),
+            (r#"{ "auto_provider": "agy" }"#, AutoProvider::Agy),
+            (
+                r#"{ "auto_provider": "yellowmoon", "apple_auto": true }"#,
+                AutoProvider::Yellowmoon,
+            ),
+            (
+                r#"{ "auto_provider": "apple", "apple_auto": "yes" }"#,
+                AutoProvider::Apple,
+            ),
+        ] {
+            let parsed = parse(text);
+            assert_eq!(parsed.preferences.auto_provider, want, "{text}");
+            assert!(parsed.warnings.is_empty(), "{text}: {:?}", parsed.warnings);
+        }
+        // A name that is not a provider is read as absent, with the warning; then the old switch decides.
+        let bad = parse(
+            r#"{ "auto_provider": "gemini", "apple_auto": false, "remove_location_from_exports": true }"#,
+        );
+        assert_eq!(bad.preferences.auto_provider, AutoProvider::Yellowmoon);
+        assert!(bad.preferences.remove_location_from_exports);
+        assert_eq!(
+            bad.warnings,
+            ["Preference \"auto_provider\" can't be used, so the default is used."]
+        );
+        let worse = parse(r#"{ "auto_provider": 7 }"#);
+        assert_eq!(worse.preferences.auto_provider, AutoProvider::Apple);
+        assert_eq!(worse.warnings.len(), 1);
+        // An old switch that is not a switch costs only that value.
+        let odd = parse(r#"{ "apple_auto": "yes", "remove_location_from_exports": true }"#);
+        assert!(odd.preferences.remove_location_from_exports);
+        assert_eq!(odd.preferences.auto_provider, AutoProvider::Apple);
+        assert_eq!(odd.warnings.len(), 1);
+        // The next save writes `auto_provider` and `auto_consent` and drops `apple_auto`.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(FILE_NAME),
+            r#"{ "apple_auto": false, "check_for_updates_automatically": false }"#,
+        )
+        .unwrap();
+        let store = PreferencesStore::open(dir.path());
+        assert_eq!(store.get().auto_provider, AutoProvider::Yellowmoon);
+        store
+            .update(&PreferencesPatch {
+                watch_downloads_during_import: Some(true),
+                ..PreferencesPatch::default()
+            })
+            .unwrap();
+        let saved: Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.path().join(FILE_NAME)).unwrap())
+                .unwrap();
+        assert!(saved.get("apple_auto").is_none(), "{saved}");
+        assert_eq!(saved["auto_provider"], "yellowmoon");
+        assert_eq!(
+            saved["auto_consent"],
+            serde_json::json!({ "claude": false, "agy": false })
+        );
+        assert_eq!(saved["check_for_updates_automatically"], false);
+        assert_eq!(
+            PreferencesStore::open(dir.path()).get().auto_provider,
+            AutoProvider::Yellowmoon
+        );
+    }
+
+    #[test]
+    fn consent_reads_forgivingly() {
+        let consent = |text: &str| parse(text).preferences.auto_consent;
+        assert_eq!(consent("{}"), AutoConsent::default());
+        assert_eq!(
+            consent(r#"{ "auto_consent": { "claude": true, "agy": true } }"#),
+            AutoConsent {
+                claude: true,
+                agy: true
+            }
+        );
+        // A missing key is false; keys of other names are dropped.
+        let parsed = parse(r#"{ "auto_consent": { "claude": true, "gemini": true } }"#);
+        assert_eq!(
+            parsed.preferences.auto_consent,
+            AutoConsent {
+                claude: true,
+                agy: false
+            }
+        );
+        assert!(parsed.warnings.is_empty(), "{:?}", parsed.warnings);
+        // A value that is not a boolean is false, with a warning; the other key is kept.
+        let parsed = parse(r#"{ "auto_consent": { "claude": "yes", "agy": true } }"#);
+        assert_eq!(
+            parsed.preferences.auto_consent,
+            AutoConsent {
+                claude: false,
+                agy: true
+            }
+        );
+        assert_eq!(parsed.warnings.len(), 1, "{:?}", parsed.warnings);
+        // A value that is not a group is all false, with a warning.
+        let parsed = parse(r#"{ "auto_consent": true, "remove_location_from_exports": true }"#);
+        assert_eq!(parsed.preferences.auto_consent, AutoConsent::default());
+        assert!(parsed.preferences.remove_location_from_exports);
+        assert_eq!(parsed.warnings.len(), 1);
+        // A file with a cloud choice and no consent is kept as it is.
+        let kept = parse(r#"{ "auto_provider": "claude" }"#);
+        assert_eq!(kept.preferences.auto_provider, AutoProvider::Claude);
+        assert_eq!(kept.preferences.auto_consent, AutoConsent::default());
+        assert!(kept.warnings.is_empty());
+    }
+
+    #[test]
+    fn a_patch_cannot_choose_a_cloud_provider_without_its_consent() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PreferencesStore::open(dir.path());
+        let choose = |p: AutoProvider| PreferencesPatch {
+            auto_provider: Some(p),
             ..PreferencesPatch::default()
         };
-        assert!(off.apply(&mut p) && !p.apple_auto);
-        assert!(!off.apply(&mut p));
-        let patch: PreferencesPatch = serde_json::from_str(r#"{ "apple_auto": true }"#).unwrap();
-        assert!(patch.apply(&mut p) && p.apple_auto);
+        // Refused: no consent saved, none in the patch; nothing is written.
+        for (p, name) in [
+            (AutoProvider::Claude, "Claude Code"),
+            (AutoProvider::Agy, "Antigravity"),
+        ] {
+            let err = store.update(&choose(p)).expect_err("refused");
+            assert!(
+                matches!(&err, PreferencesError::Invalid(m) if *m == format!("Say yes to sending photos to {name} first.")),
+                "{err}"
+            );
+        }
+        assert!(!dir.path().join(FILE_NAME).exists());
+        // Refused too when the patch's consent is for the other program.
+        let wrong = PreferencesPatch {
+            auto_provider: Some(AutoProvider::Claude),
+            auto_consent: Some(AutoConsent {
+                claude: false,
+                agy: true,
+            }),
+            ..PreferencesPatch::default()
+        };
+        assert!(store.update(&wrong).is_err());
+        // Accepted with its consent in the same patch: one atomic save.
+        let both = PreferencesPatch {
+            auto_provider: Some(AutoProvider::Claude),
+            auto_consent: Some(AutoConsent {
+                claude: true,
+                agy: false,
+            }),
+            ..PreferencesPatch::default()
+        };
+        let saved = store.update(&both).unwrap();
+        assert_eq!(saved.auto_provider, AutoProvider::Claude);
+        assert_eq!(
+            saved.auto_consent,
+            AutoConsent {
+                claude: true,
+                agy: false
+            }
+        );
+        // With the consent saved, a patch that names only the provider is accepted at once.
+        store.update(&choose(AutoProvider::Yellowmoon)).unwrap();
+        assert_eq!(
+            store
+                .update(&choose(AutoProvider::Claude))
+                .unwrap()
+                .auto_provider,
+            AutoProvider::Claude
+        );
+        // Antigravity is still refused: its consent was never given.
+        assert!(store.update(&choose(AutoProvider::Agy)).is_err());
+        assert_eq!(store.get().auto_provider, AutoProvider::Claude);
+        // Default Auto and Apple Intelligence are always allowed, consent or not.
+        let fresh = PreferencesStore::open(tempfile::tempdir().unwrap().path());
+        for p in [AutoProvider::Yellowmoon, AutoProvider::Apple] {
+            assert!(fresh.update(&choose(p)).is_ok(), "{p:?}");
+        }
+        // The patch alone is judged by `check_against`, not by `check`.
+        assert!(choose(AutoProvider::Agy).check().is_ok());
+        assert!(
+            choose(AutoProvider::Agy)
+                .check_against(&Preferences::default())
+                .is_err()
+        );
+        // A patch with the old switch is an error, so the webview and `ym` never send it.
+        assert!(serde_json::from_str::<PreferencesPatch>(r#"{ "apple_auto": false }"#).is_err());
+        let patch: PreferencesPatch = serde_json::from_str(
+            r#"{ "auto_provider": "agy", "auto_consent": { "claude": false, "agy": true } }"#,
+        )
+        .unwrap();
+        assert!(patch.check_against(&Preferences::default()).is_ok());
     }
 
     #[test]
@@ -659,11 +947,11 @@ mod tests {
         // Too long (a file edited by hand), or not text: the default, with a warning; the rest is kept.
         let long = serde_json::json!({
             "apple_auto_instructions": "x".repeat(2001),
-            "apple_auto": false,
+            "auto_provider": "yellowmoon",
         });
         let parsed = parse(&long.to_string());
         assert_eq!(parsed.preferences.apple_auto_instructions, "");
-        assert!(!parsed.preferences.apple_auto);
+        assert_eq!(parsed.preferences.auto_provider, AutoProvider::Yellowmoon);
         assert_eq!(parsed.warnings.len(), 1);
         assert!(
             parsed.warnings[0].contains("At most 2000"),
@@ -725,9 +1013,8 @@ mod tests {
             json,
             serde_json::json!({
                 "default_look": "builtin:signature",
-                "display_rendering": { "kind": "aces2" },
                 "export_defaults": {
-                    "format": "jpeg", "jpeg_quality": 92, "bit_depth": 16, "tiff_compression": "lzw",
+                    "format": "jpeg", "jpeg_quality": 92, "bit_depth": 16, "tiff_compression": "zip",
                     "color_space": "srgb", "size": { "kind": "full" }, "destination": null,
                     "name_template": "{name}_{look}", "if_exists": "keep_both"
                 },
@@ -735,17 +1022,55 @@ mod tests {
                 "check_for_updates_automatically": true,
                 "watch_downloads_during_import": false,
                 "last_used_folders": { "open": null, "export": null, "looks_import": null },
-                "apple_auto": true,
-                "apple_auto_instructions": ""
+                "auto_provider": "apple",
+                "auto_consent": { "claude": false, "agy": false },
+                "apple_auto_instructions": "",
+                "single_key_shortcuts": true
             })
         );
-        let arri = DisplayRendering::ArriDisplay {
-            id: LookId::parse("arri-display:logc4:rec709-g24").expect("id"),
-        };
-        assert_eq!(
-            serde_json::to_value(&arri).expect("json"),
-            serde_json::json!({ "kind": "arri_display", "id": "arri-display:logc4:rec709-g24" })
+    }
+
+    /// Yellowmoon no longer offers ARRI's display LUT as the rendering (owner's decision of
+    /// 2026-10-29). A file saved by an earlier version still holds the choice: it is read as
+    /// nothing, with no warning, and the next change leaves it out of the file.
+    #[test]
+    fn a_saved_choice_of_arris_display_rendering_is_ignored_and_dropped_on_the_next_change() {
+        let dir = root();
+        let path = dir.path().join(FILE_NAME);
+        std::fs::write(
+            &path,
+            r#"{
+                "default_look": "arri:3000:film",
+                "display_rendering": { "kind": "arri_display", "id": "arri-display:logc4:rec709-g24" },
+                "check_for_updates_automatically": false
+            }"#,
+        )
+        .expect("write");
+        let before = std::fs::read(&path).expect("read");
+        let store = PreferencesStore::open(dir.path());
+        assert!(store.warnings().is_empty(), "{:?}", store.warnings());
+        let read = store.get();
+        assert_eq!(read.default_look.as_str(), "arri:3000:film");
+        assert!(!read.check_for_updates_automatically);
+        // Reading changes nothing on disk.
+        assert_eq!(std::fs::read(&path).expect("read"), before);
+
+        let next = store
+            .update(&PreferencesPatch {
+                remove_location_from_exports: Some(true),
+                ..PreferencesPatch::default()
+            })
+            .expect("saved");
+        assert!(next.remove_location_from_exports);
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).expect("read")).expect("json");
+        assert!(saved.get("display_rendering").is_none(), "{saved}");
+        assert_eq!(saved["default_look"], "arri:3000:film");
+        // The patch type has no such field any more: a script that still sends one is told.
+        let patch: Result<PreferencesPatch, _> = serde_json::from_str(
+            r#"{ "display_rendering": { "kind": "arri_display", "id": "arri-display:logc4:rec709-g24" } }"#,
         );
+        assert!(patch.is_err());
     }
 
     #[test]
@@ -830,8 +1155,7 @@ mod tests {
                 "default_look": "not a look id",
                 "check_for_updates_automatically": false,
                 "export_defaults": { "format": "tiff", "jpeg_quality": 12, "bit_depth": 8 },
-                "last_used_folders": { "open": 5, "export": "/tmp/x" },
-                "display_rendering": { "kind": "mystery" }
+                "last_used_folders": { "open": 5, "export": "/tmp/x" }
             }"#,
         );
         assert_eq!(
@@ -847,8 +1171,7 @@ mod tests {
             p.preferences.last_used_folders.export,
             Some(PathBuf::from("/tmp/x"))
         );
-        assert_eq!(p.preferences.display_rendering, DisplayRendering::Aces2);
-        assert_eq!(p.warnings.len(), 4, "{:?}", p.warnings);
+        assert_eq!(p.warnings.len(), 3, "{:?}", p.warnings);
         assert!(p.warnings.iter().any(|w| w.contains("jpeg_quality")));
     }
 
@@ -878,6 +1201,43 @@ mod tests {
         let again = PreferencesStore::open(dir.path());
         assert!(again.get().watch_downloads_during_import);
         assert!(again.warnings().is_empty());
+    }
+
+    /// "Single-key shortcuts" (`docs/28` A-P11) is saved when it changes, read back as a fresh start
+    /// reads it, and a file from before it reads as on.
+    #[test]
+    fn single_key_shortcuts_survive_a_restart_and_default_to_on() {
+        let dir = root();
+        let path = dir.path().join(FILE_NAME);
+        std::fs::write(&path, r#"{ "default_look": "builtin:neutral" }"#).expect("write");
+        let store = PreferencesStore::open(dir.path());
+        assert!(
+            store.get().single_key_shortcuts,
+            "a file without the field reads as on"
+        );
+        assert!(store.warnings().is_empty());
+        store
+            .update(&PreferencesPatch {
+                single_key_shortcuts: Some(false),
+                ..PreferencesPatch::default()
+            })
+            .expect("saved");
+        let text = std::fs::read_to_string(&path).expect("read");
+        assert!(text.contains("\"single_key_shortcuts\": false"), "{text}");
+        let restarted = PreferencesStore::open(dir.path());
+        assert!(!restarted.get().single_key_shortcuts);
+        assert_eq!(restarted.get().default_look.as_str(), "builtin:neutral");
+        assert!(restarted.warnings().is_empty());
+        // A value that does not fit takes the default and says so; the rest is kept.
+        std::fs::write(
+            &path,
+            r#"{ "single_key_shortcuts": "no", "remove_location_from_exports": true }"#,
+        )
+        .expect("write");
+        let odd = PreferencesStore::open(dir.path());
+        assert!(odd.get().single_key_shortcuts);
+        assert!(odd.get().remove_location_from_exports);
+        assert_eq!(odd.warnings().len(), 1);
     }
 
     /// Runs `f` and returns what it logged at info level and above (the application's default).
@@ -1050,10 +1410,10 @@ mod tests {
             })
             .expect_err("cannot write");
         assert!(matches!(err, PreferencesError::Write { .. }), "{err}");
-        assert!(
-            err.to_string()
-                .contains("Check that the folder is writable")
-        );
+        assert!(err.to_string().starts_with(
+            "Yellowmoon couldn't save your preferences. Check that the disk has free space"
+        ));
+        assert!(!err.to_string().contains("os error"), "{err}");
         assert!(!store.get().remove_location_from_exports);
     }
 }

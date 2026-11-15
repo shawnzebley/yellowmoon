@@ -79,7 +79,9 @@ textarea,
 .ym-export__example,
 .ym-export__folder-text,
 .ym-export__problem,
+.ym-export__banner,
 .ym-pref__hint,
+.ym-pref__note,
 .ym-about-dialog__version,
 .ym-about-dialog__section,
 .ym-about-dialog__adobe,
@@ -115,6 +117,7 @@ textarea,
 [contenteditable]:not([contenteditable="false"]),
 .ym-export__code,
 .ym-pref__hint,
+.ym-pref__note,
 .ym-error-bar [data-slot="item-content"],
 .ym-wizard__callout--error [data-slot="item-content"],
 .ym-develop__notice {
@@ -132,6 +135,7 @@ a {
 .ym-tools__scroll,
 .ym-dialog__body,
 .ym-menu__list,
+.ym-add-mask-menu,
 .ym-wizard__main,
 .ym-develop-list,
 .ym-step-rail,
@@ -169,7 +173,7 @@ summary:focus-visible,
 [role="radio"]:focus-visible,
 [role="tab"]:focus-visible,
 [role="slider"]:focus-visible {
-  outline: 3px solid var(--focus);
+  outline: var(--ym-focus-width, 3px) solid var(--focus);
   outline-offset: 2px;
 }
 
@@ -184,4 +188,12 @@ summary:focus-visible,
     animation-duration: 0.001ms !important;
     transition-property: none !important;
   }
+}
+
+/* The twin of the query above, for the system setting the shell reads (docs/28 A-P12; see glass.css). */
+:root[data-reduce-motion] *,
+:root[data-reduce-motion] *::before,
+:root[data-reduce-motion] *::after {
+  animation-duration: 0.001ms !important;
+  transition-property: none !important;
 }

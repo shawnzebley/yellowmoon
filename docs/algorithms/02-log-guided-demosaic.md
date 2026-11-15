@@ -1,13 +1,12 @@
 # 02 · Log-guided fast demosaic
 
-A fast Bayer demosaic for previews and thumbnails. It builds a luminance guide in the log domain, then fills each missing channel from the mean of its neighbours scaled by the local guide ratio. Green at red and blue sites blends a horizontal and a vertical estimate with inverse-cube structure weights. The fixed-point form needs only 16-bit integers, two cubic polynomials, five small neighbourhood passes and one division per interpolated sample.
+A fast Bayer demosaic for previews and thumbnails. It builds a luminance guide in the log domain, then fills each missing channel from the mean of its neighbours scaled by the local guide ratio. Green at red and blue sites blends a horizontal and a vertical estimate with inverse-cube structure weights. The fixed-point form needs only 16-bit integers, two cubic polynomials, five small neighbourhood passes and one division per interpolated sample. The method Yellowmoon ships runs the all-float form (section 3.9); no render path uses the method today (section 9.3).
 
 | | |
 |---|---|
-| Package name | Log-guided fast demosaic |
-| Yellowmoon home | `Method::LogGuided` in `ym-gpu/src/cpu/demosaic.rs` (R6, classical family) |
-| Reference | `reference/log_guided_demosaic.cpp` (`demosaic_fixed`, `demosaic_float`) |
-| Vectors | `vectors/log_guided_demosaic/*.json` (16 files) |
+| Method | `Method::LogGuided` in `crates/ym-gpu/src/cpu/demosaic.rs` (R6, classical family). CPU: `cpu/demosaic/log_guided.rs`. Device: `shaders/log_guided.wgsl` |
+| Oracle | an independent C++ implementation outside the repository (`demosaic_fixed`, `demosaic_float`) |
+| Vectors | `crates/ym-gpu/tests/cpu_data/log_guided_demosaic/*.json` (16 files) |
 | Halo | 5 px (receptive-field radius) |
 
 ---
@@ -16,13 +15,13 @@ A fast Bayer demosaic for previews and thumbnails. It builds a luminance guide i
 
 ### 1.1 What it is for
 
-`docs/01` (Preview strategy) renders the fit view and the thumbnails with the classical path, and the full-resolution tiles are slow to arrive. This method stands in for Menon wherever those renders demosaic at full resolution. It costs a few times a bilinear demosaic, and in the reference's tests it gains 1.5 to 4.6 dB PSNR over bilinear (section 6.4). It is not meant for export.
+The method is a fast alternative to Menon for renders that need a demosaic at preview quality. It costs about half of Menon's CPU time and a few times a bilinear demosaic, and on the oracle's 40×40 test scenes it gains 1.5 to 4.6 dB PSNR over bilinear (section 9.2). It is not meant for export.
 
-Where it runs in Yellowmoon:
+Where it sits in Yellowmoon:
 
-- **R6, classical family**, selectable as `Method::LogGuided` next to `Bilinear`, `Menon` and `Lmmse`. The bilateral denoise that follows classical R6 (`denoise::bilateral_opponent`) is unchanged.
-- **Renders**: the fit view, thumbnails and look tiles wherever they demosaic at full resolution. That covers thumbnails of small photos or small crops (`k = 1`) and the coarse frame shown while full-resolution tiles are computed. The as-built raw group bins the mosaic at `k ≥ 2` (`bin_mosaic`) and does not run R6 there. Whether to replace binning at `k = 2` with "this method, then a 2× downsample" is an evaluation question (section 7.1, note 6), not part of this spec. *[As built, 2026-10-13: no render uses this method. It is reachable through the test-only switch `RenderOptions::demosaic` only; section 9.3 says why. R6's default is the adaptive ratio demosaic, `docs/05`.]*
-- **Input**: the **balanced** mosaic that R6 already receives, after R4 (gains `g0`) and R5 (highlight reconstruction). Do not divide by `g0` (section 1.3).
+- **R6, classical family**, selectable as `Method::LogGuided` next to `Bilinear`, `Menon`, `Lmmse` and `AdaptiveRatio`. The denoise that follows R6 is the same for every method.
+- **Selection.** It is not the default (the default is the adaptive ratio demosaic, `docs/algorithms/01-adaptive-ratio-demosaic.md`) and no render uses it, on the CPU or on the device. It is reachable through the test-only switch `RenderOptions::demosaic` only; section 9.3 gives the reason.
+- **Input.** The **balanced** mosaic that R6 receives after R4 (gains `g0`) and R5 (highlight reconstruction). It is not divided by `g0` (section 1.3).
 
 ### 1.2 Input and output
 
@@ -36,9 +35,9 @@ Where it runs in Yellowmoon:
 | Clip mask | Not used. |
 | Noise model | Only the read-noise part (`b`, `sigma_row`, `q`) is used, to set the offset `p` (section 2.2). |
 
-### 1.3 Balanced input, and why it is fine
+### 1.3 Balanced input
 
-The method expects the balanced mosaic. There is no `g0` round trip, which the adaptive ratio demosaic (`spec/01`) needs.
+The method takes the balanced mosaic. There is no `g0` round trip, which the adaptive ratio demosaic needs.
 
 The guide is a geometric mean of the three channels, so white balance enters it only as a constant factor. In the log domain the gains add `log g_c` at the photosites of colour `c`. That pattern is a constant, (log g_R + log g_B)/4, plus components at the CFA carrier frequencies (π, 0), (0, π) and (π, π). For every value of the detail parameter, the guide kernel's response is exactly 0 at π on each axis (section 2.3), so only the constant survives. Without the offset `p`, the balanced guide is the unbalanced guide times (g_R·g_B)^(1/4) everywhere.
 
@@ -50,13 +49,13 @@ Balanced input is the better of the two for these reasons:
 - `p` comes from the read noise of green, and green's gain is 1, so `p` is the same in balanced and unbalanced units.
 - R6 must output balanced RGB, and this way nothing has to be divided out and multiplied back.
 
-Measured with the reference's float form (a 64×64 texture with noise, `g0` = (2.1, 1, 1.7)): balanced input and "unbalanced input, then times `g0`" differ by at most 3.5e-4 (mean relative 2e-5 at full scale and 0.4 % at 1/100 scale, where `p` matters). The noiseless PSNR is identical at full scale and 0.03 dB higher for balanced input at 1/100 scale.
+Measured with the oracle's float form (a 64×64 texture with noise, `g0` = (2.1, 1, 1.7)): balanced input and "unbalanced input, then times `g0`" differ by at most 3.5e-4 (mean relative 2e-5 at full scale and 0.4 % at 1/100 scale, where `p` matters). The noiseless PSNR is identical at full scale and 0.03 dB higher for balanced input at 1/100 scale.
 
 ### 1.4 Halo
 
-The halo (receptive-field radius) is **5 px** (Chebyshev). Derivation: the reconstruction (3.7) reads the mosaic and the guide at ±1 px and the smoothed structure measures at the pixel itself. The 5×5 box (3.6) reads the structure measures at ±2. These read the guide at ±1 (3.5), so the guide is read at up to ±3. Each guide value uses the log image at ±2 on each axis (3.3), which gives ±5 in total. Everything else is pointwise.
+The halo (receptive-field radius) is **5 px** (Chebyshev). The reconstruction (3.7) reads the mosaic and the guide at ±1 px and the smoothed structure measures at the pixel itself. The 5×5 box (3.6) reads the structure measures at ±2. These read the guide at ±1 (3.5), so the guide is read at up to ±3. Each guide value uses the log image at ±2 on each axis (3.3), which gives ±5 in total. Everything else is pointwise.
 
-An implementation that shrinks its valid area by 2 px after each of the four neighbourhood stages (horizontal filter, vertical filter, structure, box) needs an 8-px border. That is a safe bound, but 5 is exact: the self-test perturbs single photosites and finds a reach of exactly 5 in both forms. Declare `Method::LogGuided.halo() = 5`. The scheduler aligns mosaic rectangles to even coordinates itself. In the `docs/05` halo table, the R6 classical row becomes 5 + 2 (bilateral) = 7 px for this method.
+An implementation that shrinks its valid area by 2 px after each of the four neighbourhood stages (horizontal filter, vertical filter, structure, box) needs an 8-px border. That is a safe bound, but 5 is exact: the perturbation test changes single photosites and finds a reach of exactly 5 in both forms. `Method::LogGuided.halo()` returns 5 (`LOG_GUIDED_HALO`). The scheduler aligns mosaic rectangles to even coordinates itself.
 
 ---
 
@@ -69,6 +68,8 @@ An implementation that shrinks its valid area by 2 px after each of the four nei
 | `guide_detail` | i32 | 0 | −50 … 100 (clamped) | Sharpness of the luminance guide. Sets the outer tap `k` of the guide kernel (2.3). |
 | `headroom_log2` | u8 | per frame (2.4) | 0 … 4 (clamped) | Fixed-point form only. Headroom H = 2^headroom_log2: the normalised value that maps to the top of the 16-bit working scale. |
 | `noise` | `NoiseModel` | the photo's model | — | Normalised, unbalanced units. Only `b`, `sigma_row` and `q` are used. |
+
+`Method::LogGuided` runs the float form with `guide_detail = 0`; `headroom_log2` applies to the fixed form only.
 
 ### 2.2 Derived values
 
@@ -105,7 +106,7 @@ Effect:
 - **Positive values** make the outer taps (same colour as the centre, two photosites away) negative. This lifts mid frequencies: more fine detail is transferred into the interpolated channels, and the result looks sharper. It also adds noise, and overshoot and zipper risk at hard edges.
 - **Negative values** widen the guide and soften the result. They help very noisy files.
 - The range stops at −50 because K(π/2) reaches 0 at k = 128 (P ≈ −62) and turns negative beyond it. It stops at 100 because the mid-frequency gain is already 1.38 there.
-- **Default 0.** It gives the plain geometric-mean guide, and sharpening belongs to R8 and to output sharpening. Do not expose the parameter in the UI. Keep it as an internal parameter for evaluation (7.1, note 7).
+- **Default 0.** It gives the plain geometric-mean guide, and sharpening belongs to R8 and to output sharpening. The parameter is internal and is not exposed in the UI.
 
 ### 2.4 Headroom (fixed form only)
 
@@ -113,7 +114,7 @@ The fixed form maps normalised values to 16-bit integers: `x_dn = round(S·x / H
 
 **Default rule.** H is the smallest power of two with H ≥ the maximum sample of the frame's balanced mosaic after R5. It is capped at 16: values above 16 then saturate in the interpolated channels, while their native samples still pass through. Compute H **once per frame**, before tiling, and pass the same H to every tile, otherwise tiles disagree. If the frame maximum is not available, use H = 4.
 
-The cost of a larger H is quantisation: one code is H/65535 (6.1e-5 at H = 4, about the step of a 14-bit raw file). Scaling the input by 2 and doubling H and the read noise gives exactly twice the output (a self-test property). The **float form needs no headroom** and is the recommended form (3.9).
+The cost of a larger H is quantisation: one code is H/65535 (6.1e-5 at H = 4, about the step of a 14-bit raw file). Scaling the input by 2 and doubling H and the read noise gives exactly twice the output (a test property). The **float form needs no headroom** and is the form `Method::LogGuided` runs (3.9).
 
 ### 2.5 Scale-dependent quantities
 
@@ -126,16 +127,30 @@ Everything is defined at the working scale S = 65535, divided by H in the fixed 
 
 Scale-free quantities: the kernel, the box size, the cube exponent, every ratio, and the log2/exp2 constants. These act on the mantissa and are exact under ×2 (L(2y) = L(y) + 4096).
 
+### 2.6 Constants and their derivation
+
+Every constant of this spec has a row, with the ID of `docs/29-raw-constants.md` §2.1 and one status: **Maths** (a mathematical fact or an error budget gives the value, and a test proves it), **Fit** (only image data can choose it; the task that fits it), **Design** (the owner's look, `docs/29` §6) or **Guard** (a numeric safeguard; what it protects). No row names an origin: each stands on the method written in it. The tests are in `crates/ym-gpu/tests/cpu_log_guided.rs`.
+
+**Where each constant lives (`docs/29` RC-03).** The two cubics are `FixedCubics::SHIPPED` and `ORACLE_CUBICS` in `crates/ym-gpu/src/cpu/demosaic/log_guided.rs`, the one home of L1 and L2; the exponent of L3 is the cube of `cube_floor1` and of `shaders/log_guided.wgsl`. There is no `Tuning` struct and no generated shader block (the device uses `log2` and `exp2`). `log_guided::REGISTRY` lists the three rows, and `crates/ym-gpu/tests/constants_registry.rs` holds it to `docs/29` §2.1.
+
+| ID | Constant | Status | Derivation | Proof or task |
+|---|---|---|---|---|
+| L1 | `(46653, 19114, 5229)/32768` (§3.2) | Maths | The integer solution of the objective stated in §3.2 (smallest largest error over every input, anchors exact, at most 23 step-backs), by exhaustive search around the continuous minimax cubic. | `tools/fit/poly_fit.py`; `log2_and_exp2_fixed_meet_their_exhaustive_bounds`, `nothing_beats_the_stored_cubics_by_the_stated_objective_near_them` (RC-01) |
+| L2 | `(45559, 14919, 5047)/65536` (§3.4) | Maths | The integer solution of the objective stated in §3.4 (smallest relative-error bound `k`, exact at `2^e`, monotone, 16 bits), by a climb and an exhaustive polish. | as L1 |
+| L3 | exponent `3` (§3.7) | Fit | The inverse-cube structure weight of the green blend. No render path uses the log-guided demosaic, and the owner skipped the task. | RC-12 (skipped, `docs/29` §6 answer 5) |
+
+Counts: Maths 2 (L1, L2), Fit 1, Design 0, Guard 0.
+
 ---
 
 ## 3. Algorithm
 
 ### 3.0 Notation
 
-- The core maths is written in **padded coordinates**. Mirror the input once by B = 5 px on every side, with Yellowmoon's `mirror` (period 2(n−1), the edge sample is not repeated, parity is kept). Every stage below is symmetric under reflection (symmetric kernels, symmetric rounding), so mirroring each intermediate plane at the buffer edge instead gives identical results (an independent per-stage-mirroring implementation reproduces every vector bit for bit).
+- The core maths is written in **padded coordinates**. The input is mirrored once by B = 5 px on every side, with Yellowmoon's `mirror` (period 2(n−1), the edge sample is not repeated, parity is kept). Every stage below is symmetric under reflection (symmetric kernels, symmetric rounding), so mirroring each intermediate plane at the buffer edge instead gives identical results (an independent per-stage-mirroring implementation reproduces every vector bit for bit).
 - `rhalf(a, b) = floor((a + b + 1) / 2)` for non-negative integers (the rounded halving add).
 - `>> n` is floor division by 2^n of a non-negative integer. All products in steps 3.2 and 3.4 fit in 32-bit unsigned integers (the largest are 65534² and 65520², both below 2^32).
-- **Site classes.** Read them from the buffer's `Cfa` at the output pixel: red site, blue site, green site in a red row (its left and right neighbours are red), green site in a blue row. The formulas use these classes, not parities, so all four phases work without shifting. Equivalently, shift the buffer so red sits at even/even. The reference uses the classes.
+- **Site classes.** They are read from the buffer's `Cfa` at the output pixel: red site, blue site, green site in a red row (its left and right neighbours are red), green site in a blue row. The formulas use these classes, not parities, so all four phases work without shifting. (Shifting the buffer so that red sits at even/even is equivalent.) The implementation uses the classes.
 
 ### 3.1 Quantise (fixed form)
 
@@ -158,16 +173,22 @@ n  = y << (15 − e)                      // 32768 ≤ n ≤ 65535
 m  = 2n − 65536                         // mantissa fraction in Q16, 0..65534
 m2 = (m·m) >> 16
 m3 = (m2·m) >> 16
-P  = ((46597·m) >> 16) − ((19037·m2) >> 16) + ((5208·m3) >> 16)   // 0..32767
+P  = ((46653·m) >> 16) − ((19114·m2) >> 16) + ((5229·m3) >> 16)   // 0..32767
 L  = 4096·e + (P >> 3)
 ```
 
-P/32768 approximates log2(1 + f) with f = m/65536, using the cubic 1.422027587890625·f − 0.580963134765625·f² + 0.158935546875·f³ (the constants are 46597/32768, 19037/32768 and 5208/32768). Error bounds, checked exhaustively in the self-test:
+P/32768 approximates log2(1 + f) with f = m/65536, using the cubic 1.423736572265625·f − 0.58331298828125·f² + 0.159576416015625·f³ (the constants are 46653/32768, 19114/32768 and 5229/32768; A − B + C = 32768, so p(0) = 0 and p(1) = 1).
 
-- The cubic alone: −0.00096 … +0.00070 stop.
-- log2_fixed including truncation: L − 4096·log2(y) ∈ [−4.98, +2.98] codes, i.e. −0.00122 … +0.00073 stop, for every y in 1 … 65535. Anchors: L(1) = 0, L(2) = 4096, L(65535) = 65535.
-- L is not strictly monotone. In the top octave it steps back by 1 code at 23 values of y. This is harmless and part of the specified function.
+**Where the triple comes from.** It is the integer solution of an objective, not a rounded real fit. The objective: minimise the largest |L − 4096·log2(y)| over every y in 1 … 65535, with the exact integer arithmetic above, subject to L(1) = 0, L(2) = 4096 and L(65535) = 65535, at most 23 step-backs (the count of the triple it replaces) and no step-back larger than one code; ties go to fewer step-backs, then to the smaller triple. The search box is B in [18954, 19194] and C in [5157, 5277] with A = 32768 + B − C, centred on the continuous minimax cubic with the same anchors (1.422865, −0.582085, 0.159220; largest error 8.79e-4 stop = 3.60 codes). `tools/fit/poly_fit.py` repeats it (numpy only, deterministic, about a minute) and prints the best five; `cpu_log_guided.rs::nothing_beats_the_stored_cubics_by_the_stated_objective_near_them` repeats it on a smaller box around the stored triple and fails if a neighbour is better. Derivation and the measured alternatives: `docs/29-raw-constants.md` F-01. The best five are (46653, 19114, 5229) at 4.404 codes and 20 step-backs, (46650, 19108, 5226) at 4.417 and 20, (46646, 19096, 5218) at 4.420 and 18, (46649, 19106, 5225) at 4.420 and 19, and (46648, 19100, 5220) at 4.420 and 21.
+
+Error bounds, checked exhaustively in the self-test:
+
+- The cubic alone: −0.00082 … +0.00105 stop.
+- log2_fixed including truncation: L − 4096·log2(y) ∈ [−4.404, +4.378] codes (largest |error| 4.404), i.e. −0.00108 … +0.00107 stop, for every y in 1 … 65535. Anchors: L(1) = 0, L(2) = 4096, L(65535) = 65535.
+- L is not strictly monotone. In the top octave it steps back by 1 code at 20 values of y. This is harmless and part of the function as defined.
 - Doubling y adds exactly 4096.
+
+The first release of this reference used (46597, 19037, 5208)/32768: error [−4.978, +2.979] codes, 23 step-backs. That triple is kept as `ORACLE_LOG2_CUBIC` and used only to run the 16 oracle vectors, whose `expected` field was made with it (section 6.1).
 
 ### 3.3 Guide filter
 
@@ -183,7 +204,7 @@ K_i are the integers (k, 256, 512 − 2k, 256, k). The sum needs a signed 32-bit
 
 ### 3.4 Back to linear: the guide C
 
-  C = exp2_fixed(Lv)     (C ≈ 2^(Lv/4096); 1 ≤ C ≤ 65522)
+  C = exp2_fixed(Lv)     (C ≈ 2^(Lv/4096); 1 ≤ C ≤ 65518)
 
 **exp2_fixed(L)** for 0 ≤ L ≤ 65535:
 
@@ -192,16 +213,22 @@ e  = L >> 12                            // integer part, 0..15
 f  = (L mod 4096) << 4                  // fraction in Q16, 0..65520
 f2 = (f·f) >> 16
 f3 = (f2·f) >> 16
-Q  = ((45607·f) >> 16) + ((14741·f2) >> 16) + ((5185·f3) >> 16)   // ≤ 65509
+Q  = ((45559·f) >> 16) + ((14919·f2) >> 16) + ((5047·f3) >> 16)   // ≤ 65501
 s  = 2^e
 C  = s + ((s·Q) >> 16)
 ```
 
-Q/65536 approximates 2^f − 1 using 0.6959075927734375·f + 0.2249298095703125·f² + 0.0791168212890625·f³ (45607/65536, 14741/65536, 5185/65536). Error bounds, checked exhaustively:
+Q/65536 approximates 2^f − 1 using 0.6951751708984375·f + 0.2276458740234375·f² + 0.0770111083984375·f³ (45559/65536, 14919/65536, 5047/65536; the constant term of 2^f is exactly 1, and the sum of the three, 0.99978, is not forced to 1).
 
-- The cubic alone: relative error −9.7e-5 … +1.38e-4.
-- exp2_fixed with t = 2^(L/4096): −(1 + 1.18e-4·t) ≤ C − t ≤ +1.24e-4·t. The "1" is the final truncation, which matters only for small t.
-- exp2_fixed(4096·e) = 2^e exactly. The function is monotone non-decreasing, and its maximum is 65522, so no saturation is needed.
+**Where the triple comes from.** The objective: minimise the smallest k with −(1 + k·t) ≤ C − t ≤ k·t, t = 2^(L/4096), over every L in 0 … 65535 with the exact integer arithmetic above, subject to exp2_fixed(4096·e) = 2^e, a monotone non-decreasing C and C ≤ 65535; ties go to the smaller triple. The search starts from the continuous relative-error minimax cubic with constant term 1 (0.695117, 0.227645, 0.077067; largest relative error 8.56e-5), climbs in integer steps of up to 8, 16 and 16 on A, B and C, and then tries every triple within ±4 of where it stops (729 triples). `tools/fit/poly_fit.py` repeats it and prints the best five; `cpu_log_guided.rs::nothing_beats_the_stored_cubics_by_the_stated_objective_near_them` repeats the ±4 box around the stored triple. The best five: (45559, 14919, 5047), (45560, 14915, 5050), (45560, 14916, 5049) and (45561, 14917, 5047) tie at k = 9.020e-5 (the lower bound is the binding one) and (45560, 14918, 5047) follows at 9.024e-5; the stored one is the smallest of the four that tie. Nothing outside the box is claimed. Derivation: `docs/29-raw-constants.md` F-01.
+
+Error bounds, checked exhaustively:
+
+- The cubic alone: relative error −8.4e-5 … +9.5e-5.
+- exp2_fixed with t = 2^(L/4096): −(1 + 9.02e-5·t) ≤ C − t ≤ +8.97e-5·t. The "1" is the final truncation, which matters only for small t.
+- exp2_fixed(4096·e) = 2^e exactly. The function is monotone non-decreasing, and its maximum is 65518, so no saturation is needed.
+
+The first release of this reference used (45607, 14741, 5185)/65536: −(1 + 1.18e-4·t) ≤ C − t ≤ 1.24e-4·t, maximum 65522. That triple is kept as `ORACLE_EXP2_CUBIC` and used only to run the 16 oracle vectors (section 6.1).
 
 C lives in the domain of `p + x/2` (half scale plus offset). Only ratios of C are used later, so the factor ½ does not matter.
 
@@ -260,7 +287,7 @@ In plain terms: a missing channel is the mean of that channel over the neighbour
 - Native channel: the input sample itself (0 if it is not finite).
 - Interpolated channels: `out = (n·H) / 65535`, evaluated in binary64 and rounded to f32. n is the integer from 3.7.
 
-### 3.9 All-float form (recommended for the GPU and acceptable on the CPU)
+### 3.9 All-float form (the form `Method::LogGuided` runs, on the CPU and the GPU)
 
 The maths is the same without fixed point. The differences:
 
@@ -275,35 +302,35 @@ The maths is the same without fixed point. The differences:
 | 3.7 | Exact halves `(a + b)/2` instead of `rhalf`. The same formulas, no rounding, no clamp. |
 | 3.8 | Interpolated `out = v / 65535`. Native samples as in the fixed form. |
 
-Precision: f32 storage is enough for every plane. On the CPU, accumulate the filters and the box in f64 (Yellowmoon convention, and what the reference does). On the GPU use f32 throughout. To keep the green blend's magnitudes small in f32, compute it as
+Precision: f32 storage is enough for every plane. The CPU accumulates the filters and the box in f64 (Yellowmoon convention); the GPU kernel uses f32 throughout. To keep the green blend's magnitudes small in f32 it is computed as
 
   t = (D̄ / Ē)³,   green = C · (HA + t·VA) / (HC + t·VC),
 
-which equals the formula above up to rounding.
+which equals the formula above up to rounding (the kernel's exact form is in 10.2).
 
-**Expected difference between the two forms** (reference, 40×40 scenes, H = 2, normalised units): mean |Δ| 7e-6 on straight edges and 2e-5 to 4e-5 on texture and zone plates. Max |Δ| 4.5e-5 on straight edges, 1.7e-4 on a diagonal edge, 5e-4 on the texture scene, and 1.6e-3 on a zone plate near Nyquist, where small guide errors change large ratios. PSNR differs by less than 0.01 dB. The sources are the log2/exp2 approximations (≤ 0.0012 stop, mostly cancelling in the ratios), the integer L (1/4096 stop), `rhalf` and output rounding (½ code each), the floor in the box (−½ code on average), and in the fixed form the clamp at H. The vectors carry both `expected` (fixed) and `expected_float`. The self-test bounds the difference at max 2e-3 and mean 5e-5.
+**Difference between the two forms** (oracle, 40×40 scenes, H = 2, normalised units): mean |Δ| 7e-6 on straight edges and 2e-5 to 4e-5 on texture and zone plates. Max |Δ| 4.5e-5 on straight edges, 1.7e-4 on a diagonal edge, 5e-4 on the texture scene, and 1.6e-3 on a zone plate near Nyquist, where small guide errors change large ratios. PSNR differs by less than 0.01 dB. The sources are the log2/exp2 approximations (≤ 0.0012 stop, mostly cancelling in the ratios), the integer L (1/4096 stop), `rhalf` and output rounding (½ code each), the floor in the box (−½ code on average), and in the fixed form the clamp at H. The vectors carry both `expected` (fixed) and `expected_float`. The tests bound the difference at max 2e-3 and mean 5e-5.
 
 ---
 
 ## 4. Edge cases
 
 - **Borders.** The input is mirrored with parity kept (3.0), so the CFA pattern continues across the edge. Results at the border are well defined, and tiles that touch the frame edge mirror the frame itself.
-- **Tiny buffers.** Any width and height ≥ 1 work. The mirror wraps several times when the buffer is narrower than the halo (vector `tiny_6x5`). With width or height 1 a colour is missing from the buffer and the output is defined but meaningless. Keep Yellowmoon's dispatch rule that sends buffers under 2×2 to bilinear.
+- **Tiny buffers.** Any width and height ≥ 1 work. The mirror wraps several times when the buffer is narrower than the halo (vector `tiny_6x5`). With width or height 1 a colour is missing from the buffer and the output is defined but meaningless. `demosaic_with` sends buffers under 2×2 to bilinear.
 - **Zero input.** A field of zeros has `y = p` everywhere, a constant guide and output 0.
-- **Negatives.** Interpolation and the guide see `max(v, 0)`. In the fixed form this is forced by the unsigned scale, and the float form does the same so the two agree. Native samples keep their negative value. The interpolated channels of a deep-shadow noise floor are therefore biased upward, by about 0.4 σ for zero-mean noise. For a preview this is usually acceptable; 7.1 note 3 gives the alternative.
+- **Negatives.** Interpolation and the guide see `max(v, 0)`. In the fixed form this is forced by the unsigned scale, and the float form does the same so the two agree. Native samples keep their negative value. The interpolated channels of a deep-shadow noise floor are therefore biased upward, by about 0.4 σ for zero-mean noise, which is acceptable for a preview.
 - **Values above 1.0.** The float form keeps them. The fixed form keeps them up to H (2.4) and saturates interpolated samples at H. Native samples always pass through.
 - **Non-finite samples.** They count as 0 everywhere.
 - **Clipped photosites.** There is no special handling. R5 has already replaced clipped values by estimates, and the clip mask is not read.
-- **CFA phases.** All four (RGGB, GRBG, GBRG, BGGR) are handled by site class (3.0). Cropping a buffer by one row or column changes its phase, and the interior result is bit-identical (self-test).
+- **CFA phases.** All four (RGGB, GRBG, GBRG, BGGR) are handled by site class (3.0). Cropping a buffer by one row or column changes its phase, and the interior result is bit-identical (tested).
 - **Overshoot.** The guide ratio can push an estimate above the largest neighbour (or below the smallest) at strong edges. That is the intended detail transfer. The only clamps are at 0 and, in the fixed form, at H.
 
 ---
 
 ## 5. Determinism, tiling, performance, GPU
 
-**Determinism.** There are no reductions and no data-dependent iteration order. Every output sample is a fixed function of the mosaic within 5 px, so threading cannot change results. The fixed form is bit-reproducible across platforms when step 3.7 is done in binary64. An f32 evaluation of 3.7 changes about 0.05 % of samples, by one code at most (measured on 122 000 samples).
+**Determinism.** There are no reductions and no data-dependent iteration order. Every output sample is a fixed function of the mosaic within 5 px, so threading cannot change results. The fixed form is bit-reproducible across platforms when step 3.7 is done in binary64. An f32 evaluation of 3.7 changes about 0.05 % of samples, by one code at most (measured on 122,000 samples).
 
-**Tiling.** A tile with ≥ 5 px of context, mirrored at the tile buffer's edge, gives the whole-frame result bit for bit in both forms. The self-test checks 9×8 cores at odd origins, where every tile has its own phase. In the fixed form, H must be the frame's value (2.4). With the banded runner, `filters::run_mosaic_bands(m, 5, BAND_ROWS, …)`.
+**Tiling.** A tile with ≥ 5 px of context, mirrored at the tile buffer's edge, gives the whole-frame result bit for bit in both forms. The tests check 9×8 cores at odd origins, where every tile has its own phase. In the fixed form, H must be the frame's value (2.4). The CPU runs the method in bands with `filters::run_mosaic_bands(m, 5, BAND_ROWS, …)`.
 
 **Cost per output pixel.**
 
@@ -316,27 +343,27 @@ which equals the formula above up to rounding.
 | 3.6 | About 4 adds with running sums, plus one division per measure. |
 | 3.7 | About 15 flops and one or two divisions. |
 
-Planes: A, L, Lh, C, Dh, Dv, D̄, Ē, as u16 in the fixed form. They can stream through 5-row ring buffers. It should cost a few times bilinear and much less than Menon. Measure it (section 6.4).
+Planes: A, L, Lh, C, Dh, Dv, D̄, Ē, as u16 in the fixed form. They can stream through 5-row ring buffers. Measured times are in section 9.2.
 
-**GPU (WGSL).** Every step is per pixel over a small neighbourhood, with no global reductions. The headroom H is a frame constant passed as a uniform, and only the fixed form uses it. A natural split:
+**GPU (WGSL).** Every step is per pixel over a small neighbourhood, with no global reductions. The kernel (section 10) runs the float form in four dispatches:
 
 1. log and horizontal filter (log on the fly at ±2);
 2. vertical filter and exp2 → C;
 3. structure measures and the horizontal 5-sum of the box;
 4. vertical 5-sum, division and reconstruction.
 
-Alternatively, run one dispatch over a shared-memory tile of 16×16 plus 5 px of halo. Use the float form. WGSL `log2` and `exp2` accuracy (a few ULP) is far below the fixed form's approximation error. The fixed form can also be ported exactly with `u32`/`i32` arithmetic if bit parity with the vectors is wanted, with 3.7 in f32 (±1 code).
+Only the float form is on the device. *Not on the device yet:* the fixed form has no kernel. It could be ported exactly with `u32`/`i32` arithmetic if bit parity with the vectors were wanted, with 3.7 in f32 (±1 code). A single dispatch over a shared-memory tile of 16×16 plus 5 px of halo is a possible alternative to the four-dispatch split.
 
 ---
 
 ## 6. Test plan
 
-### 6.1 Vectors (`vectors/log_guided_demosaic/`)
+### 6.1 Vectors (`crates/ym-gpu/tests/cpu_data/log_guided_demosaic/`)
 
 Each file holds `name`, `description` and `params`. `params` has `guide_detail`, `headroom_log2`, `noise` and `derived` (H, r_dn, p for both forms, k, the kernel). The other fields:
 
 - `input`: width, height, cfa, row-major data.
-- `expected`: fixed form, planar RGB.
+- `expected`: fixed form, planar RGB. It was made with the cubics of the first release of the reference, (46597, 19037, 5208)/32768 and (45607, 14741, 5185)/65536 (3.2, 3.4); the tests run it with those (`log_guided::ORACLE_CUBICS`, `demosaic_fixed_with`). The shipped fixed form uses the triples of 3.2 and 3.4.
 - `expected_float`: float form, planar RGB.
 - `tolerance`: for `expected`, one code of the working scale, 1.01·H/65535. A binary64 implementation of 3.7 is bit-exact; an f32 one is within one code.
 - `tolerance_float`: 1e-4 absolute, for `expected_float`.
@@ -354,9 +381,9 @@ Each file holds `name`, `description` and `params`. `params` has `guide_detail`,
 | `highlights_headroom1` | 32×32 RGGB | The same with H = 1: interpolated samples saturate at 1.0, native ones keep their value. |
 | `tiny_6x5` | 6×5 BGGR | The mirror wraps several times inside the halo; guide_detail 40. |
 
-### 6.2 Property tests (port these to Rust)
+### 6.2 Property tests (`crates/ym-gpu/tests/cpu_log_guided.rs`)
 
-The reference's `-DSELF_TEST` runs all of them.
+The oracle's self-test runs the same checks.
 
 1. **Flat field exact.** Constant grey and constant colour on the code grid, all four phases, H = 1 and 4, guide_detail −50/0/100: the fixed form is bit-exact, the float form within 1e-6 relative.
 2. **Tiling parity.** Halo 5, cores at odd origins: bit-exact in both forms (Yellowmoon's limit is 1e-4).
@@ -367,7 +394,7 @@ The reference's `-DSELF_TEST` runs all of them.
 7. **Native passthrough and no NaN.** Random inputs in [−0.05, 20] with NaN and infinity samples, every headroom: all outputs finite and native samples unchanged.
 8. **Headroom.** Values above H saturate only in interpolated channels.
 9. **Fixed vs float.** The bounds of 3.9.
-10. **log2_fixed and exp2_fixed.** The bounds and anchors of 3.2 and 3.4, checked exhaustively.
+10. **log2_fixed and exp2_fixed.** The bounds and anchors of 3.2 and 3.4, checked exhaustively; the oracle triples keep the bounds of the first release; a search around each stored triple finds nothing better by the stated objective.
 
 ### 6.3 Determinism
 
@@ -375,42 +402,42 @@ The reference's `-DSELF_TEST` runs all of them.
 
 ### 6.4 Quality gate in Yellowmoon
 
-- **PSNR**: 10 px border excluded, `metrics::psnr`, mosaicked as RGGB. Compare against Bilinear, Menon and LMMSE on the synthetic set of `tests/cpu_demosaic.rs`, and on Kodak, McMaster and PixelShift200 where they can be fetched. Run in linear light and at signal scales 1.0, 0.1 and 0.01, as `docs/05` did for LMMSE. Use the float form and p from a zero-noise model (p = 1).
-- **What the reference shows** (40×40 scenes, float form): edges +4.6 dB over bilinear (36.4 vs 31.9 dB), diagonal edge +1.8, zone plate +3.5, texture +1.5. Its position against Menon was not measured here. The gate (within 1 dB of Menon on the synthetic set, < 300 ms for the 1/4-resolution fit preview on M1) decides whether it replaces the current preview path. Report the numbers either way.
-- **Visual**: zipper and false-colour metrics against Menon, and the fit view of the nine local real files at `guide_detail` 0. *[As built the two metrics are not in `cpu/metrics.rs`: they are defined in `crates/ym-gpu/tests/common/demosaic_metrics.rs`, tested in `tests/cpu_demosaic_metrics.rs` and run by `examples/demosaic_gate.rs`. At signal scale 1 log-guided has 46.5, 56.9 and 41.3 % zipper pixels on the procedural set, Kodak and McMaster against Menon's 39.1, 34.3 and 41.8 %, and 15.9, 15.2 and 9.3 % false-colour pixels against 15.3, 7.6 and 11.2 % (`docs/05` R6).]*
+The gate is `crates/ym-gpu/examples/demosaic_gate.rs`, run by `tools/eval/demosaic/gate.sh` (protocol and metric definitions: `docs/algorithms/01-adaptive-ratio-demosaic.md` section 6.3 and `crates/ym-gpu/tests/common/demosaic_metrics.rs`).
+
+- **PSNR.** 10 px border excluded, `metrics::psnr`, the ground truth mosaicked as RGGB. The method is compared with Bilinear, Menon, LMMSE and the adaptive ratio demosaic on the procedural set of `tests/cpu_demosaic.rs`, Kodak and McMaster, in linear light at signal scales 1.0, 0.1 and 0.01. The method runs in the float form with `p` from a zero-noise model (`p = 1`).
+- **Gate.** Within 1 dB of Menon on the synthetic set, and under 300 ms for the 1/4-resolution fit preview on an M1.
+- **Artefacts.** Zipper and false-colour rates at signal scale 1.
+
+The numbers are in section 9.2.
 
 ---
 
-## 7. Evaluation notes and open questions
+## 7. Properties and fixed choices
 
-### 7.1 Evaluation notes (worth A/B testing)
+**Properties of the algorithm:**
 
-1. **Offset `p`.** It comes from green's read noise. Alternatives: the guide's effective noise, `r·(g_R·g_B)^(1/4)`; per-colour offsets `g_c·p`, which make the method exactly white-balance-equivariant; or a continuous (non-integer) `p` in the float form. Measure shadow noise and shadow colour on the noisy synthetic scenes.
-2. **Headroom.** A per-frame H against the float form, for the fixed form's integer-only use. The float form needs none.
-3. **Negatives.** In the float form, let the neighbour means (HA, VA and the diagonal sums) use unclamped values and keep the guide on `max(v, 0)`. This removes the upward bias of interpolated channels in the noise floor. Check black-level neutrality of the fit view on dark frames.
-4. **Weights.** Inverse cube against inverse square, and a 5×5 against a 3×3 box. These trade zipper suppression on edges against noise robustness.
-5. **Chroma at red and blue sites** is the plain average of the four diagonal neighbours times the guide ratio, with no direction. A directional or green-referenced estimate may reduce false colour on diagonals.
-6. **Demosaic then downsample vs binning** for the `k = 2` fit view: sharpness, chroma-edge energy (`docs/01` uses it for binning) and time.
-7. **`guide_detail`** at 25 to 50 for thumbnails that are downsampled afterwards, where part of the sharpening is lost.
-8. **Overshoot limiting.** Clamp each interpolated sample to [min, max] of the neighbours it was built from, widened by a margin. This trades detail for fewer halos at saturated colour edges.
+1. **Offset `p`.** It comes from green's read noise and is the same for the three channels. Per-colour offsets `g_c·p` would make the method exactly white-balance-equivariant; the method is equivariant only up to the three absolute quantities of section 1.3.
+2. **Negatives.** The guide and the neighbour means see `max(v, 0)` (in both forms, so that they agree), and native samples keep their negative value. The interpolated channels of a deep-shadow noise floor are therefore biased upward, by about 0.4 σ for zero-mean noise.
+3. **Weights.** The structure weights are inverse cubes of 5×5 box means. The cube and the box size trade zipper suppression on edges against noise robustness.
+4. **Chroma at red and blue sites** is the plain average of the four diagonal neighbours times the guide ratio, with no direction.
 
-### 7.2 Open questions (with the default to use meanwhile)
+**Fixed choices:**
 
-| Question | Default meanwhile |
+| Question | Choice |
 |---|---|
-| Which renders switch to this method? | `k = 1` preview renders (thumbnails of small photos or crops, the coarse frame before full-resolution tiles), after the gate of section 6.4 passes. Binning stays for `k ≥ 2` until note 6 is measured. *[As built: none. The gate passed, but no render switched; section 9.3. The method is reachable through the test-only switch only.]* |
-| Fixed or float form in the product? | Float form on CPU and GPU. Fixed form for the vectors and as an integer-only fallback. |
-| How is H chosen when the frame maximum is unknown? | H = 4 (headroom_log2 = 2). |
-| Does `p` follow the pooled noise model or the photo's own? | Whatever `RawParams::noise` carries (the pooled model when it is used). |
-| Should `guide_detail` follow the sharpening setting? | No. Fixed at 0. |
+| Which form does `Method::LogGuided` run? | The float form, on the CPU and the device. The fixed form serves the vectors and as an integer-only variant |
+| How is H chosen when the frame maximum is unknown? | H = 4 (`headroom_log2` = 2) |
+| Does `p` follow the pooled noise model or the photo's own? | Whatever `RawParams::noise` carries (the pooled model when it is used); it reaches the method through `DemosaicInputs::noise`. `demosaic(m, method)` uses the zero model |
+| Does `guide_detail` follow the sharpening setting? | No. It is fixed at 0 |
+| Which renders use the method? | None (section 9.3) |
 
 ---
 
-## 8. Reference notes
+## 8. Conventions of the implementation
 
-The reference implements this specification as written. Where the behaviour could have been defined in more than one way, it uses the following:
+Where the behaviour could be defined in more than one way, the implementation (and the oracle) uses the following:
 
-- **Symmetric weights at blue sites.** Green at a blue site uses the structure weights of the blue site itself, exactly as at a red site. A variant that reads them from the left-hand neighbour is not part of this specification: it widens the receptive field to 6 px horizontally and breaks mirror equivariance, and it changes most blue-site green values (by up to 13 000 codes at sharp noisy edges in random tests).
+- **Symmetric weights at blue sites.** Green at a blue site uses the structure weights of the blue site itself, exactly as at a red site. (Reading them from the left-hand neighbour would widen the receptive field to 6 px horizontally and break mirror equivariance.)
 - **Box mean as an exact integer quotient**, `floor(Σ / 25)`. Multiplying by the single-precision value of 1/25 and truncating gives the same result for every reachable sum (all 0 … 25·65535 checked), so a GPU may use that.
 - **Reconstruction in binary64.** Single-precision evaluation in the order of 3.7 differs by at most one code, in about 0.05 % of samples.
 - **Borders.** The input is mirrored once (Yellowmoon's `mirror`). The core stages contain no border logic of their own.
@@ -420,94 +447,92 @@ The reference implements this specification as written. Where the behaviour coul
 
 ---
 
-## 9. As built
+## 9. The CPU implementation and its measurements
 
-Decisions and measurements recorded when the method was implemented (`crates/ym-gpu/src/cpu/demosaic/log_guided.rs`). The specification above is unchanged.
+The Rust port is `crates/ym-gpu/src/cpu/demosaic/log_guided.rs`.
 
 ### 9.1 API and choices
 
 - **`Method::LogGuided`** runs the **all-float form** (3.9) with `guide_detail = 0`. The noise model comes from `DemosaicInputs::noise`; `demosaic(m, method)` therefore uses the zero-noise model (`p = 1`). The gains and the CA curves of `DemosaicInputs` are ignored. The input is the balanced mosaic: nothing is divided out.
-- **Entry points** in `log_guided`: `demosaic(m, noise)` (float, detail 0), `demosaic_float(m, noise, guide_detail)`, `demosaic_fixed(m, noise, guide_detail, headroom_log2)`, `derive`, `log2_fixed`, `exp2_fixed`, and `LogGuidedParams` with the default headroom rule of 2.4 (`LogGuidedParams::for_mosaic` reads the frame maximum; the fixed form is not used by any render path, so no caller computes it yet).
-- **Halo** `Method::LogGuided.halo() = LOG_GUIDED_HALO = 5`; the perturbation test finds a reach of exactly 5 in both forms.
+- **Entry points** in `log_guided`: `demosaic(m, noise)` (float, detail 0), `demosaic_float(m, noise, guide_detail)`, `demosaic_fixed(m, noise, guide_detail, headroom_log2)`, `derive`, `log2_fixed`, `exp2_fixed`, and `LogGuidedParams` with the default headroom rule of 2.4 (`LogGuidedParams::for_mosaic` reads the frame maximum; the fixed form is used by no render path, so no caller computes it).
+- **Halo.** `Method::LogGuided.halo() = LOG_GUIDED_HALO = 5`; the perturbation test finds a reach of exactly 5 in both forms.
 - **Invalid noise** (`NoiseDn::r` NaN, infinite or negative, which `NoiseDn::from_model` gives for a negative or infinite variance) reads as 0, so `p = 1`, as 2.2 says. `derive` does this, not `NoiseDn`.
-- **Where the Rust differs from the oracle's text** (none of it changes a vector): the 5x5 box is a vertical 5-sum then a horizontal one (every partial sum is exact in `f64`, so the order cannot matter); the structure weights are computed only at red and blue sites, the only place 3.7 reads them; `log2` and `exp2` are the platform's `f64` functions rounded to `f32`. Nothing is fused (`mul_add` is not used).
-- **Output rule** for a mosaic whose data length does not match its size: a black image of the stated size (the oracle returns an empty one). Buffers under 2x2 still go to bilinear in `demosaic_with`; `log_guided::*` itself accepts any size from 1x1.
+- **Differences in form from the oracle** (none changes a vector): the 5×5 box is a vertical 5-sum then a horizontal one (every partial sum is exact in f64, so the order cannot matter); the structure weights are computed only at red and blue sites, the only place 3.7 reads them; `log2` and `exp2` are the platform's f64 functions rounded to f32. Nothing is fused (`mul_add` is not used).
+- **Output rule** for a mosaic whose data length does not match its size: a black image of the stated size. Buffers under 2×2 go to bilinear in `demosaic_with`; `log_guided::*` itself accepts any size from 1×1.
 
-### 9.2 Results
+### 9.2 Measured
 
-- **Vectors**: all 16, both forms, difference 0.0 against `expected` and `expected_float` (tolerances: one code and 1e-4). Property tests of 6.2 (flat fields, tiling, phase and mirror equivariance, receptive field, scale, passthrough, headroom, fixed against float, the exhaustive log2 and exp2 bounds) and the determinism checks (banded against whole, 1 against 4 threads, byte for byte) pass: `crates/ym-gpu/tests/cpu_log_guided.rs`.
-- **Fixed against float** on the 40x40 scenes: max 1.6e-3 (zone plate), mean at most 3.9e-5, inside the bounds of 3.9.
-- **PSNR** (`cargo run --release -p ym-gpu --example log_guided_eval -- psnr`; 10 px border, peak scaled with the signal, `p = 1`). Mean dB, log-guided against Menon:
+- **Vectors.** All 16, both forms: difference 0.0 against `expected` and `expected_float` (tolerances: one code and 1e-4). The property tests of 6.2 (flat fields, tiling, phase and mirror equivariance, receptive field, scale, passthrough, headroom, fixed against float, the exhaustive log2 and exp2 bounds) and the determinism checks (banded against whole, 1 against 4 threads, byte for byte) pass: `crates/ym-gpu/tests/cpu_log_guided.rs`.
+- **Fixed against float** on the 40×40 scenes: max 1.6e-3 (zone plate), mean at most 3.9e-5, inside the bounds of 3.9.
+- **PSNR** (`cargo run --release -p ym-gpu --example log_guided_eval -- psnr` and the demosaic gate; 10 px border, linear light, peak scaled with the signal, `p = 1`). Mean dB:
 
-| Set | Scale | Bilinear | Menon | LMMSE | Log-guided | Log-guided minus Menon |
-|---|---|---|---|---|---|---|
-| Synthetic (7 images) | 1 | 29.28 | 31.60 | 32.00 | 30.76 | -0.84 |
-| Synthetic | 0.1 | 29.28 | 31.60 | 31.37 | 30.80 | -0.80 |
-| Synthetic | 0.01 | 29.28 | 31.60 | 30.16 | 30.87 | -0.73 |
-| Kodak (24) | 1 | 29.82 | 38.88 | 39.16 | 31.94 | -6.95 |
-| Kodak | 0.1 | 29.82 | 38.89 | 38.34 | 32.19 | -6.69 |
-| Kodak | 0.01 | 29.82 | 38.88 | 38.13 | 32.43 | -6.46 |
-| McMaster (18) | 1 | 32.31 | 34.21 | 35.09 | 33.48 | -0.74 |
-| McMaster | 0.1 | 32.31 | 34.21 | 34.61 | 33.54 | -0.68 |
-| McMaster | 0.01 | 32.31 | 34.21 | 33.60 | 33.66 | -0.55 |
+| Set (images) | Scale | Bilinear | Menon | LMMSE | Adaptive ratio | Log-guided | Log-guided minus Menon |
+|---|---|---|---|---|---|---|---|
+| Procedural (7) | 1 / 0.1 / 0.01 | 29.28 | 31.60 | 32.00 / 31.37 / 30.16 | 34.94 / 35.22 / 35.42 | 30.76 / 30.80 / 30.87 | −0.84 / −0.80 / −0.73 |
+| Kodak (24) | 1 / 0.1 / 0.01 | 29.80 | 36.14 | 36.41 / 35.98 / 35.56 | 36.38 / 37.34 / 36.97 | 32.53 / 32.65 / 32.70 | −3.61 / −3.49 / −3.44 |
+| McMaster (18) | 1 / 0.1 / 0.01 | 33.67 | 35.54 | 36.33 / 35.82 / 34.93 | 35.03 / 36.41 / 36.72 | 34.54 / 34.64 / 35.01 | −1.00 / −0.90 / −0.53 |
 
-  The gate (within 1 dB of Menon on the synthetic set) holds at every scale. On Kodak, whose images are saturated and gamma-encoded photographs, the method is 6.5 to 7 dB below Menon, and only 2.1 to 2.6 dB above bilinear; at scale 1 the per-image gap on the synthetic set ranges from +1.9 (zone plate) to -3.1 dB (natural 3). PixelShift200 is not available here. *[Note from the R6 demosaic gate: the Kodak and McMaster rows of this table are the gamma-encoded protocol (the sRGB codes mosaicked as they are), not the linear light that section 6.4 asks for. In linear light, `docs/05` R6, log-guided is 3.4 to 3.6 dB below Menon on Kodak (32.53 against 36.14 dB at scale 1) and 0.5 to 1.0 dB below on McMaster (34.54 against 35.54); the synthetic rows are linear already.]*
-- **CPU time** (`... -- timing`, release build, mosaic of 1/4, 1/2 and full resolution of a 24 MP (6000x4000) and a 61 MP (9504x6336) frame, 4 shared x86-64 cores at load average 8 to 12, so wall times are inflated and CPU seconds are the dependable number). CPU time relative to bilinear and Menon, float form of this method:
+  The gate (within 1 dB of Menon on the synthetic set) holds at every scale. On photographs the method is 3.4 to 3.6 dB below Menon on Kodak and 0.5 to 1.0 dB below on McMaster, and 0.9 to 2.7 dB above bilinear. At scale 1 the per-image gap on the synthetic set ranges from +1.9 dB (zone plate) to −3.1 dB (natural 3). On the oracle's 40×40 scenes (float form) it is +4.6 dB over bilinear on edges (36.4 against 31.9 dB), +1.8 on a diagonal edge, +3.5 on the zone plate and +1.5 on texture.
+- **Artefacts** at signal scale 1 (zipper % / false colour %; Menon in brackets): procedural 46.5 / 15.9 (39.1 / 15.3), Kodak 56.9 / 15.2 (34.3 / 7.6), McMaster 41.3 / 9.3 (41.8 / 11.2).
+- **CPU time** (`... -- timing`, release build, mosaic of 1/4, 1/2 and full resolution of a 24 MP (6000×4000) and a 61 MP (9504×6336) frame, 4 shared x86-64 cores at load average 8 to 12, so wall times are inflated and CPU seconds are the dependable number). CPU time relative to bilinear and Menon, float form:
 
 | Frame | Resolution | CPU vs bilinear | CPU vs Menon |
 |---|---|---|---|
-| 24 MP | 1/4 (1500x1000) | 1.7 to 1.8 | 0.49 to 0.51 |
-| 61 MP | 1/4 (2376x1584) | 1.7 to 1.8 | 0.40 to 0.54 |
+| 24 MP | 1/4 (1500×1000) | 1.7 to 1.8 | 0.49 to 0.51 |
+| 61 MP | 1/4 (2376×1584) | 1.7 to 1.8 | 0.40 to 0.54 |
 | 24 MP | 1/2 | 1.6 | 0.40 |
 | 61 MP | 1/2 | 1.7 | 0.53 |
 | 24 MP | full | 1.4 | 0.48 |
 
-  On one thread the 1/4-resolution frame of a 24 MP photo takes about 75 ms wall (90 CPU ms) against 165 to 200 ms for Menon and 42 to 58 ms for bilinear. The fixed form costs 1.0 to 1.6 times the float form. (LMMSE costs 1.1 to 1.8 times Menon.)
+  On one thread the 1/4-resolution frame of a 24 MP photo takes about 75 ms wall (90 CPU ms) against 165 to 200 ms for Menon and 42 to 58 ms for bilinear. The fixed form costs 1.0 to 1.6 times the float form. (LMMSE costs 1.1 to 1.8 times Menon.) Timing on an M1 is a Mac check.
 
 ### 9.3 Use for the fit view and thumbnails
 
-The numbers meet the targets (within 1 dB on the synthetic set, about twice as fast as Menon), but **no preview render demosaics today**, so there is no preview method to switch: the fit view and the thumbnails at `k >= 2` bin the mosaic (`bin_mosaic`) and never run R6. Only `k = 1` renders do (thumbnails of small photos or small crops), and those read the tiles of the full-resolution chain: the tiles are cached under the same key as the 100 % view, and exports run the same chain. Using this method there needs a second chain with its own cache key, so that its pixels cannot reach the 100 % view or an export, and it would only speed up a rare case. The comparison of 7.1 note 6 (demosaic then downsample against binning at `k = 2`) was not evaluated. `ym-core` is therefore unchanged. The gap on Kodak (-6.95 dB) is a further reason to keep Menon wherever a real photograph is shown at full resolution. The GPU port (section 10) is the place where this method pays off.
+No render demosaics at preview quality today, so there is no preview method to switch. The fit view and the thumbnails at a reduction `k ≥ 2` bin the mosaic (`bin_mosaic`) and never run R6. Only `k = 1` renders do (thumbnails of small photos or small crops), and those read the tiles of the full-resolution chain: the tiles are cached under the same key as the 100 % view, and exports run the same chain. Using this method there would need a second chain with its own cache key, so that its pixels cannot reach the 100 % view or an export, and it would only speed up a rare case. The gap on Kodak is a further reason to run the default demosaic wherever a real photograph is shown at full resolution. `ym-core` therefore never selects `Method::LogGuided`.
+
+Replacing binning at `k = 2` with "this method, then a 2× downsample" has not been evaluated (sharpness, chroma-edge energy, time). The device kernel of section 10 is where such a use would pay off; no render path runs it yet.
 
 ---
 
-## 10. As built
+## 10. The GPU kernel
 
-The GPU port of the all-float form (3.9), recorded when it was implemented. The specification above is unchanged. Files: `crates/ym-gpu/src/shaders/log_guided.wgsl`, `crates/ym-gpu/src/kernels/log_guided.rs` (wrapper, `KernelId::LogGuided`), `crates/ym-gpu/tests/gpu_log_guided.rs` (parity tests).
+The GPU port of the all-float form (3.9). Files: `crates/ym-gpu/src/shaders/log_guided.wgsl`, `crates/ym-gpu/src/kernels/log_guided.rs` (wrapper, `KernelId::LogGuided`), `crates/ym-gpu/tests/gpu_log_guided.rs` (parity tests).
 
 ### 10.1 Layout
 
 - **One shader, one pipeline, four dispatches** in the split of section 5, selected by a `pass` field of the uniform: (0) the log taken on the fly at ±2 and the horizontal guide filter, `Lh`; (1) the vertical filter and `exp2`, `C = 2^max(Lv, 0)`; (2) the structure measures `Dh`, `Dv` from `C` and their horizontal 5-sums `SH`, `SV`; (3) the vertical 5-sums, the box means, the weights and the reconstruction. Each dispatch is per pixel over a small neighbourhood; there are no reductions and no barriers. The receptive field found by perturbing single photosites is exactly 5 px, so `Method::LogGuided.halo() = 5` holds for the kernel too.
-- **Storage.** `Lh`, `C`, `SH`, `SV` are four `f32` planes of one scratch buffer (16 bytes per pixel) in **every** storage mode: the guide is a logarithm and an `f16` plane of it has steps of 0.008 to 0.016 stop. The mosaic (input) and the three output planes use the device's storage type, as the other raw kernels do, so the kernel can sit between the front end and the colour chain later. With `f16` storage the input and output are rounded to `f16` (the open question on `f16` against `f32` storage, `docs/STATUS.md` question 2, therefore applies to the planes, not to the guide). The `f32` bounds below are for `f32` storage.
-- **Entry points** in `ym_gpu::kernels::log_guided`: `demosaic(ctx, &Mosaic, NoiseDn, guide_detail)` (one rectangle, mirrored at its edges), `demosaic_tiled(ctx, &Mosaic, NoiseDn, guide_detail, tile_px, &CancelToken)` and `demosaic_planned(.., &TilePlan, ..)` (tiles with 5 px of context, even left and top edges). They upload, run and read back. `p` and the kernel taps come from `cpu::demosaic::log_guided::derive`, so the numbers are not typed twice. The scratch must fit one storage binding (128 MiB by default, 8 million pixels): a 2048 px tile with its halo needs 68 MB.
-- **Not wired into the render path.** The raw stages still run the CPU reference; this task adds the kernel, its wrapper and the registry entry (`KernelId::ALL`, `tests/shaders_naga.rs` validates the module in all storage modes).
+- **Storage.** `Lh`, `C`, `SH`, `SV` are four f32 planes of one scratch buffer (16 bytes per pixel) in **every** storage mode: the guide is a logarithm and an f16 plane of it has steps of 0.008 to 0.016 stop. The mosaic (input) and the three output planes use the device's storage type: f32 in the device chain (`StoragePreference::Auto` resolves to F32, `docs/17-gpu.md` section 2), while the host wrappers also support the f16 modes for the tests. With f16 storage the input and output are rounded to f16. The bounds below are for f32 storage.
+- **Entry points** in `ym_gpu::kernels::log_guided`: `encode_demosaic` (device in, device out, the shape of `docs/17-gpu.md` section 3), `demosaic(ctx, &Mosaic, NoiseDn, guide_detail)` (one rectangle, mirrored at its edges), `demosaic_tiled(ctx, &Mosaic, NoiseDn, guide_detail, tile_px, &CancelToken)` and `demosaic_planned(.., &TilePlan, ..)` (tiles with 5 px of context, even left and top edges). The wrappers upload, run and read back. `p` and the kernel taps come from `cpu::demosaic::log_guided::derive`, so the numbers are not typed twice. The scratch must fit one storage binding (128 MiB by default, 8 million pixels): a 2048 px tile with its halo needs 68 MB.
+- **Not on the render path.** `KernelId::LogGuided` is registered (`KernelId::ALL`; `tests/shaders_naga.rs` validates the module in all storage modes). The device chain does not run it: a forced `LogGuided` method runs that photo's raw chain on the CPU (`docs/17-gpu.md` section 11).
 
 ### 10.2 Where it is not bit-exact
 
-`f32` against the CPU's `f64`, with the same order of operations except for two exact rewrites.
+f32 against the CPU's f64, with the same order of operations except for exact rewrites.
 
-- `log2` and `exp2` are the GPU's `f32` instructions (a few ulp on lavapipe), not the `f64` library functions rounded to `f32`.
-- The guide filters, the box sums and the reconstruction accumulate in `f32`. The filters are evaluated about the centre value (`Lh = Lc + Σ t_i (L_i − Lc)`; the taps sum to exactly 1) and the second differences as `|((C_a − C) + (C_b − C))/2|`. Both are the same function in real arithmetic. They keep the `f32` error relative to the differences of neighbouring values instead of to the values (the log is about 14, `C` is up to 10^5, an ulp of 0.008 against `p = 1`). Without them the weights of a perfectly flat guide differed by rounding noise: on a 1×2 mosaic the green sample was off by 1.1e-3. With them the same case agrees to the last bit.
-- The green blend is the `f32` form of 3.9 divided through by the **larger** of the two weights `max(D̄,1)³`, `max(Ē,1)³` instead of always by `w_h`: with `r = min/max` of `max(D̄,1)` and `max(Ē,1)` and `k = r³ ≤ 1`, the weights are `(w_h, w_v) = (1, k)` when `D̄ ≤ Ē` (exactly the spec's `t = (D̄/Ē)³` form) and `(k, 1)` when `D̄ > Ē`, and `green = C (w_h·HA + w_v·VA)/(w_h·HC + w_v·VC)`. It is the same blend. The single `t` form reached `t ≈ 10¹⁵` on a strong horizontal edge (`D̄ ≫ Ē ≈ p`) and `t·VC` overflowed `f32` for mosaic values above about 10⁵, giving NaN where the CPU's `f64` is finite (the review found it with vertical stripes; `huge_values_in_strongly_directional_frames_stay_finite_and_match` guards it).
+- `log2` and `exp2` are the shader's own f32 routines built from basic operations (`lg_log2`, `lg_exp2`), not the platform's f64 functions rounded to f32 and not the device's instructions. The logarithm is within an ulp of a large result and within 1e-8 of a small one. The power takes the filter's sum as two parts, the centre value and the small filter term, so that `Lc + acc` is never rounded to an ulp of its size (7.6e-6 near 116, a relative 5e-6 of the guide, where the CPU sums in f64); it is within 1.7 ulp of `2^(Lc + acc)`.
+- The guide filters, the box sums and the reconstruction accumulate in f32. Two exact rewrites keep the f32 error relative to the differences of neighbouring values instead of to the values (the log is about 14, `C` is up to 10^5, an ulp of 0.008 against `p = 1`): the filters are evaluated about the centre value (`Lh = Lc + Σ t_i (L_i − Lc)`; the taps sum to exactly 1) and the second differences as `|((C_a − C) + (C_b − C))/2| + p`. Without them a perfectly flat guide gave structure weights that differed by rounding noise (on a 1×2 mosaic the green sample was off by 1.1e-3).
+- The green blend is the f32 form of 3.9 divided through by the **larger** of the two weights `max(D̄,1)³`, `max(Ē,1)³` instead of always by `w_h`: with `r = min/max` of `max(D̄,1)` and `max(Ē,1)` and `k = r³ ≤ 1`, the weights are `(w_h, w_v) = (1, k)` when `D̄ ≤ Ē` (exactly the `t = (D̄/Ē)³` form) and `(k, 1)` when `D̄ > Ē`, and `green = C (w_h·HA + w_v·VA)/(w_h·HC + w_v·VC)`. It is the same blend. The single `t` form reaches `t ≈ 10¹⁵` on a strong horizontal edge (`D̄ ≫ Ē ≈ p`), and `t·VC` overflows f32 for mosaic values above about 10⁵, giving NaN where the CPU's f64 is finite (`huge_values_in_strongly_directional_frames_stay_finite_and_match` guards it).
 - The box mean is `Σ/25` (the float form has no floor, so the `floor(Σ·(1/25))` of section 8 does not arise).
 - The mosaic is not padded once by 5 px: every read of the mosaic or of a plane is mirrored into the rectangle (period 2(n−1), the edge sample not repeated). Section 3.0 shows this is the same function. Tiles with 5 px of context and the whole frame give the same pixels bit for bit.
-- `f32` range: the kernel stays finite up to mosaic values of about 3e32 and overflows near 1e33, where the 25-sample box sum of the structure measures leaves the `f32` range (the CPU's `f32` planes: between 1e33 and 3e33; `A = 65535·v` itself overflows at 5e33). A balanced mosaic is a few times white at most.
+- f32 range: the kernel stays finite up to mosaic values of about 3e32 and overflows near 1e33, where the 25-sample box sum of the structure measures leaves the f32 range (the CPU's f32 planes: between 1e33 and 3e33; `A = 65535·v` itself overflows at 5e33). A balanced mosaic is a few times white at most.
+- **Fast-math (Metal).** Metal compiles with fast-math (`docs/17-gpu.md` section 13). Each of the four quotients of the reconstruction (`C / HC`, `C / VC`, `C / (blend of HC, VC)`, `C / SC`) is behind a barrier (`lg_opaque`: an OR with the always-zero `ctl.y`), so that re-association cannot turn `x·(a/b)` into `(x·a)/b`, which overflows for a very bright frame (A above 1.8e19). Every partial sum, difference and product of the filters, the structure measures and the reconstruction is behind `lg_opaque` too, so that fusion cannot fold the second differences back into `(a + b) − 2c`. With these, a C port of the shader compiled with clang `-O2` or `-O3 -ffast-math -ffp-contract=fast -mfma`, `log2` 2 ulp and a reciprocal 1 ulp off, gives at most 1.8e-7 of the peak on the stripes of `huge_values_in_strongly_directional_frames_stay_finite_and_match` at every scale. The divisions left to the device move a sample by an ulp or two and decide nothing discontinuous (where the two box means tie, the two blend weights are both 1).
 
-### 10.3 Results (lavapipe, `WGPU_BACKEND=vulkan`, Mesa 25.2.8, LLVM 20.1.2; `cargo test -p ym-gpu --test gpu_log_guided`)
+### 10.3 Results
 
-Max |GPU − CPU reference|, `f32` storage, in normalised units:
+`cargo test -p ym-gpu --test gpu_log_guided` on lavapipe (`WGPU_BACKEND=vulkan`). Maximum |GPU − CPU reference|, f32 storage, in normalised units:
 
 | Case | Asserted | Measured |
 |---|---|---|
-| 16 vectors against `expected_float` | 2e-5 (the vectors' own tolerance, 1e-4, holds too) | 3.1e-6 (`highlights_*`, values up to 3.4), 1.8e-6 (`zone_plate`), ≤ 8.4e-7 elsewhere |
-| random frames in 0..1.3, all four phases, odd and even sizes, `guide_detail` −50, 0, 100, several noise models | 5e-5 | 4.8e-6 |
-| frames from −0.05 to 20 with NaN and infinity samples, four phases | 1e-5 of the peak | 1.3e-6 of the peak (native samples bit-exact, interpolated ≥ 0) |
-| 1×1 to 7×7, two phases (the mirror wraps inside the halo) | 5e-5 | 1.5e-5 (1×3) |
-| 203×157, tiles of 32, 50, 64, 100, two phases | bit-identical to the whole GPU frame; 5e-5 against the CPU | 0; 2.4e-6 |
-| 2048×1365 in four tiles of 1024 | 5e-5 | 3.2e-6 |
-| crops by one row or column (the phase flips), flips of the mosaic | 5e-5 | 0; 1.2e-7 |
-| `f16` storage (packed and native), random frames in 0..1.3 | 5e-5 plus half an `f16` ulp of the value | 4.9e-4 (the half ulp at 1.0) |
-| `f16` storage, the 16 vectors (values up to 3.4) | the same | 9.6e-4 (the half ulp at 3.4 is 9.8e-4) |
-| stripes of one direction (one structure measure at `p`, the other as large as the signal), values from 4e2 to 4e30, both directions | 1e-5 of the peak, every sample finite | 1.1e-6 of the peak |
-| 14 extra inputs of the review against the C++ oracle's `demosaic_float` (sizes 1x1 to 128x96, all four phases, `guide_detail` -50 to 100, several noise models, values from 1e-5 to 136; run outside the repository) | the CPU bound | the Rust CPU port: 0.0 on all; the GPU: at most 2.1e-6 of the peak (9.9e-5 absolute at a peak of 136; 7e-6 on a 97x63 texture with values up to 12) |
+| 16 vectors against `expected_float` | 2e-5 (the vectors' own tolerance, 1e-4, holds too) | 4.8e-7 (`highlights_*`, values up to 3.4), 2.7e-7 (`zone_plate`), ≤ 4.2e-7 elsewhere |
+| random frames in 0..1.3, all four phases, odd and even sizes, `guide_detail` −50, 0, 100, several noise models | 5e-5 | 3.6e-6 |
+| frames from −0.05 to 20 with NaN and infinity samples, four phases | 1e-5 of the peak | 4.2e-7 of the peak (native samples bit-exact, interpolated ≥ 0) |
+| stripes of one direction (one structure measure at `p`, the other as large as the signal), values from 1e3 to 1e30, both directions | 1e-5 of the peak, every sample finite | 1.25e-7 of the peak at every scale |
+| 1×1 to 7×7, two phases (the mirror wraps inside the halo) | 5e-5 | 2.1e-6 |
+| tiny and odd shapes (1×1, 1×9, 3×33, …) with tile sizes 0 to 8 | bit-identical to the whole frame | 0 |
+| 203×157, tiles of 32 to 100 px, two phases | bit-identical to the whole GPU frame; 5e-5 against the CPU | 0; 9.5e-7 |
+| 2048×1365 in four tiles of 1024 | 5e-5 | 1.6e-6 |
+| crops by one row or column (the phase flips), flips of the mosaic | 5e-5 | 0; 1.8e-7 |
+| f16 storage (packed and native), random frames in 0..1.3 | 5e-5 plus half an f16 ulp of the value | 4.9e-4 (the half ulp at 1.0) |
+| 14 extra inputs against the C++ oracle's `demosaic_float` (sizes 1×1 to 128×96, all four phases, `guide_detail` −50 to 100, several noise models, values from 1e-5 to 136; run outside the repository) | the CPU bound | the Rust CPU port: 0.0 on all; the GPU: at most 2.1e-6 of the peak |
 
-Also asserted: flat fields come back within 1e-6 relative in all four phases; a zero field and an all-negative field give zero interpolated samples and unchanged natives; out-of-range `guide_detail` is clamped like the CPU; a plan without context, a plan for another size, an empty mosaic and a cancelled token are refused; two runs (whole and tiled) are bit-identical in every storage mode. Metal and real-GPU runs, and timings on a real GPU, are not done (no Mac or GPU here; `M0-H4`). The 2048×1365 frame takes 1 to 3 s on lavapipe (a CPU rasteriser on shared cores), which says nothing about a GPU.
+Also asserted: flat fields come back within 1e-6 relative in all four phases; a zero field and an all-negative field give zero interpolated samples and unchanged natives; out-of-range `guide_detail` is clamped like the CPU; a plan without context, a plan for another size, an empty mosaic and a cancelled token are refused; two runs (whole and tiled) are bit-identical in every storage mode. The 2048×1365 frame takes 1 to 3 s on lavapipe (a CPU rasteriser on shared cores), which says nothing about a GPU. Timing on a real GPU is a Mac check (M0-H4 in `docs/15-milestones.md`).

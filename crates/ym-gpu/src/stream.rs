@@ -23,7 +23,10 @@
 //! middle of recording and is handed out again would therefore have its *later* contents (a second
 //! uniform block, a second stage's input) visible to the *earlier* pass. [`PassList::scratch`],
 //! [`PassList::uniform`] and [`PassList::keep`] hold their buffers until the submission has been
-//! waited for, so a buffer is never reused inside the list that is still recording with it.
+//! waited for, so a buffer is never reused inside the list that is still recording with it. That is the local rule; the
+//! structural one is the pool's quarantine (`crate::pool`, *Quarantine*): every list is registered with the pool while it
+//! records, and a buffer released meanwhile, by whatever code and whether or not it called `keep`, is neither reused,
+//! poisoned nor trimmed until the list has been submitted or dropped.
 //!
 //! # Determinism
 //!
@@ -31,7 +34,7 @@
 //! poison mode of `crate::pool` makes visible).
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -52,11 +55,35 @@ pub const MAX_GROUPS_PER_DIMENSION: u32 = 65_535;
 pub const CHUNK_BYTES: u64 = 64 << 20;
 
 /// Passes of one list that can be timed; later passes run untimed.
-const MAX_TIMED_PASSES: u32 = 128;
+const MAX_TIMED_PASSES: u32 = 512;
 
 // ---------------------------------------------------------------------------------------------
 // Counters
 // ---------------------------------------------------------------------------------------------
+
+static NEXT_LIST: AtomicU64 = AtomicU64::new(1);
+
+/// Invocations a dispatch is counted at per workgroup: the kernels use workgroups of 64 to 256, and the budget is an
+/// estimate of the work in a command buffer, not a measure.
+pub const INVOCATIONS_PER_GROUP: u64 = 256;
+
+/// The most work one submission holds before [`PassList::dispatch`] starts another: 32 million invocations, a few tens of
+/// milliseconds of simple passes on an M1, which is the job length K5 of `docs/17-gpu.md` asks for (the Metal watchdog
+/// and the Windows TDR kill a command buffer that runs for seconds, and a virtual GPU is slower than any of them). A
+/// command buffer that would pass it is submitted first and the rest goes into the next; the queue keeps the order, so the
+/// result is the same bytes. One dispatch is never cut: a pass over a plane of the design binding is 4.8 million pixels.
+pub const WORK_BUDGET: u64 = 32 << 20;
+
+/// The most compute passes one command buffer of a [`PassList`] holds before [`PassList::dispatch`] submits what is
+/// recorded and goes on in a new one, exactly as the [`WORK_BUDGET`] does. Metal refuses a queue more than 4096
+/// command buffers that are created and not yet submitted (wgpu-hal `MAX_COMMAND_BUFFERS`) and treats the refusal as a
+/// lost device; wgpu-core opens about two hal command buffers for every compute pass (one for the pass, one "Pre Pass"
+/// for its barriers) and one more for each run of copies between passes, and the count falls only when the encoder is
+/// submitted. A tiled job records thousands of small passes, and the count is per queue, so lists recording on two
+/// threads share it. 256 passes are under 800 hal buffers per list, which leaves room for several lists at once.
+/// Lavapipe has no such limit, so only the counters (`max_split_passes`) and the test `pass_budget` guard this.
+/// `docs/17-gpu.md` section 8.
+pub const PASS_BUDGET: u32 = 256;
 
 /// What the device has been asked to do, counted since it opened. Read with
 /// [`GpuContext::counters`] or [`crate::device::Gpu::counters`]; subtract two snapshots to measure a
@@ -69,6 +96,21 @@ pub struct Counters {
     readback_bytes: AtomicU64,
     submissions: AtomicU64,
     dispatches: AtomicU64,
+    plane_builds: AtomicU64,
+    plane_hits: AtomicU64,
+    pipelines: AtomicU64,
+    pipeline_micros: AtomicU64,
+    precise_dispatches: AtomicU64,
+    /// A test's switch: no raster plane is kept or served on this device.
+    planes_off: AtomicBool,
+    /// The most invocations one submission may hold before the list starts another ([`WORK_BUDGET`] unless a test sets it).
+    work_budget: AtomicU64,
+    /// The most compute passes one submission may hold before the list starts another ([`PASS_BUDGET`] unless a test sets it).
+    pass_budget: AtomicU32,
+    /// The most compute passes any submission of a list held.
+    max_split_passes: AtomicU32,
+    /// The most invocations a submission of more than one dispatch held (a submission of one dispatch cannot be cut).
+    max_split_work: AtomicU64,
     /// GPU time per pass label, from the timestamp queries of the lists that were timed (empty unless the
     /// device was opened with [`GpuConfig::timestamps`](crate::device::GpuConfig::timestamps)).
     passes: Mutex<BTreeMap<String, PassTotal>>,
@@ -136,6 +178,70 @@ impl Counters {
         self.dispatches.fetch_add(n, Ordering::Relaxed);
     }
 
+    /// `builds` raster rows whose planes were made and `hits` that were copied from the kept planes.
+    pub(crate) fn count_planes(&self, builds: u64, hits: u64) {
+        self.plane_builds.fetch_add(builds, Ordering::Relaxed);
+        self.plane_hits.fetch_add(hits, Ordering::Relaxed);
+    }
+
+    /// One compute pipeline built (the shader compiled), which took `micros` microseconds.
+    pub(crate) fn count_pipeline(&self, micros: u64) {
+        self.pipelines.fetch_add(1, Ordering::Relaxed);
+        self.pipeline_micros.fetch_add(micros, Ordering::Relaxed);
+    }
+
+    /// One colour or Film dispatch that runs the compensated arithmetic of the export (`precise.wgsl`, F-08d) and not the
+    /// plain f32 arithmetic of a view.
+    pub(crate) fn count_precise(&self) {
+        self.precise_dispatches.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The invocations a submission may hold, see [`WORK_BUDGET`].
+    pub(crate) fn work_budget(&self) -> u64 {
+        match self.work_budget.load(Ordering::Relaxed) {
+            0 => WORK_BUDGET,
+            n => n,
+        }
+    }
+
+    /// Sets the work budget of a submission (0: the default), for a test.
+    pub fn set_work_budget(&self, invocations: u64) {
+        self.work_budget.store(invocations, Ordering::Relaxed);
+    }
+
+    /// The compute passes a submission may hold, see [`PASS_BUDGET`].
+    pub(crate) fn pass_budget(&self) -> u32 {
+        match self.pass_budget.load(Ordering::Relaxed) {
+            0 => PASS_BUDGET,
+            n => n,
+        }
+    }
+
+    /// Sets the pass budget of a submission (0: the default), for a test.
+    pub fn set_pass_budget(&self, passes: u32) {
+        self.pass_budget.store(passes, Ordering::Relaxed);
+    }
+
+    /// A submission that held `work` invocations in `dispatches` dispatches.
+    pub(crate) fn record_submission_work(&self, work: u64, dispatches: u32) {
+        self.max_split_passes
+            .fetch_max(dispatches, Ordering::Relaxed);
+        if dispatches > 1 {
+            self.max_split_work.fetch_max(work, Ordering::Relaxed);
+        }
+    }
+
+    /// Whether the kept raster planes are switched off ([`Counters::set_planes_kept`]).
+    pub(crate) fn planes_kept_off(&self) -> bool {
+        self.planes_off.load(Ordering::Relaxed)
+    }
+
+    /// Switches the kept raster planes of this device on (the default) or off, for a test that holds a frame made
+    /// with them to the frame made without.
+    pub fn set_planes_kept(&self, on: bool) {
+        self.planes_off.store(!on, Ordering::Relaxed);
+    }
+
     /// The current values.
     pub fn snapshot(&self) -> CounterSnapshot {
         CounterSnapshot {
@@ -145,6 +251,13 @@ impl Counters {
             readback_bytes: self.readback_bytes.load(Ordering::Relaxed),
             submissions: self.submissions.load(Ordering::Relaxed),
             dispatches: self.dispatches.load(Ordering::Relaxed),
+            plane_builds: self.plane_builds.load(Ordering::Relaxed),
+            plane_hits: self.plane_hits.load(Ordering::Relaxed),
+            pipelines: self.pipelines.load(Ordering::Relaxed),
+            pipeline_micros: self.pipeline_micros.load(Ordering::Relaxed),
+            precise_dispatches: self.precise_dispatches.load(Ordering::Relaxed),
+            max_split_work: self.max_split_work.load(Ordering::Relaxed),
+            max_split_passes: self.max_split_passes.load(Ordering::Relaxed),
         }
     }
 }
@@ -164,6 +277,25 @@ pub struct CounterSnapshot {
     pub submissions: u64,
     /// Compute dispatches recorded by [`PassList::dispatch`].
     pub dispatches: u64,
+    /// Raster rows whose planes were made (resample, Grow, Feather, Refine edges, quantise) by a view's pass.
+    pub plane_builds: u64,
+    /// Raster rows whose planes a view's pass copied from the planes kept on the device instead.
+    pub plane_hits: u64,
+    /// Compute pipelines built (shaders compiled). A frame that builds one waited for the compiler; the
+    /// warm-up builds them all before the first frame needs them (`docs/17-gpu.md` section 7).
+    pub pipelines: u64,
+    /// Microseconds those builds took.
+    pub pipeline_micros: u64,
+    /// Colour-chain and Film dispatches that ran the compensated arithmetic of the export. A viewer frame has none: a view
+    /// runs the plain f32 arithmetic it had before F-08d (`docs/24` section 3.9c "Speed").
+    pub precise_dispatches: u64,
+    /// The most invocations (workgroups x [`INVOCATIONS_PER_GROUP`]) any submission of more than one dispatch held since the
+    /// device opened: at most the work budget, which is what keeps one command buffer short (`docs/17-gpu.md` K5). Not a
+    /// difference of two readings: it is a maximum.
+    pub max_split_work: u64,
+    /// The most compute passes any single submission of a list held since the device opened: at most the pass budget
+    /// ([`PASS_BUDGET`]), which is what keeps Metal under its 4096 outstanding command buffers. A maximum, not a difference.
+    pub max_split_passes: u32,
 }
 
 impl CounterSnapshot {
@@ -177,6 +309,15 @@ impl CounterSnapshot {
             readback_bytes: self.readback_bytes.saturating_sub(earlier.readback_bytes),
             submissions: self.submissions.saturating_sub(earlier.submissions),
             dispatches: self.dispatches.saturating_sub(earlier.dispatches),
+            plane_builds: self.plane_builds.saturating_sub(earlier.plane_builds),
+            plane_hits: self.plane_hits.saturating_sub(earlier.plane_hits),
+            pipelines: self.pipelines.saturating_sub(earlier.pipelines),
+            pipeline_micros: self.pipeline_micros.saturating_sub(earlier.pipeline_micros),
+            precise_dispatches: self
+                .precise_dispatches
+                .saturating_sub(earlier.precise_dispatches),
+            max_split_work: self.max_split_work,
+            max_split_passes: self.max_split_passes,
         }
     }
 }
@@ -194,8 +335,17 @@ fn wait_submission(
     timeout: Duration,
     submission: Option<wgpu::SubmissionIndex>,
 ) -> Result<(), GpuError> {
+    // Always the queue's latest submission, never `submission` itself (kept so that callers say what they wait for).
+    // wgpu-hal 30's Metal fence is only sound for the newest submission: `Queue::submit` first drops the pending
+    // command buffers whose `MTLCommandBuffer` status is already Completed, but the fence value is published later by
+    // that buffer's completed handler. A wait for an older index in that gap finds neither the value nor the
+    // pending buffer and returns `DeviceError::Lost` ("No active command buffers for fence value"), which wgpu turns
+    // into a permanent "Device is lost". A later submission (a split list's pieces, a staging flush, another list's
+    // `submit`) between our submit and our wait opens that gap; the newest one cannot be dropped, and the queue
+    // completes in order, so waiting for it waits at least for ours. Other backends are unaffected.
+    let _ = submission;
     match device.poll(wgpu::PollType::Wait {
-        submission_index: submission,
+        submission_index: None,
         timeout: Some(timeout),
     }) {
         Ok(_) => health.check(),
@@ -484,12 +634,32 @@ struct TimestampState {
 /// Dropping a list without submitting it discards the recorded commands and returns its buffers to
 /// the pool.
 pub struct PassList<'a> {
+    /// Registers the list with the pool while it records, so what is released meanwhile is quarantined.
+    open: OpenList,
     ctx: &'a GpuContext,
     encoder: wgpu::CommandEncoder,
     keep: Vec<Arc<PooledBuffer>>,
     reads: Vec<ReadSlot>,
     dispatches: u32,
     timestamps: Option<TimestampState>,
+    id: u64,
+    after_submit: Vec<Box<dyn FnOnce() + Send>>,
+    /// Invocations and dispatches recorded in the encoder since the last submission of this list.
+    work: u64,
+    encoder_dispatches: u32,
+}
+
+/// The pool's record that a list is recording (`BufferPool::open_list`); ends the list when
+/// dropped, which is on submission or when the list is discarded.
+struct OpenList {
+    pool: crate::pool::BufferPool,
+    id: u64,
+}
+
+impl Drop for OpenList {
+    fn drop(&mut self) {
+        self.pool.close_list(self.id);
+    }
 }
 
 impl std::fmt::Debug for PassList<'_> {
@@ -516,14 +686,35 @@ impl<'a> PassList<'a> {
             }),
             labels: Vec::new(),
         });
+        let id = NEXT_LIST.fetch_add(1, Ordering::Relaxed);
+        ctx.pool().open_list(id);
         PassList {
+            open: OpenList {
+                pool: ctx.pool().clone(),
+                id,
+            },
             ctx,
             encoder,
             keep: Vec::new(),
             reads: Vec::new(),
             dispatches: 0,
             timestamps,
+            id,
+            after_submit: Vec::new(),
+            work: 0,
+            encoder_dispatches: 0,
         }
+    }
+
+    /// A number no other list of the process has.
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
+    /// Runs `f` once the list has been submitted (not when it is dropped without a submission, nor when the
+    /// submission fails): what a cache that keeps a buffer this list fills must wait for before it serves it.
+    pub fn on_submit(&mut self, f: impl FnOnce() + Send + 'static) {
+        self.after_submit.push(Box::new(f));
     }
 
     /// The device context the list records for.
@@ -548,6 +739,13 @@ impl<'a> PassList<'a> {
         let shared = Arc::new(buffer);
         self.keep.push(Arc::clone(&shared));
         shared
+    }
+
+    /// Keeps a buffer somebody else owns (a resident table, a plane uploaded once per photo) alive until
+    /// the work has finished, so it cannot go back to the pool and be written by a later job while this
+    /// list's passes still read it.
+    pub fn hold(&mut self, buffer: Arc<PooledBuffer>) {
+        self.keep.push(buffer);
     }
 
     /// A scratch storage buffer of `bytes` bytes that only kernels touch, kept alive by the list.
@@ -611,6 +809,19 @@ impl<'a> PassList<'a> {
         if groups.0 == 0 || groups.1 == 0 || groups.2 == 0 {
             return Ok(());
         }
+        // A command buffer that would hold more than the work budget (K5) or the pass budget (Metal's 4096 outstanding command
+        // buffers) is submitted first: the rest of the list goes into the next one. Timed lists split too: the query set is a
+        // resource, and wgpu-core resolves slots written in an earlier submission (it keeps which slots are initialized and
+        // defers the resolve to submit), so the one resolve at `submit` reads them all.
+        let work =
+            u64::from(groups.0) * u64::from(groups.1) * u64::from(groups.2) * INVOCATIONS_PER_GROUP;
+        let counters = self.ctx.counters_shared();
+        if self.encoder_dispatches > 0
+            && (self.work + work > counters.work_budget()
+                || self.encoder_dispatches >= counters.pass_budget())
+        {
+            self.flush()?;
+        }
         let pipeline = self.ctx.kernels().pipeline(self.ctx, kernel)?;
         let bind_group = bind(self.ctx, &pipeline, label, entries);
         let timestamp_writes = self.timestamps.as_mut().and_then(|t| {
@@ -635,6 +846,32 @@ impl<'a> PassList<'a> {
         pass.dispatch_workgroups(groups.0, groups.1, groups.2);
         drop(pass);
         self.dispatches += 1;
+        self.encoder_dispatches += 1;
+        self.work += work;
+        Ok(())
+    }
+
+    /// Submits what is recorded so far as a command buffer of its own and goes on recording into a new one. The buffers the
+    /// list keeps stay alive until the whole list has finished, the readbacks it asked for are read after the last
+    /// submission, and what follows sees what came before (the queue runs submissions in order).
+    ///
+    /// # Errors
+    ///
+    /// [`GpuError::DeviceLost`] when the device is lost or tainted.
+    fn flush(&mut self) -> Result<(), GpuError> {
+        let fresh = self
+            .ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("view continued"),
+            });
+        let done = std::mem::replace(&mut self.encoder, fresh);
+        self.ctx.submit([done.finish()])?;
+        self.ctx
+            .counters_shared()
+            .record_submission_work(self.work, self.encoder_dispatches);
+        self.work = 0;
+        self.encoder_dispatches = 0;
         Ok(())
     }
 
@@ -704,7 +941,14 @@ impl<'a> PassList<'a> {
         let dispatches = self.dispatches;
         ctx.counters_shared()
             .count_dispatches(u64::from(dispatches));
+        ctx.counters_shared()
+            .record_submission_work(self.work, self.encoder_dispatches);
         let submission = ctx.submit([self.encoder.finish()])?;
+        // The commands are on the queue: what the list had open to reuse is ordered after them.
+        drop(self.open);
+        for f in std::mem::take(&mut self.after_submit) {
+            f();
+        }
         Ok(Pending {
             device: ctx.device.clone(),
             health: ctx.health_arc(),

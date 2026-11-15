@@ -56,11 +56,11 @@ fn run(label: &str, models: IlluminantModels, files: &[PathBuf]) -> Vec<(String,
             view.camera.matched.body,
             source,
             photo.iso,
-            s.kelvin,
-            s.tint,
+            s.input.kelvin,
+            s.input.tint,
             s.light_confidence,
             s.light_class.name(),
-            s.exposure_ev,
+            s.input.exposure_ev,
             view.estimates.exposure.meter.ev_before_guard,
             view.estimates.exposure.meter.guard_reduction_ev,
             // What the old metering would have chosen (reported only, it moves nothing).
@@ -68,19 +68,19 @@ fn run(label: &str, models: IlluminantModels, files: &[PathBuf]) -> Vec<(String,
             s.noise.a,
             s.noise.b,
             view.estimates.noise.source,
-            s.sharpen.amount,
-            s.sharpen.radius_px,
-            s.noise_reduction.luminance,
+            s.input.sharpen.amount,
+            s.input.sharpen.radius_px,
+            s.input.noise_reduction.luminance,
         );
         assert!(
-            s.exposure_ev.is_finite() && s.exposure_ev.abs() <= 4.0,
+            s.input.exposure_ev.is_finite() && s.input.exposure_ev.abs() <= 4.0,
             "{name}: EV {}",
-            s.exposure_ev
+            s.input.exposure_ev
         );
         assert!(
-            (2000.0..=11000.0).contains(&s.kelvin),
+            (2000.0..=11000.0).contains(&s.input.kelvin),
             "{name}: {} K",
-            s.kelvin
+            s.input.kelvin
         );
         assert!(
             s.noise.a > 0.0 && s.noise.a < 1e-2,
@@ -88,7 +88,7 @@ fn run(label: &str, models: IlluminantModels, files: &[PathBuf]) -> Vec<(String,
             s.noise.a
         );
         assert!(s.noise.b >= 0.0 && s.noise.b.is_finite());
-        rows.push((name, s.kelvin, s.tint, s.exposure_ev));
+        rows.push((name, s.input.kelvin, s.input.tint, s.input.exposure_ev));
     }
     rows
 }
@@ -189,15 +189,15 @@ fn every_file_of_the_synthetic_variant_set_develops() {
                 let e = session.estimates(photo.id).unwrap();
                 let s = e.summary();
                 assert!(
-                    s.exposure_ev.is_finite() && s.exposure_ev.abs() <= 4.0,
+                    s.input.exposure_ev.is_finite() && s.input.exposure_ev.abs() <= 4.0,
                     "{}",
                     photo.file_name
                 );
                 assert!(
-                    (2000.0..=11000.0).contains(&s.kelvin),
+                    (2000.0..=11000.0).contains(&s.input.kelvin),
                     "{}: {}",
                     photo.file_name,
-                    s.kelvin
+                    s.input.kelvin
                 );
                 assert!(
                     s.noise.a > 0.0 && s.noise.a.is_finite(),
@@ -206,7 +206,7 @@ fn every_file_of_the_synthetic_variant_set_develops() {
                 );
                 eprintln!(
                     "{:<46} EV {:>5.2} {:>5.0} K  a {:.1e}  {:?}",
-                    photo.file_name, s.exposure_ev, s.kelvin, s.noise.a, e.noise.source
+                    photo.file_name, s.input.exposure_ev, s.input.kelvin, s.noise.a, e.noise.source
                 );
             }
             PhotoStatus::Skipped { reason } => {
@@ -226,7 +226,7 @@ fn old_metric_median_luminance_against_the_embedded_jpegs_of_the_real_files_info
     // Mykyta's decision of 2026-10-13 (`docs/16`): the median luminance in linear light of our
     // render at `EV_auto` against the median of the camera's embedded JPEG. That metric mixes in
     // the camera's tone curve and the scene's key, so its errors are not all exposure errors
-    // (nine real files under the metered rule and ACES 2 without the placement: median -0.28 EV,
+    // (nine real files under the metered rule and the old ACES 2 display transform without its placement: median -0.28 EV,
     // `docs/02` Evaluation; since 2026-10-14 `EV_auto` is the camera's gain, +1.11 EV, and this
     // test reads 9 of 9 within +-0.5 EV on the nine files of `testdata/real/files`, errors -0.45
     // (DSLR-A300) to +0.41 (A7 II); `autoexp.py` G1 on the twelve local files of `docs/02` Gate

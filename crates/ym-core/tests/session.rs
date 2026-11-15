@@ -15,16 +15,21 @@ use common::{Layout, Scene, base_env, light, session_with_events, settle};
 use ym_color::exposure::CAMERA_GAIN_EV;
 use ym_color::wb::LightSource;
 use ym_core::auto::NoiseSource;
+use ym_core::media::{CHANGED_MESSAGE, Media};
+use ym_core::scheduler::MemoryLedger;
 use ym_core::session::{
     ApplyScope, EventSink, OpenOptions, PhotoId, PhotoProgress, PhotoStage, PhotoStatus, Session,
     SessionError, SessionEvent, ThumbnailInput, ThumbnailRenderer, default_decode_threads,
+    default_decode_threads_for,
 };
 use ym_core::settings::{
     AutoOr, ColorBalancePatch, Crop, CropAspect, CurvesPatch, DecodePatch, ExposureSetting,
     NoiseReductionManualPatch, NormRect, Orientation, RolloffPatch, SettingsPatch,
     SharpenManualPatch, WhiteBalanceManualPatch, WhiteBalanceValue,
 };
+use ym_core::settings::{GradePatch, NodeId, NodePatch};
 use ym_looks::library::LookId;
+use ym_raw::error::MESSAGE_NOT_FOUND;
 use ym_raw::layout::ChromaSubsampling;
 use ym_raw::testgen::{ArwBuilder, ContainerOnly, CrawEncoder, LosslessL, LosslessMs};
 
@@ -204,10 +209,9 @@ fn a_mixed_folder_opens_with_per_file_errors_that_block_nothing() {
         reason("h_corrupt.ARW"),
         "This isn't an ARW file. Yellowmoon opens Sony ARW files only."
     );
-    assert!(
-        reason("i_truncated.ARW").starts_with("This file is damaged or incomplete"),
-        "{}",
-        reason("i_truncated.ARW")
+    assert_eq!(
+        reason("i_truncated.ARW"),
+        "This file is incomplete: it ends before its picture does. Copy it from the card again, or skip it."
     );
     // A skipped photo has no estimates and says why.
     let id = by_name["h_corrupt.ARW"].id;
@@ -264,7 +268,10 @@ fn a_drop_without_arw_files_says_so() {
     let (session, _rx) = session_with_events();
     let outcome = session.open(&[dir.path().to_path_buf()], OpenOptions::default());
     assert!(outcome.no_arw());
-    assert_eq!(outcome.message(), Some("No ARW files in what you dropped."));
+    assert_eq!(
+        outcome.message().as_deref(),
+        Some("No ARW files in what you dropped.")
+    );
     assert_eq!(outcome.ignored, 2);
     assert!(session.state().photos.is_empty());
     assert_eq!(session.state().current_index, None);
@@ -276,6 +283,34 @@ fn a_drop_without_arw_files_says_so() {
     assert!(outcome.no_arw());
     assert_eq!(outcome.ignored, 1);
     assert_eq!(outcome.missing, vec![dir.path().join("nope.ARW")]);
+}
+
+/// A folder with mode 000 is not an empty folder (`docs/26` H-02). Skipped when the test runs as root,
+/// which may read it anyway; the seam test in `session.rs` covers the logic then.
+#[cfg(unix)]
+#[test]
+fn an_unreadable_folder_says_so_and_is_not_no_arw() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let locked = dir.path().join("Locked");
+    std::fs::create_dir_all(&locked).unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let readable = std::fs::read_dir(&locked).is_ok();
+    let (session, _rx) = session_with_events();
+    let outcome = session.open(std::slice::from_ref(&locked), OpenOptions::default());
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+    if readable {
+        eprintln!("skipped: this user can read a folder with mode 000 (root)");
+        return;
+    }
+    assert_eq!(outcome.unreadable, [locked]);
+    assert!(outcome.no_arw());
+    assert_eq!(
+        outcome.message().as_deref(),
+        Some(
+            "Yellowmoon can't read the folder Locked. Check that it is still there and that you may open it, then try again."
+        )
+    );
 }
 
 #[test]
@@ -352,6 +387,223 @@ fn a_decode_failure_after_a_good_probe_ends_the_sequence_with_the_reason() {
     assert!(camera.card().note.unwrap().contains("borrows the A7R IV"));
 }
 
+// --- A file that goes away or changes (docs/26 P1-4, H-04) -----------------------------------
+
+/// Eight photos, settled; the first is current. Returns the folder, the session, its events and
+/// the ids in file order. `p0` and `p1` are cached; `p5` is not.
+fn eight_photos() -> (
+    tempfile::TempDir,
+    Session,
+    mpsc::Receiver<SessionEvent>,
+    Vec<PhotoId>,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    for i in 0..8 {
+        write_plain(dir.path(), &format!("p{i}.ARW"), 0.25 + 0.01 * f64::from(i));
+    }
+    let (session, rx) = session_with_events();
+    session.open(&[dir.path().to_path_buf()], OpenOptions::default());
+    settle(&session);
+    let ids = session.photo_ids();
+    assert!(!session.cached_ids().contains(&ids[5]));
+    (dir, session, rx, ids)
+}
+
+/// The progress events of `id` that carry an error.
+fn errors_of(rx: &mpsc::Receiver<SessionEvent>, id: PhotoId) -> Vec<PhotoProgress> {
+    progress_by_photo(rx)
+        .remove(&id)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|p| p.error.is_some())
+        .collect()
+}
+
+fn skipped_with(session: &Session, id: PhotoId, sentence: &str) {
+    assert_eq!(
+        session.status(id),
+        Some(PhotoStatus::Skipped {
+            reason: sentence.to_owned()
+        })
+    );
+}
+
+/// What the person is told when the skipped photo is asked for again: the same sentence.
+fn asked_again(session: &Session, id: PhotoId, sentence: &str) {
+    match session.raw_image(id) {
+        Err(SessionError::Skipped(reason)) => assert_eq!(reason, sentence),
+        other => panic!(
+            "expected the photo to be skipped, got {:?}",
+            other.map(|_| ())
+        ),
+    }
+}
+
+#[test]
+fn a_file_deleted_after_it_was_opened_skips_the_photo_with_the_not_found_sentence_and_an_event() {
+    let (dir, session, rx, ids) = eight_photos();
+    let _ = progress_by_photo(&rx);
+    std::fs::remove_file(dir.path().join("p5.ARW")).unwrap();
+
+    match session.raw_image(ids[5]) {
+        Err(SessionError::Skipped(reason)) => assert_eq!(reason, MESSAGE_NOT_FOUND),
+        other => panic!("expected Skipped, got {:?}", other.map(|_| ())),
+    }
+    skipped_with(&session, ids[5], MESSAGE_NOT_FOUND);
+    let events = errors_of(&rx, ids[5]);
+    assert_eq!(events.len(), 1, "one error event: {events:?}");
+    assert_eq!(events[0].stage, PhotoStage::Decode);
+    assert!(events[0].done);
+    assert_eq!(events[0].error.as_deref(), Some(MESSAGE_NOT_FOUND));
+    // Asked again (every render asks): the same answer, and no second event.
+    asked_again(&session, ids[5], MESSAGE_NOT_FOUND);
+    assert!(errors_of(&rx, ids[5]).is_empty());
+    // Nothing else is touched; a render source and a view refuse the photo the way a photo that was
+    // skipped at open is refused.
+    assert!(matches!(
+        session.view(ids[5]),
+        Err(SessionError::Skipped(_))
+    ));
+    assert_eq!(session.status(ids[4]), Some(PhotoStatus::Ready));
+}
+
+#[test]
+fn a_file_cut_short_after_it_was_opened_skips_the_photo_with_the_changed_sentence() {
+    let (dir, session, rx, ids) = eight_photos();
+    let _ = progress_by_photo(&rx);
+    let path = dir.path().join("p5.ARW");
+    let bytes = std::fs::read(&path).unwrap();
+    std::fs::write(&path, &bytes[..bytes.len() / 2]).unwrap();
+
+    asked_again(&session, ids[5], CHANGED_MESSAGE);
+    skipped_with(&session, ids[5], CHANGED_MESSAGE);
+    let events = errors_of(&rx, ids[5]);
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(events[0].error.as_deref(), Some(CHANGED_MESSAGE));
+    assert_eq!(
+        CHANGED_MESSAGE,
+        "This file changed after it was opened. Remove it from the filmstrip and open it again."
+    );
+}
+
+#[test]
+fn a_file_made_longer_or_rewritten_with_another_time_is_changed() {
+    let (dir, session, rx, ids) = eight_photos();
+    let _ = progress_by_photo(&rx);
+    // Longer: a few bytes appended.
+    let path = dir.path().join("p5.ARW");
+    let mut bytes = std::fs::read(&path).unwrap();
+    bytes.extend_from_slice(&[0; 16]);
+    std::fs::write(&path, &bytes).unwrap();
+    asked_again(&session, ids[5], CHANGED_MESSAGE);
+    assert_eq!(errors_of(&rx, ids[5]).len(), 1);
+
+    // Rewritten with the same length: the modification time is set by hand, so the test does not
+    // depend on the clock moving between two writes.
+    let path = dir.path().join("p6.ARW");
+    let before = std::fs::metadata(&path).unwrap().modified().unwrap();
+    let bytes = std::fs::read(&path).unwrap();
+    std::fs::write(&path, &bytes).unwrap();
+    let file = std::fs::File::options().write(true).open(&path).unwrap();
+    file.set_modified(before + Duration::from_secs(3600))
+        .unwrap();
+    drop(file);
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), bytes.len() as u64);
+    asked_again(&session, ids[6], CHANGED_MESSAGE);
+    skipped_with(&session, ids[6], CHANGED_MESSAGE);
+    assert_eq!(errors_of(&rx, ids[6]).len(), 1);
+
+    // The same bytes with the same time (a file touched and set back) are the same file.
+    let path = dir.path().join("p7.ARW");
+    let before = std::fs::metadata(&path).unwrap().modified().unwrap();
+    let bytes = std::fs::read(&path).unwrap();
+    std::fs::write(&path, &bytes).unwrap();
+    let file = std::fs::File::options().write(true).open(&path).unwrap();
+    file.set_modified(before).unwrap();
+    drop(file);
+    assert!(session.raw_image(ids[7]).is_ok());
+    assert_eq!(session.status(ids[7]), Some(PhotoStatus::Ready));
+}
+
+#[test]
+fn a_photo_whose_mosaic_is_cached_still_renders_until_the_cache_lets_it_go() {
+    let (dir, session, rx, ids) = eight_photos();
+    let _ = progress_by_photo(&rx);
+    assert!(session.cached_ids().contains(&ids[0]));
+    std::fs::remove_file(dir.path().join("p0.ARW")).unwrap();
+
+    // Served from the cache with no `stat`: Ready, the same allocation, no event.
+    let a = session.raw_image(ids[0]).unwrap();
+    let b = session.raw_image(ids[0]).unwrap();
+    assert!(Arc::ptr_eq(&a, &b));
+    assert_eq!(session.status(ids[0]), Some(PhotoStatus::Ready));
+    assert!(session.view(ids[0]).is_ok());
+    assert!(errors_of(&rx, ids[0]).is_empty());
+
+    // The window moves on and the cache lets the mosaic go: the next read misses the file.
+    session.set_current(ids[5]).unwrap();
+    settle(&session);
+    assert!(!session.cached_ids().contains(&ids[0]));
+    asked_again(&session, ids[0], MESSAGE_NOT_FOUND);
+    skipped_with(&session, ids[0], MESSAGE_NOT_FOUND);
+    assert_eq!(errors_of(&rx, ids[0]).len(), 1);
+}
+
+#[test]
+fn a_file_changed_between_the_probe_and_the_develop_job_fails_the_photo_at_decode() {
+    let dir = tempfile::tempdir().unwrap();
+    write_plain(dir.path(), "a.ARW", 0.3);
+    write_plain(dir.path(), "b.ARW", 0.35);
+    // The probe reads the file, then another program appends to it: the stamp taken before the
+    // probe no longer matches when the develop job comes to read the file.
+    let mut media = Media::new();
+    media.probe = Arc::new(|path| {
+        let meta = ym_raw::metadata::probe(path);
+        if path.file_name().is_some_and(|n| n == "a.ARW") {
+            let mut file = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+            std::io::Write::write_all(&mut file, &[0; 8]).unwrap();
+        }
+        meta
+    });
+    let (sink, rx) = EventSink::channel();
+    let session = Session::new(base_env().with_events(sink).with_media(media));
+    let outcome = session.open(&[dir.path().to_path_buf()], OpenOptions::default());
+    settle(&session);
+    let (a, b) = (outcome.added[0], outcome.added[1]);
+    skipped_with(&session, a, CHANGED_MESSAGE);
+    assert_eq!(session.status(b), Some(PhotoStatus::Ready));
+    let got: Vec<_> = progress_by_photo(&rx)[&a]
+        .iter()
+        .map(|p| (p.stage, p.done, p.error.clone()))
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            (PhotoStage::Probe, true, None),
+            (PhotoStage::Decode, false, None),
+            (PhotoStage::Decode, true, Some(CHANGED_MESSAGE.to_owned())),
+        ]
+    );
+}
+
+#[test]
+fn a_file_deleted_before_the_develop_job_reads_it_is_not_found() {
+    let dir = tempfile::tempdir().unwrap();
+    write_plain(dir.path(), "a.ARW", 0.3);
+    let mut media = Media::new();
+    media.probe = Arc::new(|path| {
+        let meta = ym_raw::metadata::probe(path);
+        std::fs::remove_file(path).unwrap();
+        meta
+    });
+    let (sink, rx) = EventSink::channel();
+    let session = Session::new(base_env().with_events(sink).with_media(media));
+    let outcome = session.open(&[dir.path().to_path_buf()], OpenOptions::default());
+    settle(&session);
+    skipped_with(&session, outcome.added[0], MESSAGE_NOT_FOUND);
+    assert_eq!(errors_of(&rx, outcome.added[0]).len(), 1);
+}
+
 struct Recorder {
     calls: AtomicUsize,
     started: AtomicBool,
@@ -379,7 +631,7 @@ impl ThumbnailRenderer for Recorder {
         self.seen
             .lock()
             .unwrap()
-            .push((input.id, input.estimates.summary().exposure_ev));
+            .push((input.id, input.estimates.summary().input.exposure_ev));
         std::thread::sleep(self.delay);
         if (input.cancelled)() {
             return Err("cancelled".into());
@@ -445,6 +697,175 @@ fn a_thumbnail_that_fails_skips_that_photo_only() {
         })
     );
     assert_eq!(session.status(PhotoId(2)), Some(PhotoStatus::Ready));
+}
+
+/// The bytes of one mosaic of the scene of [`scene`] (`2 B` a photosite).
+const MOSAIC: u64 = 2 * 384 * 288;
+
+/// A thumbnail hook that counts how many of its calls overlap. A develop job is inside it with its
+/// mosaic reserved, so the count is the number of develop jobs running together.
+struct Overlap {
+    now: AtomicUsize,
+    most: AtomicUsize,
+}
+
+impl ThumbnailRenderer for Overlap {
+    fn render(&self, input: &ThumbnailInput<'_>) -> Result<Vec<u8>, String> {
+        let now = self.now.fetch_add(1, Ordering::SeqCst) + 1;
+        self.most.fetch_max(now, Ordering::SeqCst);
+        // Only to give a second job the time to overlap if the ledger let it.
+        std::thread::sleep(Duration::from_millis(30));
+        self.now.fetch_sub(1, Ordering::SeqCst);
+        Ok(vec![0x89, b'P', b'N', b'G', input.id.0 as u8])
+    }
+}
+
+/// `docs/26` H-13: under a budget of one and a half mosaics two develop jobs never run together,
+/// however many threads the pool has, and the photos all develop (a job that cannot reserve
+/// waits; it does not fail).
+#[test]
+fn two_develop_jobs_never_run_together_under_a_budget_of_one_and_a_half_mosaics() {
+    let dir = tempfile::tempdir().unwrap();
+    for i in 0..6 {
+        write_plain(dir.path(), &format!("p{i}.ARW"), 0.25 + 0.01 * f64::from(i));
+    }
+    let ledger = MemoryLedger::new(MOSAIC * 3 / 2);
+    let hook = Arc::new(Overlap {
+        now: AtomicUsize::new(0),
+        most: AtomicUsize::new(0),
+    });
+    let session = Session::new(
+        base_env()
+            .with_decode_threads(3)
+            .with_ledger(Arc::clone(&ledger))
+            .with_thumbnails(hook.clone()),
+    );
+    session.open(&[dir.path().to_path_buf()], OpenOptions::default());
+    settle(&session);
+    for id in session.photo_ids() {
+        assert_eq!(session.status(id), Some(PhotoStatus::Ready), "photo {id}");
+    }
+    assert_eq!(
+        session.peak_mosaic_holders(),
+        1,
+        "decodes that held a mosaic together"
+    );
+    assert_eq!(
+        hook.most.load(Ordering::SeqCst),
+        1,
+        "develop jobs inside the hook together"
+    );
+    // The ledger was never over its budget, and what the cache holds is counted.
+    assert!(ledger.peak() <= MOSAIC * 3 / 2, "peak {}", ledger.peak());
+    assert!(ledger.used() <= MOSAIC);
+    assert_eq!(ledger.used(), MOSAIC * session.cached_ids().len() as u64);
+    session.close();
+    assert_eq!(ledger.used(), 0);
+}
+
+/// A budget smaller than one mosaic does not stop a photo from developing: a job with nothing to
+/// wait for takes its bytes over the budget (and the ledger says so).
+#[test]
+fn a_budget_smaller_than_a_mosaic_still_develops_the_photos_one_at_a_time() {
+    let dir = tempfile::tempdir().unwrap();
+    for i in 0..3 {
+        write_plain(dir.path(), &format!("p{i}.ARW"), 0.25);
+    }
+    let ledger = MemoryLedger::new(MOSAIC / 2);
+    let session = Session::new(
+        base_env()
+            .with_decode_threads(2)
+            .with_ledger(Arc::clone(&ledger)),
+    );
+    session.open(&[dir.path().to_path_buf()], OpenOptions::default());
+    settle(&session);
+    for id in session.photo_ids() {
+        assert_eq!(session.status(id), Some(PhotoStatus::Ready), "photo {id}");
+    }
+    assert_eq!(session.peak_mosaic_holders(), 1);
+    session.close();
+    assert_eq!(ledger.used(), 0);
+}
+
+/// `docs/26` H-13: the ledger counts the mosaics the session holds and gives every byte back, on
+/// every path.
+#[test]
+fn the_ledger_counts_the_mosaics_and_is_back_to_its_start_when_the_session_closes() {
+    let dir = tempfile::tempdir().unwrap();
+    for i in 0..6 {
+        write_plain(dir.path(), &format!("p{i}.ARW"), 0.25 + 0.01 * f64::from(i));
+    }
+    let ledger = MemoryLedger::new(1 << 30);
+    let start = ledger.used();
+    assert_eq!(start, 0);
+    let session = Session::new(base_env().with_ledger(Arc::clone(&ledger)));
+    session.open(&[dir.path().to_path_buf()], OpenOptions::default());
+    settle(&session);
+    let ids = session.photo_ids();
+    // Success: the first photo is current, so it and its neighbour are cached and counted.
+    assert_eq!(session.cached_ids().len(), 2);
+    assert_eq!(ledger.used(), 2 * MOSAIC);
+    assert!(ledger.peak() >= 2 * MOSAIC);
+    // Eviction: moving on keeps three at most; the ones that left give their bytes back.
+    session.set_current(ids[4]).unwrap();
+    settle(&session);
+    assert_eq!(session.cached_ids().len(), 3);
+    assert_eq!(ledger.used(), 3 * MOSAIC);
+    // A read outside the window is counted while it runs and not kept: nothing is left behind.
+    session.raw_image(ids[0]).unwrap();
+    assert_eq!(ledger.used(), 3 * MOSAIC);
+    // Removal drops the cached mosaic with the photo.
+    session.remove(&[ids[4]]);
+    settle(&session);
+    assert!(ledger.used() <= 3 * MOSAIC);
+    assert_eq!(ledger.used(), MOSAIC * session.cached_ids().len() as u64);
+    // Error: a file that went away fails its read and leaves nothing reserved.
+    let before = ledger.used();
+    std::fs::remove_file(dir.path().join("p1.ARW")).unwrap();
+    assert!(session.raw_image(ids[1]).is_err());
+    assert_eq!(ledger.used(), before);
+    // Close.
+    session.close();
+    assert_eq!(ledger.used(), start);
+    assert!(ledger.peak() >= 3 * MOSAIC);
+}
+
+/// `docs/26` H-13: a reservation that would be refused asks the session to let go of its cached mosaics first,
+/// those of other photos before the photo it is for.
+#[test]
+fn cached_mosaics_are_given_up_before_a_reservation_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    for i in 0..4 {
+        write_plain(dir.path(), &format!("p{i}.ARW"), 0.25 + 0.01 * f64::from(i));
+    }
+    let ledger = MemoryLedger::new(MOSAIC * 7 / 2);
+    let session = Session::new(base_env().with_ledger(Arc::clone(&ledger)));
+    session.open(&[dir.path().to_path_buf()], OpenOptions::default());
+    settle(&session);
+    let ids = session.photo_ids();
+    session.set_current(ids[1]).unwrap();
+    settle(&session);
+    assert_eq!(session.cached_ids().len(), 3);
+    assert!(
+        ledger.try_reserve(MOSAIC).is_err(),
+        "full: three mosaics of 3.5"
+    );
+    // Needs 1.5 mosaics: the others' mosaics go, the photo's own stays.
+    let held = ledger
+        .reserve_reclaiming(MOSAIC * 3 / 2, Some(ids[1]))
+        .expect("fits after the others went");
+    assert_eq!(session.cached_ids(), vec![ids[1]]);
+    drop(held);
+    // Needs more than the photo's own leaves room for: everything goes.
+    let held = ledger
+        .reserve_reclaiming(MOSAIC * 3, Some(ids[1]))
+        .expect("fits after all went");
+    assert!(session.cached_ids().is_empty());
+    // What is not a cache is not touched: nothing more can be had.
+    assert!(ledger.reserve_reclaiming(MOSAIC, None).is_err());
+    drop(held);
+    session.close();
+    assert_eq!(ledger.used(), 0);
 }
 
 #[test]
@@ -665,10 +1086,52 @@ fn dropping_a_busy_session_stops_its_threads() {
 
 #[test]
 fn the_decode_pool_has_min_of_cores_minus_two_and_six_threads() {
+    // The cores alone (RAM not known): `min(cores - 2, 6)`, at least one.
+    for (cores, want) in [(1, 1), (2, 1), (3, 1), (4, 2), (8, 6), (10, 6), (64, 6)] {
+        assert_eq!(
+            default_decode_threads_for(cores, None),
+            want,
+            "{cores} cores"
+        );
+    }
     let cpus = std::thread::available_parallelism().map_or(2, std::num::NonZero::get);
-    let want = cpus.saturating_sub(2).clamp(1, 6);
+    let want = default_decode_threads_for(cpus, ym_core::scheduler::total_ram_bytes());
     assert_eq!(default_decode_threads(), want);
     assert!((1..=6).contains(&default_decode_threads()));
+}
+
+/// `docs/26` H-13: the develop pool is `min(cores - 2, 6, max(1, RAM / 2 / job))`: 8 GB gives three
+/// threads and 16 GB six, on a machine with cores to spare.
+#[test]
+fn the_decode_pool_follows_the_ram() {
+    const GIB: u64 = 1 << 30;
+    // (cores, RAM in GiB, threads)
+    let table = [
+        (8, 2, 1),
+        (8, 4, 1),
+        (8, 6, 2),
+        (8, 8, 3),
+        (10, 8, 3),
+        (8, 12, 4),
+        (8, 16, 6),
+        (8, 32, 6),
+        (8, 64, 6),
+        // The cores still cap it.
+        (4, 16, 2),
+        (4, 8, 2),
+        (3, 8, 1),
+        (2, 64, 1),
+    ];
+    for (cores, ram, want) in table {
+        assert_eq!(
+            default_decode_threads_for(cores, Some(ram * GIB)),
+            want,
+            "{cores} cores, {ram} GiB"
+        );
+    }
+    // Never zero, however little RAM there is.
+    assert_eq!(default_decode_threads_for(8, Some(1 << 20)), 1);
+    assert_eq!(default_decode_threads_for(8, Some(0)), 1);
 }
 
 #[test]
@@ -969,38 +1432,50 @@ fn settings_commands_resolve_clamp_and_stay_in_memory() {
     let ids = session.photo_ids();
 
     let r = session.settings(ids[0]).unwrap();
-    assert!(r.auto.exposure && r.auto.white_balance && r.auto.noise_reduction);
+    assert!(r.auto.input.exposure && r.auto.input.white_balance && r.auto.input.noise_reduction);
     assert_eq!(r.photo_id, ids[0]);
-    assert_eq!(r.settings.look.as_str(), "builtin:neutral");
+    assert_eq!(r.settings.output().look.as_str(), "builtin:neutral");
 
     // Moving the exposure slider makes it Manual and clamps.
     let r = session
         .update_settings(ids[0], &SettingsPatch::exposure_ev(0.4))
         .unwrap();
-    assert!(!r.auto.exposure && r.values.exposure_ev == 0.4);
+    assert!(!r.auto.input.exposure && r.values.input.exposure_ev == 0.4);
     let r = session
         .update_settings(ids[0], &SettingsPatch::exposure_ev(9.0))
         .unwrap();
-    assert_eq!(r.values.exposure_ev, 4.0);
+    assert_eq!(r.values.input.exposure_ev, 4.0);
     // A rejected patch leaves the settings as they were.
-    let bad = SettingsPatch {
-        contrast: Some(ym_core::settings::PercentSetting::manual_value(f64::NAN)),
-        ..Default::default()
-    };
+    let bad = SettingsPatch::default().and(
+        NodeId::MAIN,
+        NodePatch {
+            grade: Some(GradePatch {
+                contrast: Some(ym_core::settings::PercentSetting::manual_value(f64::NAN)),
+                ..GradePatch::default()
+            }),
+            ..NodePatch::default()
+        },
+    );
     assert!(matches!(
         session.update_settings(ids[0], &bad),
         Err(SessionError::Settings(_))
     ));
-    assert_eq!(session.settings(ids[0]).unwrap().values.exposure_ev, 4.0);
+    assert_eq!(
+        session.settings(ids[0]).unwrap().values.input.exposure_ev,
+        4.0
+    );
     // Only Kelvin moved: manual at that Kelvin and the automatic tint.
-    let auto_tint = session.settings(ids[1]).unwrap().values.tint;
+    let auto_tint = session.settings(ids[1]).unwrap().values.input.tint;
     let r = session
         .update_settings(ids[1], &SettingsPatch::kelvin(4100.0))
         .unwrap();
-    assert_eq!((r.values.kelvin, r.values.tint), (4100.0, auto_tint));
-    assert!(!r.auto.white_balance);
+    assert_eq!(
+        (r.values.input.kelvin, r.values.input.tint),
+        (4100.0, auto_tint)
+    );
+    assert!(!r.auto.input.white_balance);
     // Other photos are untouched.
-    assert!(session.settings(ids[2]).unwrap().auto.exposure);
+    assert!(session.settings(ids[2]).unwrap().auto.input.exposure);
 
     // Apply to: this photo (the current one), picked, all.
     let look = LookId::builtin("signature");
@@ -1023,17 +1498,28 @@ fn settings_commands_resolve_clamp_and_stay_in_memory() {
     for id in &ids {
         let r = session.settings(*id).unwrap();
         assert_eq!(
-            (r.values.look.as_str(), r.values.look_intensity),
+            (
+                r.values.output.look.as_str(),
+                r.values.output.look_intensity
+            ),
             ("builtin:signature", 40.0)
         );
     }
     // Look intensity is clamped; the other settings were not touched by Apply to.
     session.apply_look(ApplyScope::All, &look, 400.0).unwrap();
     assert_eq!(
-        session.settings(ids[1]).unwrap().values.look_intensity,
+        session
+            .settings(ids[1])
+            .unwrap()
+            .values
+            .output
+            .look_intensity,
         100.0
     );
-    assert_eq!(session.settings(ids[0]).unwrap().values.exposure_ev, 4.0);
+    assert_eq!(
+        session.settings(ids[0]).unwrap().values.input.exposure_ev,
+        4.0
+    );
     assert!(
         session
             .apply_look(ApplyScope::All, &look, f64::NAN)
@@ -1068,6 +1554,7 @@ fn settings_commands_resolve_clamp_and_stay_in_memory() {
             .settings(added.added[0])
             .unwrap()
             .values
+            .output
             .look
             .as_str(),
         "builtin:signature"
@@ -1083,16 +1570,16 @@ fn replacing_the_settings_clamps_them_like_a_patch() {
     settle(&session);
     let id = session.photo_ids()[0];
     let mut s = ym_core::settings::DevelopSettings::default();
-    s.contrast = ym_core::settings::PercentSetting::manual_value(500.0);
-    s.exposure = ym_core::settings::ExposureSetting::manual_ev(-9.0);
+    s.main_grade_mut().contrast = ym_core::settings::PercentSetting::manual_value(500.0);
+    s.input_mut().exposure = ym_core::settings::ExposureSetting::manual_ev(-9.0);
     let r = session.replace_settings(id, s).unwrap();
-    assert_eq!(r.values.exposure_ev, -4.0);
+    assert_eq!(r.values.input.exposure_ev, -4.0);
     assert_eq!(
-        r.settings.contrast,
+        r.settings.main_grade().contrast,
         ym_core::settings::PercentSetting::manual_value(100.0)
     );
     let mut bad = ym_core::settings::DevelopSettings::default();
-    bad.curve.luma = vec![[0.5, 0.5]];
+    bad.main_grade_mut().curve.luma = vec![[0.5, 0.5]];
     assert!(session.replace_settings(id, bad).is_err());
 }
 
@@ -1105,43 +1592,59 @@ fn rerun_recomputes_the_estimates_and_resets_exposure_white_balance_and_noise() 
     settle(&session);
     let id = session.photo_ids()[0];
     let before = session.view(id).unwrap();
-    let patch = SettingsPatch {
-        exposure: Some(ym_core::settings::ExposureSetting::manual_ev(1.0)),
-        white_balance: Some(AutoOr::Manual(ym_core::settings::WhiteBalanceManualPatch {
-            kelvin: Some(3000.0),
-            tint: Some(5.0),
-        })),
-        noise_reduction: Some(AutoOr::Manual(
-            ym_core::settings::NoiseReductionManualPatch {
-                luminance: Some(80.0),
-                color: Some(80.0),
-                detail: Some(80.0),
+    let patch = SettingsPatch::default()
+        .and(
+            NodeId::Input,
+            NodePatch {
+                exposure: Some(ym_core::settings::ExposureSetting::manual_ev(1.0)),
+                white_balance: Some(AutoOr::Manual(ym_core::settings::WhiteBalanceManualPatch {
+                    kelvin: Some(3000.0),
+                    tint: Some(5.0),
+                })),
+                noise_reduction: Some(AutoOr::Manual(
+                    ym_core::settings::NoiseReductionManualPatch {
+                        luminance: Some(80.0),
+                        color: Some(80.0),
+                        detail: Some(80.0),
+                    },
+                )),
+                sharpen: Some(AutoOr::Manual(ym_core::settings::SharpenManualPatch {
+                    amount: Some(200.0),
+                    radius_px: Some(1.0),
+                })),
+                ..NodePatch::default()
             },
-        )),
-        sharpen: Some(AutoOr::Manual(ym_core::settings::SharpenManualPatch {
-            amount: Some(200.0),
-            radius_px: Some(1.0),
-        })),
-        contrast: Some(ym_core::settings::PercentSetting::manual_value(20.0)),
-        ..Default::default()
-    };
+        )
+        .and(
+            NodeId::MAIN,
+            NodePatch {
+                grade: Some(GradePatch {
+                    contrast: Some(ym_core::settings::PercentSetting::manual_value(20.0)),
+                    ..GradePatch::default()
+                }),
+                ..NodePatch::default()
+            },
+        );
     session.update_settings(id, &patch).unwrap();
     let r = session.rerun_auto(id).unwrap();
     assert!(
-        r.auto.exposure && r.auto.white_balance && r.auto.noise_reduction && r.auto.light_source
+        r.auto.input.exposure
+            && r.auto.input.white_balance
+            && r.auto.input.noise_reduction
+            && r.auto.input.light_source
     );
-    assert!(r.settings.white_pick.is_none());
+    assert!(r.settings.input().white_pick.is_none());
     // Sharpening and the other controls are not part of Re-run, nor are contrast and saturation
     // without Apple Auto (they are while Apple Auto acts on the photo, docs/19 section 5).
-    assert!(!r.auto.sharpen);
-    assert!(!r.auto.contrast);
-    assert_eq!(r.values.contrast, 20.0);
+    assert!(!r.auto.input.sharpen);
+    assert!(!r.auto.main.contrast);
+    assert_eq!(r.values.main.grade.contrast, 20.0);
     // The estimates were recomputed (same pixels, same answer) and the version moved on.
     let after = session.view(id).unwrap();
     assert!(after.estimates_version > before.estimates_version);
     assert_eq!(
-        after.estimates.summary().exposure_ev,
-        before.estimates.summary().exposure_ev
+        after.estimates.summary().input.exposure_ev,
+        before.estimates.summary().input.exposure_ev
     );
     assert_eq!(
         after.estimates.color.w_scene_initial,
@@ -1171,59 +1674,78 @@ fn a_white_pick_samples_the_photo_and_a_blown_out_spot_is_refused() {
     settle(&session);
     let id = session.photo_ids()[0];
     let before = session.settings(id).unwrap();
-    assert!((before.values.kelvin - 6500.0).abs() <= 50.0);
+    assert!((before.values.input.kelvin - 6500.0).abs() <= 50.0);
     // A neutral patch (k = 2) finds the true light.
-    let patch = SettingsPatch {
-        white_pick: Some(Some([0.4167, 0.125])),
-        ..Default::default()
-    };
+    let patch = SettingsPatch::default().and(
+        NodeId::Input,
+        NodePatch {
+            white_pick: Some(Some([0.4167, 0.125])),
+            ..NodePatch::default()
+        },
+    );
     let r = session.update_settings(id, &patch).unwrap();
     assert!(
-        r.auto.white_balance,
+        r.auto.input.white_balance,
         "a pick leaves the white balance on Auto"
     );
     assert!(
-        (r.values.kelvin - 3000.0).abs() <= 100.0,
+        (r.values.input.kelvin - 3000.0).abs() <= 100.0,
         "{}",
-        r.values.kelvin
+        r.values.input.kelvin
     );
-    assert_eq!(r.settings.white_pick, Some([0.4167, 0.125]));
+    assert_eq!(r.settings.input().white_pick, Some([0.4167, 0.125]));
     // The sample is remembered with the photo.
     let view = session.view(id).unwrap();
     assert!(view.picked_white().is_some());
-    assert!((session.settings(id).unwrap().values.kelvin - r.values.kelvin).abs() < 1e-9);
+    assert!(
+        (session.settings(id).unwrap().values.input.kelvin - r.values.input.kelvin).abs() < 1e-9
+    );
     // Moving Kelvin switches to Manual and keeps the picked scene light for the sensor map.
     let r2 = session
         .update_settings(id, &SettingsPatch::kelvin(4000.0))
         .unwrap();
-    assert_eq!(r2.values.kelvin, 4000.0);
-    assert!(r2.settings.white_pick.is_some());
+    assert_eq!(r2.values.input.kelvin, 4000.0);
+    assert!(r2.settings.input().white_pick.is_some());
 
     // The blown-out spot is refused with the spec's message and changes nothing.
-    let blown = SettingsPatch {
-        white_pick: Some(Some([41.0 / 512.0, 41.0 / 384.0])),
-        ..Default::default()
-    };
+    let blown = SettingsPatch::default().and(
+        NodeId::Input,
+        NodePatch {
+            white_pick: Some(Some([41.0 / 512.0, 41.0 / 384.0])),
+            ..NodePatch::default()
+        },
+    );
     let err = session.update_settings(id, &blown).unwrap_err();
     assert_eq!(
         err.to_string(),
         "That spot is too bright to use. Pick a grey or white area that isn't blown out."
     );
     assert_eq!(
-        session.settings(id).unwrap().settings.white_pick,
+        session.settings(id).unwrap().settings.input().white_pick,
         Some([0.4167, 0.125])
     );
     // Clearing the pick drops the sample.
-    let cleared = SettingsPatch {
-        white_pick: Some(None),
-        ..Default::default()
-    };
+    let cleared = SettingsPatch::default().and(
+        NodeId::Input,
+        NodePatch {
+            white_pick: Some(None),
+            ..NodePatch::default()
+        },
+    );
     session.update_settings(id, &cleared).unwrap();
     assert!(session.view(id).unwrap().pick.is_none());
     // Re-run also forgets a pick.
     session.update_settings(id, &patch).unwrap();
     session.rerun_auto(id).unwrap();
-    assert!(session.settings(id).unwrap().settings.white_pick.is_none());
+    assert!(
+        session
+            .settings(id)
+            .unwrap()
+            .settings
+            .input()
+            .white_pick
+            .is_none()
+    );
 }
 
 /// Three developed photos of one scene at three brightnesses.
@@ -1242,70 +1764,101 @@ fn three_photos() -> (tempfile::TempDir, Session, Vec<PhotoId>) {
 
 /// A patch that sets every kind of setting, the crop, the turn and the white pick included.
 fn edit_everything() -> SettingsPatch {
-    SettingsPatch {
-        look: Some(LookId::builtin("signature")),
-        look_intensity: Some(60.0),
-        exposure: Some(ExposureSetting::manual_ev(0.7)),
-        contrast: Some(ym_core::settings::PercentSetting::manual_value(12.0)),
-        brightness: Some(-8.0),
-        highlights: Some(ym_core::settings::PercentSetting::manual_value(-30.0)),
-        shadows: Some(ym_core::settings::PercentSetting::manual_value(25.0)),
-        white: Some(5.0),
-        white_offset_ev: Some(0.5),
-        black: Some(ym_core::settings::PercentSetting::manual_value(-4.0)),
-        light_source: Some(LightSource::Day),
-        white_balance: Some(AutoOr::Manual(WhiteBalanceManualPatch {
-            kelvin: Some(4300.0),
-            tint: Some(7.0),
-        })),
-        color_balance: Some(ColorBalancePatch {
-            shadows: Some(ym_core::settings::BalanceSetting::manual_point([0.2, -0.1])),
-            midtones: None,
-            highlights: Some(ym_core::settings::BalanceSetting::manual_point([-0.1, 0.1])),
-        }),
-        saturation: Some(ym_core::settings::PercentSetting::manual_value(15.0)),
-        color_warp: Some(ym_core::settings::ColorWarp {
-            pins: vec![
-                ym_color::warp::WarpPin::moving([0.12, 0.03], [0.08, 0.1]).into(),
-                ym_color::warp::WarpPin::locked_at([-0.05, -0.1]).into(),
-            ],
-        }),
-        sharpen: Some(AutoOr::Manual(SharpenManualPatch {
-            amount: Some(80.0),
-            radius_px: Some(1.2),
-        })),
-        output_sharpening: Some(60.0),
-        noise_reduction: Some(AutoOr::Manual(NoiseReductionManualPatch {
-            luminance: Some(30.0),
-            color: Some(40.0),
-            detail: Some(50.0),
-        })),
-        curve: Some(CurvesPatch {
-            luma: Some(vec![[0.0, 0.0], [0.5, 0.6], [1.0, 1.0]]),
-            ..Default::default()
-        }),
-        decode: Some(DecodePatch {
-            neural_demosaic: Some(false),
-            lens_corrections: Some(false),
-            ..Default::default()
-        }),
-        rolloff: Some(RolloffPatch {
-            highlights: Some(0.7),
-            low_light: Some(0.3),
-        }),
-        crop: Some(Some(Crop {
-            rect: NormRect {
-                x: 0.1,
-                y: 0.1,
-                width: 0.5,
-                height: 0.5,
+    SettingsPatch::default()
+        .and(
+            NodeId::Input,
+            NodePatch {
+                exposure: Some(ExposureSetting::manual_ev(0.7)),
+                light_source: Some(LightSource::Day),
+                white_balance: Some(AutoOr::Manual(WhiteBalanceManualPatch {
+                    kelvin: Some(4300.0),
+                    tint: Some(7.0),
+                })),
+                lens: Some(ym_core::settings::LensPatch {
+                    kind: Some(ym_core::settings::LensKind::Sonnar),
+                    flares: Some(40.0),
+                    edges: Some(35.0),
+                    anamorphic: Some(15.0),
+                }),
+                sharpen: Some(AutoOr::Manual(SharpenManualPatch {
+                    amount: Some(80.0),
+                    radius_px: Some(1.2),
+                })),
+                noise_reduction: Some(AutoOr::Manual(NoiseReductionManualPatch {
+                    luminance: Some(30.0),
+                    color: Some(40.0),
+                    detail: Some(50.0),
+                })),
+                decode: Some(DecodePatch {
+                    neural_demosaic: Some(false),
+                    lens_corrections: Some(false),
+                    ..Default::default()
+                }),
+                rolloff: Some(RolloffPatch {
+                    highlights: Some(0.7),
+                    low_light: Some(0.3),
+                }),
+                crop: Some(Some(Crop {
+                    rect: NormRect {
+                        x: 0.1,
+                        y: 0.1,
+                        width: 0.5,
+                        height: 0.5,
+                    },
+                    angle_deg: 3.0,
+                    aspect: CropAspect::Free,
+                    auto: false,
+                })),
+                orientation: Some(Orientation::Deg90),
+                white_pick: Some(Some([0.4167, 0.125])),
+                ..NodePatch::default()
             },
-            angle_deg: 3.0,
-            aspect: CropAspect::Free,
-        })),
-        orientation: Some(Orientation::Deg90),
-        white_pick: Some(Some([0.4167, 0.125])),
-    }
+        )
+        .and(
+            NodeId::MAIN,
+            NodePatch {
+                grade: Some(GradePatch {
+                    contrast: Some(ym_core::settings::PercentSetting::manual_value(12.0)),
+                    brightness: Some(-8.0),
+                    highlights: Some(ym_core::settings::PercentSetting::manual_value(-30.0)),
+                    shadows: Some(ym_core::settings::PercentSetting::manual_value(25.0)),
+                    white: Some(5.0),
+                    black: Some(ym_core::settings::PercentSetting::manual_value(-4.0)),
+                    color_balance: Some(ColorBalancePatch {
+                        shadows: Some(ym_core::settings::BalanceSetting::manual_point([0.2, -0.1])),
+                        midtones: None,
+                        highlights: Some(ym_core::settings::BalanceSetting::manual_point([
+                            -0.1, 0.1,
+                        ])),
+                    }),
+                    saturation: Some(ym_core::settings::PercentSetting::manual_value(15.0)),
+                    color_warp: Some(ym_core::settings::ColorWarp {
+                        pins: vec![
+                            ym_color::warp::WarpPin {
+                                saturation: 0.4,
+                                ..ym_color::warp::WarpPin::moving([0.12, 0.03], [0.08, 0.1])
+                            }
+                            .into(),
+                            ym_color::warp::WarpPin::locked_at([-0.05, -0.1]).into(),
+                        ],
+                    }),
+                    curve: Some(CurvesPatch {
+                        luma: Some(vec![[0.0, 0.0], [0.5, 0.6], [1.0, 1.0]]),
+                        ..Default::default()
+                    }),
+                }),
+                ..NodePatch::default()
+            },
+        )
+        .and(
+            NodeId::Output,
+            NodePatch {
+                look: Some(LookId::builtin("signature")),
+                look_intensity: Some(60.0),
+                output_sharpening: Some(60.0),
+                ..NodePatch::default()
+            },
+        )
 }
 
 #[test]
@@ -1316,44 +1869,63 @@ fn pasting_takes_every_setting_but_the_crop_the_turn_and_the_white_pick() {
     // the same patch sets them, and this one does.
     session.update_settings(a, &edit_everything()).unwrap();
     // The targets have a crop and a turn of their own; c has only a turn.
-    let own_crop = SettingsPatch {
-        crop: Some(Some(Crop {
-            rect: NormRect {
-                x: 0.0,
-                y: 0.2,
-                width: 0.9,
-                height: 0.6,
-            },
-            angle_deg: -2.0,
-            aspect: CropAspect::Original,
-        })),
-        orientation: Some(Orientation::Deg180),
-        ..Default::default()
-    };
+    let own_crop = SettingsPatch::default().and(
+        NodeId::Input,
+        NodePatch {
+            crop: Some(Some(Crop {
+                rect: NormRect {
+                    x: 0.0,
+                    y: 0.2,
+                    width: 0.9,
+                    height: 0.6,
+                },
+                angle_deg: -2.0,
+                aspect: CropAspect::Original,
+                auto: false,
+            })),
+            orientation: Some(Orientation::Deg180),
+            ..NodePatch::default()
+        },
+    );
     session.update_settings(b, &own_crop).unwrap();
     session
         .update_settings(
             c,
-            &SettingsPatch {
-                orientation: Some(Orientation::Deg270),
-                ..Default::default()
-            },
+            &SettingsPatch::default().and(
+                NodeId::Input,
+                NodePatch {
+                    orientation: Some(Orientation::Deg270),
+                    ..NodePatch::default()
+                },
+            ),
         )
         .unwrap();
 
     let source = session.settings(a).unwrap().settings;
-    assert!(source.crop.is_some() && source.white_pick.is_some());
-    assert_eq!(source.orientation, Orientation::Deg90);
+    assert!(source.input().crop.is_some() && source.input().white_pick.is_some());
+    assert_eq!(source.input().orientation, Orientation::Deg90);
 
     let patch = session.copy_settings(a).unwrap();
+    let input_patch = patch.input_patch().expect("the copy has the Input");
     assert!(
-        patch.crop.is_none() && patch.orientation.is_none() && patch.white_pick.is_none(),
+        input_patch.crop.is_none()
+            && input_patch.orientation.is_none()
+            && input_patch.white_pick.is_none(),
         "the copy leaves out the crop, the turn and the white pick"
     );
+    let warp = patch
+        .main_patch()
+        .and_then(|p| p.grade.as_ref())
+        .and_then(|g| g.color_warp.as_ref());
     assert_eq!(
-        patch.color_warp.as_ref().map(|w| w.pins.len()),
+        warp.map(|w| w.pins.len()),
         Some(2),
         "the copy takes the colour warp's pins"
+    );
+    assert_eq!(
+        warp.map(|w| w.pins[0].saturation),
+        Some(0.4),
+        "and each pin's saturation"
     );
     let own: Vec<_> = [b, c]
         .iter()
@@ -1368,9 +1940,9 @@ fn pasting_takes_every_setting_but_the_crop_the_turn_and_the_white_pick() {
     assert!(report.skipped.is_empty());
     for (id, before) in [b, c].into_iter().zip(own) {
         let mut expected = source.clone();
-        expected.crop = before.crop;
-        expected.orientation = before.orientation;
-        expected.white_pick = before.white_pick;
+        expected.input_mut().crop = before.input().crop;
+        expected.input_mut().orientation = before.input().orientation;
+        expected.input_mut().white_pick = before.input().white_pick;
         assert_eq!(session.settings(id).unwrap().settings, expected);
     }
     // The source itself was not touched.
@@ -1384,59 +1956,72 @@ fn auto_stays_auto_and_each_photo_keeps_its_own_estimates() {
     session
         .update_settings(
             a,
-            &SettingsPatch {
-                contrast: Some(ym_core::settings::PercentSetting::manual_value(20.0)),
-                ..Default::default()
-            },
+            &SettingsPatch::default().and(
+                NodeId::MAIN,
+                NodePatch {
+                    grade: Some(GradePatch {
+                        contrast: Some(ym_core::settings::PercentSetting::manual_value(20.0)),
+                        ..GradePatch::default()
+                    }),
+                    ..NodePatch::default()
+                },
+            ),
         )
         .unwrap();
     // b is manual wherever a is automatic.
     session
         .update_settings(
             b,
-            &SettingsPatch {
-                exposure: Some(ExposureSetting::manual_ev(-1.5)),
-                light_source: Some(LightSource::Tungsten),
-                white_balance: Some(AutoOr::Manual(WhiteBalanceManualPatch {
-                    kelvin: Some(3300.0),
-                    tint: Some(-4.0),
-                })),
-                sharpen: Some(AutoOr::Manual(SharpenManualPatch {
-                    amount: Some(120.0),
-                    radius_px: Some(1.5),
-                })),
-                noise_reduction: Some(AutoOr::Manual(NoiseReductionManualPatch {
-                    luminance: Some(70.0),
-                    color: Some(70.0),
-                    detail: Some(70.0),
-                })),
-                ..Default::default()
-            },
+            &SettingsPatch::default().and(
+                NodeId::Input,
+                NodePatch {
+                    exposure: Some(ExposureSetting::manual_ev(-1.5)),
+                    light_source: Some(LightSource::Tungsten),
+                    white_balance: Some(AutoOr::Manual(WhiteBalanceManualPatch {
+                        kelvin: Some(3300.0),
+                        tint: Some(-4.0),
+                    })),
+                    sharpen: Some(AutoOr::Manual(SharpenManualPatch {
+                        amount: Some(120.0),
+                        radius_px: Some(1.5),
+                    })),
+                    noise_reduction: Some(AutoOr::Manual(NoiseReductionManualPatch {
+                        luminance: Some(70.0),
+                        color: Some(70.0),
+                        detail: Some(70.0),
+                    })),
+                    ..NodePatch::default()
+                },
+            ),
         )
         .unwrap();
     let estimates_before = session.settings(b).unwrap().estimates;
-    assert!(!session.settings(b).unwrap().auto.exposure);
+    assert!(!session.settings(b).unwrap().auto.input.exposure);
 
     let patch = session.copy_settings(a).unwrap();
-    assert_eq!(patch.exposure, Some(AutoOr::Auto));
-    assert_eq!(patch.white_balance, Some(AutoOr::Auto));
-    assert_eq!(patch.light_source, Some(LightSource::Auto));
-    assert_eq!(patch.sharpen, Some(AutoOr::Auto));
-    assert_eq!(patch.noise_reduction, Some(AutoOr::Auto));
+    let input_patch = patch.input_patch().expect("the copy has the Input");
+    assert_eq!(input_patch.exposure, Some(AutoOr::Auto));
+    assert_eq!(input_patch.white_balance, Some(AutoOr::Auto));
+    assert_eq!(input_patch.light_source, Some(LightSource::Auto));
+    assert_eq!(input_patch.sharpen, Some(AutoOr::Auto));
+    assert_eq!(input_patch.noise_reduction, Some(AutoOr::Auto));
     session.paste_settings(&[b], &patch).unwrap();
 
     let r = session.settings(b).unwrap();
-    assert!(r.auto.exposure && r.auto.light_source && r.auto.white_balance);
-    assert!(r.auto.sharpen && r.auto.noise_reduction);
+    assert!(r.auto.input.exposure && r.auto.input.light_source && r.auto.input.white_balance);
+    assert!(r.auto.input.sharpen && r.auto.input.noise_reduction);
     assert_eq!(
-        r.settings.contrast,
+        r.settings.main_grade().contrast,
         ym_core::settings::PercentSetting::manual_value(20.0)
     );
     // The automatic values are b's own, from b's pixels, and nothing changed them.
     assert_eq!(r.estimates, estimates_before);
-    assert_eq!(r.values.exposure_ev, r.estimates.exposure_ev);
-    assert_eq!(r.values.sharpen, r.estimates.sharpen);
-    assert_eq!(r.values.noise_reduction, r.estimates.noise_reduction);
+    assert_eq!(r.values.input.exposure_ev, r.estimates.input.exposure_ev);
+    assert_eq!(r.values.input.sharpen, r.estimates.input.sharpen);
+    assert_eq!(
+        r.values.input.noise_reduction,
+        r.estimates.input.noise_reduction
+    );
 
     // Manual values are pasted as they are, onto a photo that is automatic.
     session.update_settings(a, &edit_everything()).unwrap();
@@ -1444,13 +2029,18 @@ fn auto_stays_auto_and_each_photo_keeps_its_own_estimates() {
     session.paste_settings(&[b], &patch).unwrap();
     let r = session.settings(b).unwrap();
     assert!(
-        !r.auto.exposure && !r.auto.white_balance && !r.auto.sharpen && !r.auto.noise_reduction
+        !r.auto.input.exposure
+            && !r.auto.input.white_balance
+            && !r.auto.input.sharpen
+            && !r.auto.input.noise_reduction
     );
-    assert_eq!(r.values.exposure_ev, 0.7);
-    assert_eq!((r.values.kelvin, r.values.tint), (4300.0, 7.0));
-    assert_eq!(r.settings.white_offset_ev, 0.5);
+    assert_eq!(r.values.input.exposure_ev, 0.7);
+    assert_eq!((r.values.input.kelvin, r.values.input.tint), (4300.0, 7.0));
     assert_eq!(
-        (r.settings.rolloff.highlights, r.settings.rolloff.low_light),
+        (
+            r.settings.input().rolloff.highlights,
+            r.settings.input().rolloff.low_light
+        ),
         (0.7, 0.3),
         "the highlight range is pasted as it is"
     );
@@ -1471,68 +2061,90 @@ fn a_white_balance_from_a_picked_white_is_pasted_as_manual_kelvin_and_tint() {
     settle(&session);
     let (a, b) = (session.photo_ids()[0], session.photo_ids()[1]);
 
-    let pick = SettingsPatch {
-        white_pick: Some(Some([0.4167, 0.125])),
-        ..Default::default()
-    };
+    let pick = SettingsPatch::default().and(
+        NodeId::Input,
+        NodePatch {
+            white_pick: Some(Some([0.4167, 0.125])),
+            ..NodePatch::default()
+        },
+    );
     let picked = session.update_settings(a, &pick).unwrap();
-    assert!((picked.values.kelvin - 3000.0).abs() <= 100.0);
-    assert!(picked.auto.white_balance && picked.auto.light_source);
+    assert!((picked.values.input.kelvin - 3000.0).abs() <= 100.0);
+    assert!(picked.auto.input.white_balance && picked.auto.input.light_source);
 
     let patch = session.copy_settings(a).unwrap();
-    assert!(patch.white_pick.is_none(), "the point stays with its photo");
-    assert_eq!(patch.light_source, Some(LightSource::Auto));
+    let input_patch = patch.input_patch().expect("the copy has the Input");
+    assert!(
+        input_patch.white_pick.is_none(),
+        "the point stays with its photo"
+    );
+    assert_eq!(input_patch.light_source, Some(LightSource::Auto));
     assert_eq!(
-        patch.white_balance,
+        input_patch.white_balance,
         Some(AutoOr::Manual(WhiteBalanceManualPatch {
-            kelvin: Some(picked.values.kelvin),
-            tint: Some(picked.values.tint),
+            kelvin: Some(picked.values.input.kelvin),
+            tint: Some(picked.values.input.tint),
         }))
     );
     session.paste_settings(&[b], &patch).unwrap();
     let r = session.settings(b).unwrap();
     assert_eq!(
-        r.settings.white_balance,
+        r.settings.input().white_balance,
         AutoOr::Manual(WhiteBalanceValue {
-            kelvin: picked.values.kelvin,
-            tint: picked.values.tint
+            kelvin: picked.values.input.kelvin,
+            tint: picked.values.input.tint
         })
     );
-    assert!(r.settings.white_pick.is_none() && !r.auto.white_balance);
+    assert!(r.settings.input().white_pick.is_none() && !r.auto.input.white_balance);
 
     // A light preset chosen after the pick wins over it: the preset is copied, the white balance
     // stays Auto.
     session
         .update_settings(
             a,
-            &SettingsPatch {
-                light_source: Some(LightSource::Day),
-                ..Default::default()
-            },
+            &SettingsPatch::default().and(
+                NodeId::Input,
+                NodePatch {
+                    light_source: Some(LightSource::Day),
+                    ..NodePatch::default()
+                },
+            ),
         )
         .unwrap();
     let patch = session.copy_settings(a).unwrap();
-    assert_eq!(patch.light_source, Some(LightSource::Day));
-    assert_eq!(patch.white_balance, Some(AutoOr::Auto));
+    let input_patch = patch.input_patch().expect("the copy has the Input");
+    assert_eq!(input_patch.light_source, Some(LightSource::Day));
+    assert_eq!(input_patch.white_balance, Some(AutoOr::Auto));
 
     // A manual white balance next to a pick is copied as it is.
     session
         .update_settings(
             a,
-            &SettingsPatch {
-                light_source: Some(LightSource::Auto),
-                white_balance: Some(AutoOr::Manual(WhiteBalanceManualPatch {
-                    kelvin: Some(4000.0),
-                    tint: Some(3.0),
-                })),
-                ..Default::default()
-            },
+            &SettingsPatch::default().and(
+                NodeId::Input,
+                NodePatch {
+                    light_source: Some(LightSource::Auto),
+                    white_balance: Some(AutoOr::Manual(WhiteBalanceManualPatch {
+                        kelvin: Some(4000.0),
+                        tint: Some(3.0),
+                    })),
+                    ..NodePatch::default()
+                },
+            ),
         )
         .unwrap();
-    assert!(session.settings(a).unwrap().settings.white_pick.is_some());
+    assert!(
+        session
+            .settings(a)
+            .unwrap()
+            .settings
+            .input()
+            .white_pick
+            .is_some()
+    );
     let patch = session.copy_settings(a).unwrap();
     assert_eq!(
-        patch.white_balance,
+        patch.input_patch().and_then(|p| p.white_balance),
         Some(AutoOr::Manual(WhiteBalanceManualPatch {
             kelvin: Some(4000.0),
             tint: Some(3.0)
@@ -1567,7 +2179,7 @@ fn a_photo_that_cannot_be_adjusted_is_skipped_and_a_bad_patch_changes_nothing() 
     assert_eq!(report.skipped, [failed, PhotoId(99)]);
     assert_eq!(report.pasted.len(), 1);
     assert_eq!(report.pasted[0].id, c);
-    assert_eq!(session.settings(c).unwrap().values.exposure_ev, 0.7);
+    assert_eq!(session.settings(c).unwrap().values.input.exposure_ev, 0.7);
 
     // A patch that names the crop, the turn or the white pick does not touch them.
     let (_dir2, session2, ids2) = three_photos();
@@ -1575,26 +2187,32 @@ fn a_photo_that_cannot_be_adjusted_is_skipped_and_a_bad_patch_changes_nothing() 
         .paste_settings(&[ids2[1]], &edit_everything())
         .unwrap();
     let r = session2.settings(ids2[1]).unwrap().settings;
-    assert!(r.crop.is_none() && r.white_pick.is_none());
-    assert_eq!(r.orientation, Orientation::Deg0);
+    assert!(r.input().crop.is_none() && r.input().white_pick.is_none());
+    assert_eq!(r.input().orientation, Orientation::Deg0);
     assert_eq!(
-        r.contrast,
+        r.main_grade().contrast,
         ym_core::settings::PercentSetting::manual_value(12.0)
     );
 
     // A patch that cannot be applied changes no photo, not even the ones before the bad value.
     let before = session.settings(a).unwrap().settings;
-    let bad = SettingsPatch {
-        contrast: Some(ym_core::settings::PercentSetting::manual_value(f64::NAN)),
-        ..Default::default()
-    };
+    let bad = SettingsPatch::default().and(
+        NodeId::MAIN,
+        NodePatch {
+            grade: Some(GradePatch {
+                contrast: Some(ym_core::settings::PercentSetting::manual_value(f64::NAN)),
+                ..GradePatch::default()
+            }),
+            ..NodePatch::default()
+        },
+    );
     assert!(matches!(
         session.paste_settings(&[a, c], &bad),
         Err(SessionError::Settings(_))
     ));
     assert_eq!(session.settings(a).unwrap().settings, before);
     assert_eq!(
-        session.settings(c).unwrap().settings.contrast,
+        session.settings(c).unwrap().settings.main_grade().contrast,
         ym_core::settings::PercentSetting::manual_value(12.0)
     );
 }
@@ -1607,10 +2225,16 @@ fn the_patches_of_a_paste_undo_and_redo_it_and_a_second_paste_changes_nothing() 
     session
         .update_settings(
             b,
-            &SettingsPatch {
-                contrast: Some(ym_core::settings::PercentSetting::manual_value(-10.0)),
-                ..Default::default()
-            },
+            &SettingsPatch::default().and(
+                NodeId::MAIN,
+                NodePatch {
+                    grade: Some(GradePatch {
+                        contrast: Some(ym_core::settings::PercentSetting::manual_value(-10.0)),
+                        ..GradePatch::default()
+                    }),
+                    ..NodePatch::default()
+                },
+            ),
         )
         .unwrap();
     let patch = session.copy_settings(a).unwrap();
@@ -1621,7 +2245,13 @@ fn the_patches_of_a_paste_undo_and_redo_it_and_a_second_paste_changes_nothing() 
     let step = &report.pasted[0];
     assert!(!step.before.is_empty() && !step.after.is_empty());
     // Only what changed is in the step: the crop and the turn never are.
-    assert!(step.before.crop.is_none() && step.after.orientation.is_none());
+    for patch in [&step.before, &step.after] {
+        let input = patch.input_patch();
+        assert!(
+            input.is_none_or(|p| p.crop.is_none() && p.orientation.is_none()),
+            "the crop and the turn are never in a step"
+        );
+    }
     session.update_settings(b, &step.before).unwrap();
     assert_eq!(session.settings(b).unwrap().settings, was);
     session.update_settings(b, &step.after).unwrap();

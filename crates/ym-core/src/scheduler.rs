@@ -2,7 +2,10 @@
 //! section Scheduling and threads).
 //!
 //! * **Priorities.** Viewport frames run before visible-tile passes, those before thumbnails, those
-//!   before export ([`Priority`]). A job that is running is never pre-empted.
+//!   before export ([`Priority`]); the bands of a whole-image level being filled ([`Priority::Fill`])
+//!   come last of all, are not foreground load (an export does not wait for them) and give way to an
+//!   export ([`JobScheduler::exports_active`]). A job that is running is never pre-empted, so the
+//!   fill is cut into one job per band: a frame, an export or a thumbnail waits for one band at most.
 //! * **Two workers.** The first runs everything the person is waiting for (viewport, tile and
 //!   thumbnail jobs) one at a time in priority order. The second runs export jobs and **gives way**
 //!   to the first: an export job starts only when no foreground job is queued or running, and a
@@ -13,7 +16,7 @@
 //!   every frame for as long as it takes (36 s for 50 MP on four cores). While an export tile
 //!   runs, a foreground job shares the cores with it; that overlap is bounded by one tile.
 //! * **Cancellation.** Every job carries a token. Moving to another photo ([`JobScheduler::navigate`])
-//!   cancels the viewport and tile jobs of the photo being left, pending and running, and the jobs
+//!   cancels the viewport, tile and fill jobs of the photo being left, pending and running, and the jobs
 //!   queued with [`JobScheduler::submit_superseded`] (the Look tab's tiles and the histogram: panel
 //!   requests that nobody wants once the person has moved on) for that photo, letting go of what
 //!   they hold at once; the filmstrip's thumbnails and export jobs are never cancelled by
@@ -157,9 +160,50 @@ impl MemoryBudget {
     }
 }
 
-/// Installed RAM in bytes, where the operating system says (Linux `/proc/meminfo`, macOS `sysctl`).
+/// The environment variable that overrides the installed RAM, in GiB: a development switch for
+/// running the pipeline "as an 8 GB machine" (`docs/17` section on environment variables). Like
+/// `YELLOWMOON_GPU` it is not part of the user guide.
+pub const RAM_ENV: &str = "YELLOWMOON_RAM_GB";
+
+/// The most the override may name, in GiB.
+pub const RAM_OVERRIDE_MAX_GIB: f64 = 1024.0;
+
+/// Reads the value of [`RAM_ENV`]: a number of GiB, fractions allowed (`0.5`, `7.5`), more than 0 and
+/// at most [`RAM_OVERRIDE_MAX_GIB`]; surrounding spaces are ignored. Anything else (zero, a negative
+/// number, text, `nan`, `inf`, empty) is `None`. The result is in bytes, rounded down.
+#[must_use]
+pub fn parse_ram_override(value: &str) -> Option<u64> {
+    let gib: f64 = value.trim().parse().ok()?;
+    if !gib.is_finite() || gib <= 0.0 || gib > RAM_OVERRIDE_MAX_GIB {
+        return None;
+    }
+    // Exact: at most 2^40 GiB-fractions fit an f64 without rounding errors that matter here.
+    Some((gib * f64::from(1u32 << 30)) as u64).filter(|bytes| *bytes > 0)
+}
+
+/// The RAM the override says, when [`RAM_ENV`] is set to a value [`parse_ram_override`] accepts.
+/// A value that does not parse is ignored (the installed RAM is used), with a warning in the log.
+#[must_use]
+pub fn ram_override() -> Option<u64> {
+    let value = std::env::var(RAM_ENV).ok()?;
+    let parsed = parse_ram_override(&value);
+    if parsed.is_none() {
+        tracing::warn!(value = %value, "{RAM_ENV} is not a number of GiB from above 0 to 1024; ignored");
+    }
+    parsed
+}
+
+/// Installed RAM in bytes, where the operating system says (Linux `/proc/meminfo`, macOS `sysctl`),
+/// or what [`RAM_ENV`] says when it is set: the budget rule, the unified-memory rule, the GPU opener
+/// and the develop pool all read it here.
 #[must_use]
 pub fn total_ram_bytes() -> Option<u64> {
+    ram_override().or_else(installed_ram_bytes)
+}
+
+/// The RAM the operating system reports, whatever [`RAM_ENV`] says.
+#[must_use]
+pub fn installed_ram_bytes() -> Option<u64> {
     if let Ok(text) = std::fs::read_to_string("/proc/meminfo") {
         let line = text.lines().find(|l| l.starts_with("MemTotal:"))?;
         let kb: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
@@ -184,12 +228,36 @@ pub struct OverBudget {
     pub budget: u64,
 }
 
-/// Counts the bytes that full-resolution jobs hold while they run.
-#[derive(Debug)]
+/// What a reclaimer is asked to let go of (see [`MemoryLedger::reserve_reclaiming`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Reclaim {
+    /// `false`: only caches of photos other than `keep`. `true`: every cache that can go.
+    pub all: bool,
+    /// The photo the reservation is for, whose caches the first pass leaves alone.
+    pub keep: Option<PhotoId>,
+}
+
+/// A holder of counted caches: frees what it can and says whether it is still there (`false`: the
+/// ledger forgets it). It is called with no lock of the ledger held, and must not wait for a
+/// reservation.
+pub type Reclaimer = Arc<dyn Fn(Reclaim) -> bool + Send + Sync>;
+
+/// Counts the bytes that full-resolution jobs and the caches hold.
 pub struct MemoryLedger {
     budget: AtomicU64,
     used: AtomicU64,
     peak: AtomicU64,
+    reclaimers: Mutex<Vec<Reclaimer>>,
+}
+
+impl std::fmt::Debug for MemoryLedger {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MemoryLedger")
+            .field("budget", &self.budget())
+            .field("used", &self.used())
+            .field("peak", &self.peak())
+            .finish_non_exhaustive()
+    }
 }
 
 impl MemoryLedger {
@@ -200,7 +268,63 @@ impl MemoryLedger {
             budget: AtomicU64::new(budget),
             used: AtomicU64::new(0),
             peak: AtomicU64::new(0),
+            reclaimers: Mutex::new(Vec::new()),
         })
+    }
+
+    /// Registers a holder of caches that [`MemoryLedger::reserve_reclaiming`] may ask to let go.
+    pub fn add_reclaimer(&self, reclaimer: Reclaimer) {
+        self.reclaimers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(reclaimer);
+    }
+
+    /// Asks every reclaimer to free what it holds, and forgets those that are gone.
+    pub fn reclaim(&self, what: Reclaim) {
+        // Called outside the lock: a reclaimer takes locks of its own.
+        let all: Vec<Reclaimer> = self
+            .reclaimers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        let gone: Vec<&Reclaimer> = all.iter().filter(|r| !r(what)).collect();
+        if !gone.is_empty() {
+            self.reclaimers
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .retain(|r| !gone.iter().any(|g| Arc::ptr_eq(g, r)));
+        }
+    }
+
+    /// [`MemoryLedger::try_reserve`] that frees caches before it refuses: when `bytes` do not fit,
+    /// the reclaimers are asked to let go of the caches of photos other than `keep`, then of every
+    /// cache, with the reservation tried again after each. A cache is only a cache (what goes is
+    /// made again when it is needed), so it must never be the reason for a refusal; what stays
+    /// counted after that is held by running work.
+    ///
+    /// No lock is held while the reclaimers run, and a reclaimer never waits for the ledger, so
+    /// this cannot deadlock. A reservation that is refused after all caches went is refused for
+    /// real.
+    ///
+    /// # Errors
+    ///
+    /// [`OverBudget`] as for [`MemoryLedger::try_reserve`].
+    pub fn reserve_reclaiming(
+        self: &Arc<Self>,
+        bytes: u64,
+        keep: Option<PhotoId>,
+    ) -> Result<Reservation, OverBudget> {
+        if let Ok(r) = self.try_reserve(bytes) {
+            return Ok(r);
+        }
+        for all in [false, true] {
+            self.reclaim(Reclaim { all, keep });
+            if let Ok(r) = self.try_reserve(bytes) {
+                return Ok(r);
+            }
+        }
+        self.try_reserve(bytes)
     }
 
     /// Reserves `bytes` until the returned guard is dropped.
@@ -233,6 +357,21 @@ impl MemoryLedger {
                 }
                 Err(actual) => cur = actual,
             }
+        }
+    }
+
+    /// Reserves `bytes` whether or not they fit: the ledger may then be over its budget until the
+    /// guard is dropped. For work that has to run and has nothing to wait for (a develop job alone
+    /// on a budget smaller than its mosaic): the count stays true and the next request is refused.
+    pub fn reserve_forced(self: &Arc<Self>, bytes: u64) -> Reservation {
+        let next = self
+            .used
+            .fetch_add(bytes, Ordering::SeqCst)
+            .saturating_add(bytes);
+        self.peak.fetch_max(next, Ordering::SeqCst);
+        Reservation {
+            ledger: Arc::clone(self),
+            bytes,
         }
     }
 
@@ -269,6 +408,19 @@ pub struct Reservation {
 }
 
 impl Reservation {
+    /// Moves `bytes` (at most all of them) into a reservation of their own: the ledger's count does
+    /// not change. For a part that outlives the rest (the rendered picture, which the encoder
+    /// holds after the render's working set is gone).
+    #[must_use]
+    pub fn split_off(&mut self, bytes: u64) -> Reservation {
+        let bytes = bytes.min(self.bytes);
+        self.bytes -= bytes;
+        Reservation {
+            ledger: Arc::clone(&self.ledger),
+            bytes,
+        }
+    }
+
     /// The reserved size.
     #[must_use]
     pub fn bytes(&self) -> u64 {
@@ -282,13 +434,40 @@ impl Drop for Reservation {
     }
 }
 
+/// Bytes in a [`MemoryLedger`] that travel with a value (a rendered picture): shared by its clones,
+/// released with the last of them. It is always equal to another, so it does not change what a
+/// comparison of the values says.
+#[derive(Debug, Clone, Default)]
+pub struct Held(#[allow(dead_code, reason = "held for its drop")] Option<Arc<Reservation>>);
+
+impl Held {
+    /// Holds `reservation`.
+    #[must_use]
+    pub fn new(reservation: Reservation) -> Self {
+        Self(Some(Arc::new(reservation)))
+    }
+}
+
+impl PartialEq for Held {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
 /// A least-recently-used map bounded by the bytes its values hold. Small (a handful of entries):
 /// a vector, newest last.
+///
+/// A map made with [`ByteLru::with_ledger`] also reserves the bytes of each entry in a
+/// [`MemoryLedger`] for as long as the entry lives, so the ledger counts what the cache holds
+/// (`docs/26` H-13). A reservation that does not fit is left out (the entry is kept, uncounted):
+/// the ledger is full then, and a full-resolution render is refused whether or not it counts the
+/// entry.
 #[derive(Debug)]
 pub struct ByteLru<K, V> {
-    entries: Vec<(K, V, usize)>,
+    entries: Vec<(K, V, usize, Option<Reservation>)>,
     budget: usize,
     used: usize,
+    ledger: Option<Arc<MemoryLedger>>,
 }
 
 impl<K: PartialEq, V> ByteLru<K, V> {
@@ -300,31 +479,55 @@ impl<K: PartialEq, V> ByteLru<K, V> {
             entries: Vec::new(),
             budget,
             used: 0,
+            ledger: None,
+        }
+    }
+
+    /// [`ByteLru::new`] whose entries are reserved in `ledger` while they are held.
+    #[must_use]
+    pub fn with_ledger(budget: usize, ledger: Arc<MemoryLedger>) -> Self {
+        Self {
+            ledger: Some(ledger),
+            ..Self::new(budget)
         }
     }
 
     /// The value for `key`, marking it most recently used.
     pub fn get(&mut self, key: &K) -> Option<&V> {
-        let i = self.entries.iter().position(|(k, _, _)| k == key)?;
+        let i = self.entries.iter().position(|(k, ..)| k == key)?;
         let e = self.entries.remove(i);
         self.entries.push(e);
-        self.entries.last().map(|(_, v, _)| v)
+        self.entries.last().map(|(_, v, ..)| v)
     }
 
     /// Whether `key` is present (does not touch the order).
     #[must_use]
     pub fn contains(&self, key: &K) -> bool {
-        self.entries.iter().any(|(k, _, _)| k == key)
+        self.entries.iter().any(|(k, ..)| k == key)
     }
 
     /// Inserts `value` that holds `bytes` bytes, replacing an equal key, then evicts the least
     /// recently used entries until the budget holds.
     pub fn insert(&mut self, key: K, value: V, bytes: usize) {
-        if let Some(i) = self.entries.iter().position(|(k, _, _)| *k == key) {
+        self.insert_counted(key, value, bytes, bytes);
+    }
+
+    /// [`ByteLru::insert`] for a value that takes `bytes` in the map's budget but only `host_bytes`
+    /// of the host's memory (an image on the device), which is what the ledger is given.
+    pub fn insert_counted(&mut self, key: K, value: V, bytes: usize, host_bytes: usize) {
+        if let Some(i) = self.entries.iter().position(|(k, ..)| *k == key) {
             self.used -= self.entries.remove(i).2;
         }
-        self.entries.push((key, value, bytes));
+        let held = match &self.ledger {
+            Some(ledger) if host_bytes > 0 => ledger.try_reserve(host_bytes as u64).ok(),
+            _ => None,
+        };
+        self.entries.push((key, value, bytes, held));
         self.used += bytes;
+        self.evict_to_budget();
+    }
+
+    fn evict_to_budget(&mut self) {
         while self.used > self.budget && self.entries.len() > 1 {
             self.used -= self.entries.remove(0).2;
         }
@@ -333,7 +536,7 @@ impl<K: PartialEq, V> ByteLru<K, V> {
     /// Removes every entry for which `drop_it` is true.
     pub fn retain(&mut self, mut keep: impl FnMut(&K, &V) -> bool) {
         let mut used = 0;
-        self.entries.retain(|(k, v, b)| {
+        self.entries.retain(|(k, v, b, _)| {
             let keep_it = keep(k, v);
             if keep_it {
                 used += b;
@@ -370,9 +573,7 @@ impl<K: PartialEq, V> ByteLru<K, V> {
     /// Changes the budget and evicts to fit.
     pub fn set_budget(&mut self, budget: usize) {
         self.budget = budget;
-        while self.used > self.budget && self.entries.len() > 1 {
-            self.used -= self.entries.remove(0).2;
-        }
+        self.evict_to_budget();
     }
 }
 
@@ -394,6 +595,118 @@ impl LoadGuard {
 impl Drop for LoadGuard {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Marks an export as running for as long as it is alive ([`JobScheduler::begin_export`]): the fill of a
+/// whole-image level starts no band while one exists. Counts the whole of an export, not only its queued
+/// device jobs: reading the raw, the CPU work, the encoding and the writing, and the gaps between its jobs,
+/// are all time the fill must not take. It lowers the count in `Drop`, so a return, an error, a cancel and a
+/// panic (unwinding runs destructors) all end it, and it cannot leak.
+#[must_use = "the export counts as running only while the guard is alive"]
+pub struct ExportGuard {
+    _count: LoadGuard,
+}
+
+impl std::fmt::Debug for ExportGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ExportGuard")
+    }
+}
+
+/// The switch that pauses optional background work while memory is critical (`docs/26` P4-5, H-14): the session's decode
+/// pool does not start a prefetch or a thumbnail refresh while it is paused, and the shell's thumbnail refresher waits in
+/// [`BackgroundGate::wait_resumed`]. Work the person is waiting for (the current photo's development, a viewport frame, an
+/// export) never looks at it.
+///
+/// Whoever acts when the gate opens registers with [`BackgroundGate::on_resume`], so a pause never needs a timer to end.
+#[derive(Default)]
+pub struct BackgroundGate {
+    paused: Mutex<bool>,
+    changed: std::sync::Condvar,
+    listeners: Mutex<Vec<Arc<dyn Fn() -> bool + Send + Sync>>>,
+    pauses: AtomicU64,
+    resumes: AtomicU64,
+}
+
+impl std::fmt::Debug for BackgroundGate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BackgroundGate")
+            .field("paused", &self.is_paused())
+            .finish_non_exhaustive()
+    }
+}
+
+impl BackgroundGate {
+    /// A gate that is open.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Whether optional background work is paused now.
+    #[must_use]
+    pub fn is_paused(&self) -> bool {
+        *locked(&self.paused)
+    }
+
+    /// Pauses or resumes. Returns whether the state changed. A resume wakes the waiters and runs the listeners (outside the
+    /// gate's lock; a listener that returns false is forgotten).
+    pub fn set_paused(&self, paused: bool) -> bool {
+        {
+            let mut now = locked(&self.paused);
+            if *now == paused {
+                return false;
+            }
+            *now = paused;
+        }
+        if paused {
+            self.pauses.fetch_add(1, Ordering::SeqCst);
+            return true;
+        }
+        self.resumes.fetch_add(1, Ordering::SeqCst);
+        self.changed.notify_all();
+        let all: Vec<_> = locked(&self.listeners).clone();
+        let alive: Vec<bool> = all.iter().map(|l| l()).collect();
+        if alive.contains(&false) {
+            let mut listeners = locked(&self.listeners);
+            let mut keep = alive.iter();
+            listeners.retain(|_| keep.next().copied().unwrap_or(true));
+        }
+        true
+    }
+
+    /// Registers something to do when the gate opens. It returns whether it is still wanted.
+    pub fn on_resume(&self, listener: Arc<dyn Fn() -> bool + Send + Sync>) {
+        locked(&self.listeners).push(listener);
+    }
+
+    /// Blocks while the gate is paused; returns true when it is open, false when `stop` says so (asked every `slice`).
+    pub fn wait_resumed(&self, stop: &dyn Fn() -> bool, slice: Duration) -> bool {
+        let mut paused = locked(&self.paused);
+        while *paused {
+            if stop() {
+                return false;
+            }
+            paused = self
+                .changed
+                .wait_timeout(paused, slice)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        }
+        true
+    }
+
+    /// How many times the gate has been closed (a test's counter).
+    #[must_use]
+    pub fn pauses(&self) -> u64 {
+        self.pauses.load(Ordering::SeqCst)
+    }
+
+    /// How many times the gate has been opened again (a test's counter).
+    #[must_use]
+    pub fn resumes(&self) -> u64 {
+        self.resumes.load(Ordering::SeqCst)
     }
 }
 
@@ -439,6 +752,8 @@ pub struct JobScheduler {
     background: Scheduler<()>,
     /// Foreground jobs queued or running.
     load: Arc<AtomicUsize>,
+    /// Export jobs queued or running: the fill of a whole-image level gives way while there is one.
+    exports: Arc<AtomicUsize>,
     /// The photo being looked at, for [`JobScheduler::navigate`] (0: none).
     current: AtomicU64,
     /// Queued panel requests that navigation supersedes.
@@ -476,6 +791,7 @@ impl JobScheduler {
             foreground,
             background,
             load: Arc::new(AtomicUsize::new(0)),
+            exports: Arc::new(AtomicUsize::new(0)),
             current: AtomicU64::new(0),
             superseded: Mutex::new(Vec::new()),
         })
@@ -499,12 +815,19 @@ impl JobScheduler {
         }
         if priority == Priority::Export {
             let load = Arc::clone(&self.load);
+            let active = LoadGuard::new(&self.exports);
             self.background.submit(spec, move |(), token| {
+                let _active = active;
                 // A cancelled wait still runs the job: it sees its token set at its first check
                 // and returns its own cancellation result.
                 let _ = wait_until_idle(&load, token);
                 job(token)
             })
+        } else if priority == Priority::Fill {
+            // The bands of a level being filled are nobody's wait: they do not count as foreground load, or an export
+            // (which starts and goes on only while the foreground is idle) would wait for a fill whose next band is
+            // always queued before the last one ends.
+            self.foreground.submit(spec, move |(), token| job(token))
         } else {
             let guard = LoadGuard::new(&self.load);
             self.foreground.submit(spec, move |(), token| {
@@ -605,6 +928,23 @@ impl JobScheduler {
         wait_until_idle(&self.load, cancel)
     }
 
+    /// Marks the start of an export that lasts until the returned guard is dropped (the whole of
+    /// `export_photo`, and the export queue's job): [`JobScheduler::exports_active`] is true meanwhile,
+    /// also in the stretches where no export job is queued (reading, encoding, writing, the gaps between
+    /// device jobs). Guards nest: the count is the number alive.
+    pub fn begin_export(&self) -> ExportGuard {
+        ExportGuard {
+            _count: LoadGuard::new(&self.exports),
+        }
+    }
+
+    /// Whether an export is running: an export job is queued or running, or an [`ExportGuard`] is alive.
+    /// The fill of a level yields to it (it starts no band; a band already running ends).
+    #[must_use]
+    pub fn exports_active(&self) -> bool {
+        self.exports.load(Ordering::SeqCst) > 0
+    }
+
     /// Foreground jobs queued or running now.
     #[must_use]
     pub fn foreground_load(&self) -> usize {
@@ -700,6 +1040,7 @@ mod tests {
         for (name, p) in [
             ("export", Priority::Export),
             ("thumbnail", Priority::Thumbnail),
+            ("fill", Priority::Fill),
             ("tile", Priority::TileNeural),
             ("viewport", Priority::Viewport),
         ] {
@@ -713,10 +1054,121 @@ mod tests {
         for h in handles {
             h.wait().expect("job");
         }
+        // The bands of a level being filled run after every job somebody asked for, thumbnails included. (The export is on
+        // its own worker and starts once the foreground it waits for has gone idle; the fill is not part of that.)
+        let order = order.lock().expect("order").clone();
+        let at = |n: &str| order.iter().position(|x| *x == n).expect(n);
+        assert_eq!(&order[..3], ["viewport", "tile", "thumbnail"]);
+        assert!(at("fill") > at("thumbnail") && at("export") > at("thumbnail"));
+    }
+
+    #[test]
+    fn an_export_does_not_wait_for_a_fill_that_keeps_queueing_bands() {
+        let s = Arc::new(JobScheduler::new("test-fill-export").expect("scheduler"));
+        // A fill whose every band queues the next one before it ends, as a level's does.
+        fn band(s: &Arc<JobScheduler>, left: usize, ran: &Arc<std::sync::atomic::AtomicUsize>) {
+            let (s2, ran2) = (Arc::clone(s), Arc::clone(ran));
+            let _ = s.submit(Priority::Fill, Some(PhotoId(1)), move |_| {
+                std::thread::sleep(Duration::from_millis(30));
+                ran2.fetch_add(1, Ordering::SeqCst);
+                if left > 1 {
+                    band(&s2, left - 1, &ran2);
+                }
+            });
+        }
+        let ran = Arc::new(AtomicUsize::new(0));
+        band(&s, 40, &ran);
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(s.foreground_load(), 0, "a fill is not foreground load");
+        let export = s.submit(Priority::Export, None, |_| ());
+        assert!(s.exports_active());
+        export.wait().expect("the export ran");
+        assert!(!s.exports_active());
+        assert!(
+            ran.load(Ordering::SeqCst) < 40,
+            "the export did not wait for the fill to end"
+        );
+    }
+
+    /// The guard counts an export through the stretches that are not queued jobs, nests, and cannot leak.
+    #[test]
+    fn an_export_guard_counts_until_dropped_nests_and_survives_a_panic() {
+        let s = Arc::new(JobScheduler::new("test-guard").expect("scheduler"));
+        assert!(!s.exports_active());
+        let outer = s.begin_export();
+        assert!(
+            s.exports_active(),
+            "no export job is queued, the guard counts"
+        );
+        let inner = s.begin_export();
+        drop(outer);
+        assert!(s.exports_active(), "guards nest: one is alive");
+        // A job queued and finished does not lower what a guard holds.
+        s.submit(Priority::Export, None, |_| ())
+            .wait()
+            .expect("export job");
+        assert!(s.exports_active());
+        drop(inner);
+        assert!(!s.exports_active());
+        // A panic unwinds through the guard's destructor.
+        let s2 = Arc::clone(&s);
+        let r = std::thread::spawn(move || {
+            let _guard = s2.begin_export();
+            assert!(s2.exports_active());
+            panic!("an export that panics");
+        })
+        .join();
+        assert!(r.is_err());
+        assert!(!s.exports_active(), "a panic does not leak the guard");
+    }
+
+    #[test]
+    fn a_fill_queued_behind_a_running_band_lets_a_later_frame_in_first() {
+        let s = JobScheduler::new("test-fill").expect("scheduler");
+        let (gate, gate_job) = block(&s);
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let mut handles = Vec::new();
+        // Three bands queue, one after the other (a fill submits its next band when one is done), and a frame arrives meanwhile.
+        for name in ["band 1", "band 2", "band 3"] {
+            let order = Arc::clone(&order);
+            handles.push(s.submit(Priority::Fill, Some(PhotoId(1)), move |_| {
+                order.lock().expect("order").push(name);
+            }));
+        }
+        let order2 = Arc::clone(&order);
+        handles.push(s.submit(Priority::Viewport, Some(PhotoId(1)), move |_| {
+            order2.lock().expect("order").push("frame");
+        }));
+        gate.send(()).expect("open the gate");
+        gate_job.wait().expect("gate job");
+        for h in handles {
+            h.wait().expect("job");
+        }
         assert_eq!(
             *order.lock().expect("order"),
-            vec!["viewport", "tile", "thumbnail", "export"]
+            vec!["frame", "band 1", "band 2", "band 3"]
         );
+    }
+
+    #[test]
+    fn navigation_cancels_the_fill_of_the_photo_left() {
+        let s = JobScheduler::new("test-fill-nav").expect("scheduler");
+        assert_eq!(s.navigate(PhotoId(1)), 0);
+        let (gate, gate_job) = block(&s);
+        let fill = s.submit(Priority::Fill, Some(PhotoId(1)), |token| {
+            token.is_cancelled()
+        });
+        let other = s.submit(Priority::Fill, Some(PhotoId(2)), |token| {
+            token.is_cancelled()
+        });
+        assert!(
+            s.navigate(PhotoId(2)) >= 1,
+            "the fill of photo 1 is cancelled"
+        );
+        gate.send(()).expect("open the gate");
+        gate_job.wait().expect("gate job");
+        assert!(fill.wait().is_err(), "the cancelled fill never ran");
+        assert!(!other.wait().expect("the fill of the photo moved to"));
     }
 
     #[test]
@@ -1184,6 +1636,84 @@ mod tests {
     }
 
     #[test]
+    fn a_map_with_a_ledger_reserves_what_it_holds_and_gives_it_back_on_every_path() {
+        let ledger = MemoryLedger::new(1000);
+        let mut m: ByteLru<u32, &str> = ByteLru::with_ledger(250, Arc::clone(&ledger));
+        m.insert(1, "a", 100);
+        m.insert(2, "b", 100);
+        assert_eq!(ledger.used(), 200);
+        // Eviction by the map's own budget.
+        m.insert(3, "c", 100);
+        assert_eq!(m.len(), 2);
+        assert_eq!(ledger.used(), 200);
+        // Replacing a key swaps the reservation.
+        m.insert(3, "c2", 50);
+        assert_eq!(ledger.used(), 150);
+        // An entry on the device costs the map its bytes and the host nothing.
+        m.insert_counted(4, "d", 40, 0);
+        assert_eq!(ledger.used(), 150);
+        // A smaller budget, retain, clear and drop.
+        m.insert(5, "e", 30);
+        assert_eq!(ledger.used(), 50 + 100 + 30);
+        m.set_budget(60);
+        // The oldest go until the map's 60 bytes hold: only the newest entry is left.
+        assert_eq!(m.len(), 1);
+        assert_eq!(ledger.used(), 30);
+        m.retain(|k, _| *k != 5);
+        assert_eq!(ledger.used(), 0);
+        m.clear();
+        assert_eq!(ledger.used(), 0);
+        m.insert(9, "z", 100);
+        drop(m);
+        assert_eq!(ledger.used(), 0);
+        // A reservation that does not fit leaves the entry uncounted: the ledger is full already.
+        let mut n: ByteLru<u32, &str> = ByteLru::with_ledger(10_000, Arc::clone(&ledger));
+        let all = ledger.try_reserve(950).expect("fits");
+        n.insert(1, "big", 100);
+        assert_eq!((n.len(), ledger.used()), (1, 950));
+        drop(all);
+    }
+
+    #[test]
+    fn a_forced_reservation_goes_over_the_budget_and_counts() {
+        let ledger = MemoryLedger::new(100);
+        let forced = ledger.reserve_forced(150);
+        assert_eq!((ledger.used(), ledger.peak()), (150, 150));
+        assert!(ledger.try_reserve(1).is_err());
+        drop(forced);
+        assert_eq!(ledger.used(), 0);
+        assert!(ledger.try_reserve(100).is_ok());
+    }
+
+    #[test]
+    fn the_ram_override_takes_gib_and_refuses_the_rest() {
+        const GIB: u64 = 1 << 30;
+        assert_eq!(parse_ram_override("8"), Some(8 * GIB));
+        assert_eq!(parse_ram_override(" 16 "), Some(16 * GIB));
+        assert_eq!(parse_ram_override("1024"), Some(1024 * GIB));
+        // Fractions are allowed: a tight machine is worth trying.
+        assert_eq!(parse_ram_override("7.5"), Some(15 * GIB / 2));
+        assert_eq!(parse_ram_override("0.5"), Some(GIB / 2));
+        for bad in [
+            "", " ", "0", "0.0", "-8", "1024.5", "1025", "8GB", "eight", "nan", "inf", "1e400",
+        ] {
+            assert_eq!(parse_ram_override(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn eight_gib_of_override_gives_the_budgets_of_the_rule() {
+        const GIB: u64 = 1 << 30;
+        let ram = parse_ram_override("8");
+        // CPU only: half of the RAM, under the 6 GiB default.
+        assert_eq!(MemoryBudget::for_ram(ram).cpu_bytes, 4 * GIB);
+        // With a GPU that shares the memory: 2 GiB and 2.8 GiB (`docs/17`).
+        let unified = MemoryBudget::for_ram(ram).for_unified_memory(ram);
+        assert_eq!(unified.gpu_bytes, 2 * GIB);
+        assert_eq!(unified.cpu_bytes, 8 * GIB * 3 / 5 - 2 * GIB);
+    }
+
+    #[test]
     fn the_ledger_follows_a_new_budget() {
         let ledger = MemoryLedger::new(100);
         let first = ledger.try_reserve(60).expect("fits");
@@ -1194,5 +1724,61 @@ mod tests {
         drop(first);
         assert_eq!(ledger.used(), 0, "what was reserved is released as before");
         ledger.try_reserve(50).expect("fits the new budget");
+    }
+    #[test]
+    fn the_gate_pauses_and_resumes_once_per_change_and_tells_its_listeners_on_resume() {
+        let gate = Arc::new(BackgroundGate::new());
+        let woken = Arc::new(AtomicUsize::new(0));
+        let alive = Arc::new(AtomicBool::new(true));
+        {
+            let (woken, alive) = (Arc::clone(&woken), Arc::clone(&alive));
+            gate.on_resume(Arc::new(move || {
+                woken.fetch_add(1, Ordering::SeqCst);
+                alive.load(Ordering::SeqCst)
+            }));
+        }
+        assert!(!gate.is_paused());
+        assert!(!gate.set_paused(false), "already open: no change");
+        assert!(gate.set_paused(true));
+        assert!(!gate.set_paused(true), "already paused: no change");
+        assert_eq!(woken.load(Ordering::SeqCst), 0, "a pause wakes nobody");
+        assert!(gate.set_paused(false));
+        assert_eq!(woken.load(Ordering::SeqCst), 1);
+        assert_eq!((gate.pauses(), gate.resumes()), (1, 1));
+        // A listener that says it is gone is forgotten.
+        alive.store(false, Ordering::SeqCst);
+        gate.set_paused(true);
+        gate.set_paused(false);
+        assert_eq!(woken.load(Ordering::SeqCst), 2);
+        gate.set_paused(true);
+        gate.set_paused(false);
+        assert_eq!(woken.load(Ordering::SeqCst), 2, "it was dropped");
+    }
+
+    #[test]
+    fn a_waiter_goes_on_when_the_gate_opens_and_gives_up_when_told_to_stop() {
+        let gate = Arc::new(BackgroundGate::new());
+        // Open: no wait at all.
+        assert!(gate.wait_resumed(&|| false, Duration::from_millis(5)));
+        gate.set_paused(true);
+        let waiter = {
+            let gate = Arc::clone(&gate);
+            std::thread::spawn(move || gate.wait_resumed(&|| false, Duration::from_secs(60)))
+        };
+        // `set_paused(false)` wakes it at once, so the long slice is never waited out.
+        gate.set_paused(false);
+        assert!(waiter.join().expect("the waiter"));
+        // A waiter told to stop returns false while the gate is still paused.
+        gate.set_paused(true);
+        let stop = Arc::new(AtomicBool::new(false));
+        let waiter = {
+            let (gate, stop) = (Arc::clone(&gate), Arc::clone(&stop));
+            std::thread::spawn(move || {
+                gate.wait_resumed(&|| stop.load(Ordering::SeqCst), Duration::from_millis(5))
+            })
+        };
+        stop.store(true, Ordering::SeqCst);
+        assert!(!waiter.join().expect("the waiter"));
+        assert!(gate.is_paused());
     }
 }

@@ -43,8 +43,9 @@ pub fn run() {
     let mut app_builder = tauri::Builder::default();
     // The page measures itself (`src/perf.ts`) when asked with `?perf` or `localStorage.ymPerf`; the Mac
     // viewport job can do neither, so `YM_PERF` reaches the page as a flag set before its scripts run.
-    if perf::page_requested() {
-        app_builder = app_builder.plugin(perf::page_plugin::<tauri::Wry>());
+    // `YM_GLASS=off` reaches it the same way (the glass without its blur, to compare on the same Mac).
+    if let Some(script) = perf::page_script() {
+        app_builder = app_builder.plugin(perf::script_plugin::<tauri::Wry>(script));
     }
     let app = app_builder
         .plugin(tauri_plugin_updater::Builder::new().build())
@@ -66,6 +67,8 @@ pub fn run() {
         .on_menu_event(on_menu_event)
         .setup(move |app| {
             builder.mount_events(app);
+            // The system's display options reach the page whether or not the core started.
+            crate::a11y::watch(app.handle().clone());
             let state = start(app, &frames);
             app.manage(state);
             Ok(())
@@ -97,6 +100,8 @@ fn start(app: &mut App, frames: &Arc<FrameStore>) -> AppState {
     if perf::enabled() {
         perf::watch_main_thread(app.handle().clone());
     }
+    // The core's `frame` and `gpu passes` lines (`ym_core::perf`) follow the same switch.
+    ym_core::perf::set_enabled(perf::enabled());
     let emitter: Arc<dyn Emitter> = Arc::new(TauriEmitter::new(app.handle().clone()));
     let cli = CliLink::locate()
         .map_err(|e| tracing::warn!(error = %e, "no command-line tool next to the app"))
@@ -181,8 +186,9 @@ fn serve_frame(
 }
 
 /// The answer for `path`, `/<launch>/frame-<n>.png` (a frame of the fallback viewport),
-/// `/<launch>/thumb-<photo>-<version>.png` (a thumbnail of the filmstrip) or
-/// `/<launch>/look-<photo>-<version>.png` (a tile of the Look tab).
+/// `/<launch>/thumb-<photo>-<version>.png` (a thumbnail of the filmstrip),
+/// `/<launch>/look-<photo>-<version>.png` (a tile of the Look tab) or
+/// `/<launch>/node-<photo>-<node>-<version>.png` (a card of the node view).
 ///
 /// Thumbnails and tiles that exist are cached for good: their address holds the launch id and a
 /// version that is never used twice, so what an address names never changes, and the webview need
@@ -524,8 +530,8 @@ fn page_paints_over_cell(page: &serde_json::Value) -> Vec<String> {
 }
 
 /// Drives the photo cell and a slider like a hand does (`YM_PERF_SCRIPT`): 240 ctrl+wheel events (zoom
-/// in about the middle of the cell, a little out at the end), 240 pan events and 60 key presses on the
-/// Temperature slider, 8 ms apart (a timer cannot keep to it: the milliseconds each phase took are
+/// in about the middle of the cell, a little out at the end), 240 pan events, 60 key presses on the
+/// Temperature slider and a drag of it of 240 pointer moves, 8 ms apart (a timer cannot keep to it: the milliseconds each phase took are
 /// in the result). The result is left in `window.__ymPerfResult`; a script that is evaluated does not
 /// wait for promises, so [`SMOKE_PERF_RESULT`] reads it later. What it cannot find is listed in
 /// `missing`.
@@ -560,6 +566,21 @@ const SMOKE_PERF_SCRIPT: &str = r##"(() => {
       slider.focus();
       const key = (i) => (Math.floor(i / 10) % 2 ? "ArrowLeft" : "ArrowRight");
       await phase("slider_keys", 60, (i) => slider.dispatchEvent(new KeyboardEvent("keydown", { key: key(i), shiftKey: true, bubbles: true, cancelable: true })));
+      // A drag with pointer events, 240 moves back and forth along the track (the timeline of a slider tick, `src-tauri/src/timeline.rs`, times these).
+      // Radix captures the pointer, which an event made by a script cannot, so the capture calls are made harmless for this run.
+      const track = (slider.closest('[data-slot="slider"]') || slider.parentElement).getBoundingClientRect();
+      const knob = slider.getBoundingClientRect();
+      Element.prototype.setPointerCapture = function () {};
+      Element.prototype.hasPointerCapture = function () { return true; };
+      Element.prototype.releasePointerCapture = function () {};
+      const y = knob.top + knob.height / 2;
+      const pointer = (type, x, buttons) => slider.dispatchEvent(new PointerEvent(type, { bubbles: true, cancelable: true, composed: true, pointerId: 1, pointerType: "mouse", isPrimary: true, button: 0, buttons, clientX: x, clientY: y }));
+      pointer("pointerdown", knob.left + knob.width / 2, 1);
+      await phase("slider_drag", 240, (i) => {
+        const f = (i % 120) / 120;
+        pointer("pointermove", track.left + track.width * (0.3 + 0.4 * (f < 0.5 ? f * 2 : 2 - f * 2)), 1);
+      });
+      pointer("pointerup", knob.left + knob.width / 2, 0);
     }
     finish();
   })().catch((e) => { out.error = String(e); finish(); });

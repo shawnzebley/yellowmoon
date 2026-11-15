@@ -1,12 +1,10 @@
 //! `golden truth`: the end-to-end colour of the product against the ground truth of the synthetic scenes.
 //!
-//! For every scene the real `ym` binary develops the file with its default settings and writes a DNG. The three defaults
+//! For every scene the real `ym` binary develops the file with its default settings and writes a DNG. The two defaults
 //! that are not the sensor's colour are switched off, because the truth is the colour of the scene and not a look: the
 //! look is Neutral (the default look is Signature since pipeline 0.3.0), the highlight range is 0, "as recorded"
 //! (`rolloff.highlights`, a gain on the highlights that is the identity at 0 below the ALEXA's clip, `docs/02` C7;
-//! the default 1 moves the camera's clip on purpose), and the white lift is off (`white_offset_ev` -3: the per-photo
-//! gain on the tones above +1 stop, `docs/02` C12 step 1b, which the DNG carries; [`truth_settings`]). The low-light
-//! toe keeps its value. The DNG holds the picture after the whole colour chain up to the look and curve
+//! the default 1 moves the camera's clip on purpose; [`truth_settings`]). The low-light toe keeps its value. The DNG holds the picture after the whole colour chain up to the look and curve
 //! (C1 to C11, `docs/02`), decoded back to linear AWG4: the last place before the display transform where the colour
 //! can be compared with an ALEXA-referred truth without going through a tone curve. The sidecar of the scene holds,
 //! for every patch, what an ALEXA would have recorded of the same scene (the ALEXA estimate of `docs/02` C3 to C6, in
@@ -29,10 +27,10 @@ use std::path::Path;
 
 use anyhow::{Context, Result, ensure};
 use serde::Serialize;
-use ym_color::aces2::{Aces2Output, Aces2Transform};
 use ym_color::consts::{Vec3, linalg};
 use ym_color::deltae::{d65_white_xyz, delta_e_2000, percentile, xyz_to_lab};
-use ym_color::encode::srgb_decode;
+use ym_color::display::OutputTarget;
+use ym_color::display::cine::CineRendering;
 use ym_color::gamut;
 
 use crate::dngread::{LinearRaw, read_linear_raw};
@@ -83,7 +81,7 @@ pub struct PatchResult {
     pub render: f64,
     /// ΔE00 between the baseline (Sony through the ARRI matrix, no sensor map) and the truth.
     pub baseline: f64,
-    /// Like `render`, but after the display transform (ACES 2, sRGB) on both sides: the colour as it is seen.
+    /// Like `render`, but after the display transform (the cine rendering, sRGB) on both sides: the colour as it is seen.
     pub render_display: f64,
     /// Like `baseline`, but after the display transform.
     pub baseline_display: f64,
@@ -139,12 +137,10 @@ fn scaled(v: Vec3, s: f64) -> Vec3 {
     v.map(|c| c * s)
 }
 
-/// Lab (D65) of what the display transform (ACES 2, sRGB) makes of a scene-linear AWG4 colour.
+/// Lab (D65) of what the display transform (the cine rendering, sRGB) makes of a scene-linear AWG4 colour.
 fn displayed_lab(awg4: Vec3) -> Vec3 {
     let m = gamut::matrices();
-    let ap0 = linalg::mul_vec(&m.awg4_to_ap0, awg4);
-    let encoded = Aces2Transform::shared(Aces2Output::Srgb).transform_ap0(ap0);
-    let linear = encoded.map(srgb_decode);
+    let linear = CineRendering::new(OutputTarget::Srgb).forward(gamut::LinearAwg4(awg4));
     xyz_to_lab(linalg::mul_vec(&m.rec709_to_xyz, linear), d65_white_xyz())
 }
 
@@ -211,29 +207,60 @@ pub fn group_stats(
         .collect()
 }
 
-/// The settings a scene is developed with for the truth: the entry's own, with the Neutral look, the highlight range
-/// at 0 ("as recorded", `rolloff.highlights`) and no white lift (`white_offset_ev` -3) unless the entry sets them. The
-/// default look (Signature), the default highlight range (1, which places the camera's clip at white) and the
-/// automatic white lift change the picture on purpose; the truth measures the colour of the scene, so a number here
+/// The settings a scene is developed with for the truth: the entry's own (a node-first document, `docs/23`
+/// section 3), with the Output's Neutral look and the Input's highlight range at 0 ("as recorded",
+/// `rolloff.highlights`) unless the entry sets them. The
+/// default look (Signature) and the default highlight range (1, which places the camera's clip at white)
+/// change the picture on purpose; the truth measures the colour of the scene, so a number here
 /// moves only when the sensor map or the white balance does. An entry's own `rolloff.low_light` stays (a `rolloff`
 /// with only `highlights` reads the toe as its default, 0.5).
 #[must_use]
 pub fn truth_settings(base: &serde_json::Value) -> serde_json::Value {
+    use serde_json::{Map, Value, json};
+    /// The object of the item `id`, added when the document does not list the node.
+    fn item<'a>(items: &'a mut Vec<Value>, id: &str) -> Option<&'a mut Map<String, Value>> {
+        let at = items
+            .iter()
+            .position(|i| i.get("id").and_then(Value::as_str) == Some(id))
+            .unwrap_or_else(|| {
+                items.push(json!({ "id": id }));
+                items.len() - 1
+            });
+        items[at].as_object_mut()
+    }
     let mut settings = base.clone();
-    if let Some(map) = settings.as_object_mut() {
-        map.entry("look")
-            .or_insert_with(|| serde_json::Value::from("builtin:neutral"));
-        // -3 is the lowest offset: the automatic amount can never be larger than 2 stops, so the lift is off.
-        map.entry("white_offset_ev")
-            .or_insert_with(|| serde_json::Value::from(-3));
-        let rolloff = map
+    // A document that is not an object, a `nodes` that is not one, or items that are not a list are
+    // passed on as they are (ym refuses them, loudly).
+    let Some(map) = settings.as_object_mut() else {
+        return settings;
+    };
+    let Some(nodes) = map
+        .entry("nodes")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+    else {
+        return settings;
+    };
+    let Some(items) = nodes
+        .entry("items")
+        .or_insert_with(|| json!([]))
+        .as_array_mut()
+    else {
+        return settings;
+    };
+    if let Some(input) = item(items, "input") {
+        let rolloff = input
             .entry("rolloff")
-            .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+            .or_insert_with(|| Value::Object(Map::new()));
         // A `rolloff` that is not an object is passed on as it is (ym refuses it, loudly).
         if let Some(r) = rolloff.as_object_mut() {
-            r.entry("highlights")
-                .or_insert_with(|| serde_json::Value::from(0));
+            r.entry("highlights").or_insert_with(|| Value::from(0));
         }
+    }
+    if let Some(output) = item(items, "output") {
+        output
+            .entry("look")
+            .or_insert_with(|| Value::from("builtin:neutral"));
     }
     settings
 }
@@ -540,32 +567,45 @@ mod tests {
     }
 
     #[test]
-    fn the_truth_has_no_default_look_no_white_lift_and_the_highlights_as_recorded() {
+    fn the_truth_has_no_default_look_and_the_highlights_as_recorded() {
         use serde_json::json;
-        // An entry with no settings gets the Neutral look, the highlight range at 0 and no lift; the toe is not
-        // named, so it reads as its default.
+        let input = |s: &serde_json::Value| s["nodes"]["items"][0].clone();
+        let output = |s: &serde_json::Value| s["nodes"]["items"][1].clone();
+        // An entry with no settings gets the Neutral look on the Output and the highlight range at 0 on
+        // the Input; the toe is not named, so it reads as its default.
         let plain = truth_settings(&json!({}));
-        assert_eq!(plain["look"], "builtin:neutral");
-        assert_eq!(plain["rolloff"], json!({"highlights": 0}));
-        assert_eq!(plain["white_offset_ev"], -3);
+        assert_eq!(output(&plain)["look"], "builtin:neutral");
+        assert_eq!(input(&plain)["rolloff"], json!({"highlights": 0}));
         // What the entry sets itself stays.
-        let own = truth_settings(&json!({
-            "look": "builtin:signature",
-            "rolloff": {"highlights": 0.5, "low_light": 0.2},
-            "white_offset_ev": 0.5,
-            "exposure": {"ev": 1.0}
-        }));
-        assert_eq!(own["look"], "builtin:signature");
-        assert_eq!(own["rolloff"], json!({"highlights": 0.5, "low_light": 0.2}));
-        assert_eq!(own["white_offset_ev"], 0.5);
-        assert_eq!(own["exposure"]["ev"], 1.0);
+        let own = truth_settings(&json!({ "nodes": { "items": [
+            { "id": "output", "look": "builtin:signature" },
+            { "id": "input", "rolloff": {"highlights": 0.5, "low_light": 0.2},
+              "exposure": {"kind": "manual", "ev": 1.0} },
+        ] } }));
+        let items = own["nodes"]["items"].as_array().unwrap();
+        let find = |id: &str| items.iter().find(|i| i["id"] == id).unwrap().clone();
+        assert_eq!(find("output")["look"], "builtin:signature");
+        assert_eq!(
+            find("input")["rolloff"],
+            json!({"highlights": 0.5, "low_light": 0.2})
+        );
+        assert_eq!(find("input")["exposure"]["ev"], 1.0);
         // An entry that sets only the toe keeps it and gets the highlights as recorded.
-        let toe = truth_settings(&json!({"rolloff": {"low_light": 0.0}}));
-        assert_eq!(toe["rolloff"], json!({"highlights": 0, "low_light": 0.0}));
-        // Something that is not an object is passed on as it is (ym refuses it, loudly), and so is a `rolloff` that
-        // is not one.
+        let toe = truth_settings(
+            &json!({ "nodes": { "items": [ { "id": "input", "rolloff": {"low_light": 0.0} } ] } }),
+        );
+        assert_eq!(
+            input(&toe)["rolloff"],
+            json!({"highlights": 0, "low_light": 0.0})
+        );
+        // Something that is not an object is passed on as it is (ym refuses it, loudly), and so is a
+        // `rolloff` that is not one.
         assert_eq!(truth_settings(&json!(3)), json!(3));
-        assert_eq!(truth_settings(&json!({"rolloff": 1}))["rolloff"], json!(1));
+        let bad =
+            truth_settings(&json!({ "nodes": { "items": [ { "id": "input", "rolloff": 1 } ] } }));
+        assert_eq!(input(&bad)["rolloff"], json!(1));
+        let nodes_bad = json!({ "nodes": 3 });
+        assert_eq!(truth_settings(&nodes_bad), nodes_bad);
     }
 
     #[test]

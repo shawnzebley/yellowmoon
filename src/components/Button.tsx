@@ -3,8 +3,10 @@ import type { ButtonHTMLAttributes, MouseEvent, ReactNode, Ref } from "react";
 import { Button as GlassButton } from "@/components/glass/button";
 import { Kbd } from "@/components/glass/kbd";
 import { Toggle } from "@/components/glass/toggle";
-import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/glass/tooltip";
+import { TooltipTrigger } from "@/components/glass/tooltip";
+import { OptionalTooltip } from "./OptionalTooltip";
 import { cx } from "./cx";
+import { BUTTON_HANDLERS, memoStable } from "./stable";
 
 /** Visual kind of a `Button`. */
 export type ButtonVariant = "primary" | "secondary" | "header" | "quiet";
@@ -44,7 +46,7 @@ const KIND = { primary: "prominent", secondary: "glass", header: "glass", quiet:
  * uses `aria-disabled` so the button keeps its place in the tab order (the wizard's Next explains why it is locked). `title` is shown
  * as a glass tooltip (the span around the button lets a disabled one explain itself on hover too).
  */
-export function Button({
+function ButtonImpl({
   variant = "primary",
   size = "md",
   block = false,
@@ -133,7 +135,7 @@ export function Button({
   // The tree is the same whether or not there is a title: a button whose title comes and goes (the wizard's Next, the Export panel's
   // estimate) keeps its element, so the focus stays on it. Without a title the span is inert (no content, no description).
   return (
-    <Tooltip>
+    <OptionalTooltip text={title}>
       {/* The tooltip opens on hover only. On focus it would take the first Esc (Radix dismisses the topmost layer and calls preventDefault,
           so the dialog or the mode behind it would need a second press); the reason is still read from the description, and the screens
           that lock a button say why in their own note. Radix skips its focus handler when this one calls preventDefault. */}
@@ -147,8 +149,7 @@ export function Button({
           ) : null}
         </span>
       </TooltipTrigger>
-      {title ? <TooltipContent>{title}</TooltipContent> : null}
-    </Tooltip>
+    </OptionalTooltip>
   );
 }
 
@@ -189,3 +190,6 @@ export function LinkButton({ size = "md", weight = "heavy", disabled = false, cl
     </GlassButton>
   );
 }
+
+/** The button, drawn again only when its data changes: a new `onClick` function at each render of the screen does not draw it (U-02). */
+export const Button = memoStable<ButtonProps>(ButtonImpl, BUTTON_HANDLERS);

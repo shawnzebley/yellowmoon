@@ -1,10 +1,12 @@
 import { useEffect, useState } from "react";
 import { ToggleGroup, ToggleGroupItem } from "@/components/glass/toggle-group";
-import { Button, Card, formats, MINUS, ResetLink, RowNote, Slider, WarpPlane, WARP_MAX_PINS } from "../../components";
+import { Button, Card, formats, MINUS, ResetLink, RowNote, Slider, WarpPlane, WARP_MAX_PINS, WARP_RANGE_DEFAULT } from "../../components";
 import type { WarpTool } from "../../components";
 import type { ColorWarpPin } from "../../api/types";
 import { useAppState } from "../../state/context";
+import { gradeOf, MAIN_ID, patchOf } from "../../state/settingsGraph";
 import type { TabProps } from "./shared";
+import { useAfterFirstFrame, usePaneActive } from "./pane";
 
 /** What the card says while no pin is selected. */
 export const WARP_HINT = "Drag a colour to move it. Lock holds a colour in place.";
@@ -20,6 +22,8 @@ export const formatPivot = (value: number): string => {
 export const formatWarpExposure = (value: number): string => `${formats.ev(value)} EV`;
 
 export interface ColorWarpCardProps extends TabProps {
+  /** The corrector whose warp this is: Main (the default, the simple view) or the selected node of the node view. */
+  node?: number;
   /** Pick colour is on: a click on the photo adds a pin (the crosshair layer of Pick white, `Photos`). */
   pickingColor?: boolean;
   /** Turns Pick colour on or off. Without it the toggle does nothing. */
@@ -32,17 +36,21 @@ export interface ColorWarpCardProps extends TabProps {
  * setting, `color_warp`: every change sends the whole list through `store.update`, a drag one patch per frame and a final one, so a
  * drag is one undo step. The selected pin is the store's `warpPin`, which is window state and not a setting.
  */
-export function ColorWarpCard({ store, photo, rs, pickingColor = false, onPickColor }: ColorWarpCardProps) {
-  const pins = rs.settings.color_warp.pins;
+export function ColorWarpCard({ store, photo, rs, node = MAIN_ID, pickingColor = false, onPickColor }: ColorWarpCardProps) {
+  const pins = gradeOf(rs.settings, node).color_warp.pins;
   const stored = useAppState((s) => s.warpPin);
   const selected = stored !== null && stored < pins.length ? stored : null;
   const scatter = useAppState((s) => s.chromaScatter);
   const [tool, setTool] = useState<WarpTool>("move");
 
   // The photo's colours behind the plane follow the frames the viewport draws, at most five times a second (`store.watchChromaScatter`).
-  useEffect(() => store.watchChromaScatter(), [store, photo.id]);
+  // They are the colours at the input of this node's warp (`at`, `docs/01`); Main's are asked for without a node, as before nodes.
+  const at = node === MAIN_ID ? undefined : node;
+  const active = usePaneActive();
+  const planeReady = useAfterFirstFrame();
+  useEffect(() => (active ? store.watchChromaScatter({ at }) : undefined), [store, photo.id, at, active]);
 
-  const send = (next: ColorWarpPin[], final: boolean): void => void store.update({ color_warp: { pins: next } }, final, rs.photo_id);
+  const send = (next: ColorWarpPin[], final: boolean): void => void store.update(patchOf(node, { grade: { color_warp: { pins: next } } }), final, rs.photo_id);
   const pin = selected === null ? undefined : pins[selected];
   /** Changes a field of the selected pin. */
   const setPin = (patch: Partial<ColorWarpPin>, final: boolean): void => {
@@ -62,7 +70,7 @@ export function ColorWarpCard({ store, photo, rs, pickingColor = false, onPickCo
   };
   const reset = (): void => {
     store.selectWarpPin(null);
-    void store.update({ color_warp: { pins: [] } });
+    void store.update(patchOf(node, { grade: { color_warp: { pins: [] } } }));
   };
 
   return (
@@ -93,14 +101,19 @@ export function ColorWarpCard({ store, photo, rs, pickingColor = false, onPickCo
             Delete pin
           </Button>
         </div>
-        <WarpPlane
-          pins={pins}
-          selected={selected}
-          onSelect={(index) => store.selectWarpPin(index)}
-          onChange={send}
-          tool={tool}
-          scatter={scatter?.points ?? null}
-        />
+        {planeReady ? (
+          <WarpPlane
+            pins={pins}
+            selected={selected}
+            onSelect={(index) => store.selectWarpPin(index)}
+            onChange={send}
+            tool={tool}
+            scatter={scatter?.points ?? null}
+          />
+        ) : (
+          // Same size as the plane, so nothing moves when it arrives one frame later.
+          <div className="ym-warp-plane" aria-hidden="true" />
+        )}
       </div>
       {!pin ? (
         <RowNote>{pins.length >= WARP_MAX_PINS ? WARP_LIMIT_HINT : WARP_HINT}</RowNote>
@@ -111,7 +124,7 @@ export function ColorWarpCard({ store, photo, rs, pickingColor = false, onPickCo
             value={Math.round(pin.range * 100)}
             min={1}
             max={25}
-            defaultValue={4}
+            defaultValue={Math.round(WARP_RANGE_DEFAULT * 100)}
             format={formats.integer}
             onChange={(v, final) => setPin({ range: v / 100 }, final)}
           />
@@ -154,6 +167,15 @@ export function ColorWarpCard({ store, photo, rs, pickingColor = false, onPickCo
                 defaultValue={0}
                 format={formatWarpExposure}
                 onChange={(v, final) => setPin({ exposure_ev: v }, final)}
+              />
+              <Slider
+                label="Saturation"
+                value={pin.saturation * 100}
+                min={-100}
+                max={100}
+                defaultValue={0}
+                format={formats.signedPercent}
+                onChange={(v, final) => setPin({ saturation: v / 100 }, final)}
               />
             </>
           )}

@@ -42,6 +42,7 @@ use ym_gpu::cpu::chain::{Chain, Prepared, RawFrame};
 use ym_gpu::cpu::demosaic::{DEFAULT_METHOD, Method};
 use ym_gpu::cpu::denoise::{self, BilateralParams};
 use ym_gpu::cpu::detail::{self, NoiseReduction};
+use ym_gpu::cpu::frame_denoise::{DEFAULT_DENOISE, DenoiseMethod, FrameDenoise};
 use ym_gpu::cpu::highlights::{self, OffsetAccumulator};
 use ym_gpu::cpu::lens::{LensGeometry, LensSwitches, LensTags};
 use ym_gpu::cpu::normalize::{self, Levels};
@@ -1441,10 +1442,20 @@ impl FullChain {
         sigma: impl SharedSigma,
         cancel: &CancelToken,
     ) -> Result<Self, RenderError> {
-        Self::with_method(frame, plan, params, sigma, DEFAULT_METHOD, cancel)
+        Self::with_method(
+            frame,
+            plan,
+            params,
+            sigma,
+            DEFAULT_METHOD,
+            DEFAULT_DENOISE,
+            cancel,
+        )
     }
 
-    /// [`FullChain::new`] with the R6 demosaic `method`: the renderer passes
+    /// [`FullChain::new`] with the R6 demosaic `method` and the R6 denoise `denoise` (the single-frame
+    /// method from the photo's controls, ISO, noise model and gains, [`FrameDenoise::resolve`]; the
+    /// bilateral for [`DenoiseMethod::Bilateral`]): the renderer passes
     /// [`RenderOptions::demosaic`](super::graph::RenderOptions::demosaic). The chain gets the R4
     /// gains and the noise model of `params`, which the adaptive ratio demosaic reads; it undoes R4
     /// on each tile itself (`Chain::run_tile`), so every method returns the balanced image.
@@ -1460,6 +1471,7 @@ impl FullChain {
         params: &RawParams,
         sigma: impl SharedSigma,
         method: Method,
+        denoise: DenoiseMethod,
         cancel: &CancelToken,
     ) -> Result<Self, RenderError> {
         debug_assert!(!frame.reduced);
@@ -1477,6 +1489,17 @@ impl FullChain {
             highlight_recovery: params.highlight_recovery && plan.has_clipped,
             method,
             denoise: (scale > 0.0).then(BilateralParams::default),
+            // The single-frame denoise of `docs/algorithms/05` in place of the bilateral and R7
+            // (`None` for the bilateral, which is the two stages above).
+            frame_denoise: FrameDenoise::resolve(
+                denoise,
+                &params.noise_reduction,
+                params.iso,
+                // An unusable model is zero noise here too (`usable_noise_model`), as for the
+                // sigma map and the demosaic.
+                &usable_noise_model(&params.noise),
+                params.g0,
+            ),
             noise_reduction: params.noise_reduction,
             iso: params.iso,
             sigma: 0.0,
@@ -2287,7 +2310,7 @@ mod tests {
     // R8 diffraction deconvolution: pixel pitch, gate, method choice
     // -----------------------------------------------------------------------------------------
 
-    use ym_profiles::registry::{ProfileStore, SensorGeometry};
+    use ym_profiles::registry::{BodyMatch, ProfileStore, SensorGeometry};
 
     /// The metadata of a synthetic ARW of `model` with the given f-number and focal lengths.
     fn meta_of(
@@ -2441,6 +2464,7 @@ mod tests {
             ProfileStore::load(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data"))
                 .expect("the data folder");
         let mut with_sensor = 0;
+        let mut without_sensor = Vec::new();
         for b in &store.registry().bodies {
             let meta = meta_of(&b.model, Some(8.0), Some(35.0), Some(35));
             let found = store.detect(&meta.make, &meta.model, meta.model_id);
@@ -2460,13 +2484,46 @@ mod tests {
                 assert_eq!(source, PitchSource::Registry);
                 assert_eq!(pitch, s.pixel_pitch_um);
             } else {
-                assert_eq!(
-                    (b.model.as_str(), source),
-                    ("ILME-FX3", PitchSource::CropFactor)
+                // No published geometry: the crop factor, for the FX3 (Sony gives its stills only
+                // as "12M") and for the `match = default` stand-ins added in registry 1.3.0.
+                assert_eq!(source, PitchSource::CropFactor, "{}", b.model);
+                assert!(
+                    b.model == "ILME-FX3" || b.match_kind == BodyMatch::Default,
+                    "{}: no sensor geometry, and not a stand-in",
+                    b.model
                 );
+                without_sensor.push(b.model.as_str());
             }
         }
+        // The bodies without geometry are the ones `docs/03` names: the FX3 and the eighteen
+        // older, APS-C and compact bodies of registry 1.3.0. A body gaining geometry, or losing
+        // it, is a change to make here on purpose.
+        without_sensor.sort_unstable();
+        let mut expected = [
+            "DSC-RX100",
+            "DSC-RX100M2",
+            "DSC-RX100M7",
+            "DSC-RX10M4",
+            "DSLR-A300",
+            "DSLR-A500",
+            "ILCE-5000",
+            "ILCE-6000",
+            "ILCE-6300",
+            "ILCE-6500",
+            "ILCE-6700",
+            "ILCE-7",
+            "ILCE-7R",
+            "ILCE-7S",
+            "ILME-FX3",
+            "NEX-5N",
+            "NEX-5R",
+            "NEX-7",
+            "ZV-E10",
+        ];
+        expected.sort_unstable();
+        assert_eq!(without_sensor, expected);
         assert_eq!(with_sensor, 27);
+        assert_eq!(with_sensor + without_sensor.len(), 46);
         // A body the registry does not list has no sensor: the crop factor (or nothing).
         let meta = meta_of("ILCE-7M6", Some(8.0), Some(50.0), Some(50));
         let found = store.detect(&meta.make, &meta.model, meta.model_id);
@@ -2663,8 +2720,16 @@ mod tests {
             params.noise = model;
             let plan = RawPlan::new(&raw, &frame, &params).expect("plan");
             let build = |method: Method| {
-                FullChain::with_method(&frame, &plan, &params, &sigma, method, &CancelToken::new())
-                    .expect("chain")
+                FullChain::with_method(
+                    &frame,
+                    &plan,
+                    &params,
+                    &sigma,
+                    method,
+                    DEFAULT_DENOISE,
+                    &CancelToken::new(),
+                )
+                .expect("chain")
             };
             let full = build(Method::AdaptiveRatio);
             let c = &full.chain;
@@ -2759,6 +2824,7 @@ mod tests {
             &params,
             &sigma,
             Method::AdaptiveRatio,
+            DEFAULT_DENOISE,
             &CancelToken::new(),
         );
         assert!(matches!(refused, Err(RenderError::Image(m)) if m.contains("adaptive ratio")));
@@ -2769,6 +2835,7 @@ mod tests {
             &params,
             &sigma,
             Method::Menon,
+            DEFAULT_DENOISE,
             &CancelToken::new(),
         )
         .expect("Menon runs");
@@ -2987,8 +3054,17 @@ mod tests {
         // Odd sizes: the last photosite column and row read the last cell.
         let (w, h) = (161u32, 121u32);
         let (frame, plan, sigma, params) = full_chain_with_every_stage(w, h);
-        let full = FullChain::new(&frame, &plan, &params, &sigma, &CancelToken::new())
-            .expect("full chain");
+        // The bilateral denoise and R7 read the sigma map (method A does not): this is their chain.
+        let full = FullChain::with_method(
+            &frame,
+            &plan,
+            &params,
+            &sigma,
+            DEFAULT_METHOD,
+            DenoiseMethod::Bilateral,
+            &CancelToken::new(),
+        )
+        .expect("full chain");
         // Nothing but the half plane is held, and the chain the device walks has no map.
         assert!(!full.sigma_map_built());
         assert_eq!(full.bytes(), 0);

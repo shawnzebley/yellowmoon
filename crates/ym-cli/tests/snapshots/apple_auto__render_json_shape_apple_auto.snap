@@ -53,7 +53,9 @@ expression: "Value::Object(picked)"
         "instructions": "string",
         "instructions_sha256": "string",
         "model": "string",
-        "os": "string"
+        "os": "string",
+        "prompt": "number",
+        "provider": "string"
       },
       "state": "string"
     },
@@ -71,37 +73,73 @@ expression: "Value::Object(picked)"
       "tint": "null",
       "white": "number"
     },
-    "balance_highlights": [
-      "number"
-    ],
-    "balance_shadows": [
-      "number"
-    ],
-    "black": "number",
-    "contrast": "number",
-    "exposure_ev": "number",
-    "highlights": "number",
-    "kelvin": "number",
+    "input": {
+      "exposure_ev": "number",
+      "kelvin": "number",
+      "noise_reduction": {
+        "color": "number",
+        "detail": "number",
+        "luminance": "number"
+      },
+      "sharpen": {
+        "amount": "number",
+        "radius_px": "number"
+      },
+      "tint": "number"
+    },
     "light_class": "string",
     "light_confidence": "number",
+    "main": {
+      "balance_highlights": [
+        "number"
+      ],
+      "balance_shadows": [
+        "number"
+      ],
+      "black": "number",
+      "contrast": "number",
+      "highlights": "number",
+      "saturation": "number",
+      "shadows": "number"
+    },
     "noise": {
       "a": "number",
       "b": "number"
     },
-    "noise_reduction": {
-      "color": "number",
-      "detail": "number",
-      "luminance": "number"
+    "provider": "string",
+    "source": "string"
+  },
+  "auto_advisor": {
+    "api": "null",
+    "image": "null",
+    "instructions": "string",
+    "instructions_sha256": "string",
+    "model": "string",
+    "os": "string",
+    "plan": "string",
+    "prompt": "number",
+    "provider": "string",
+    "reason": "null",
+    "reproducible": "bool",
+    "scene": "string",
+    "schema": "null",
+    "state": "string",
+    "steps": {
+      "blacks": "null",
+      "contrast": "number",
+      "exposure": "number",
+      "highlight_color": "null",
+      "highlight_color_strength": "null",
+      "highlights": "number",
+      "saturation": "number",
+      "shadow_color": "string",
+      "shadow_color_strength": "number",
+      "shadows": "number",
+      "tint": "null",
+      "white": "number"
     },
-    "saturation": "number",
-    "shadows": "number",
-    "sharpen": {
-      "amount": "number",
-      "radius_px": "number"
-    },
-    "source": "string",
-    "tint": "number",
-    "white_ev": "number"
+    "table": "number",
+    "tool_version": "null"
   },
   "auto_source": "string"
 }

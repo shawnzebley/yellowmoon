@@ -10,8 +10,10 @@ mod console;
 mod develop;
 mod doctor;
 mod exit;
+mod film_cmd;
 mod info;
 mod inputs;
+mod lenses_cmd;
 mod looks_cmd;
 mod render;
 mod report;
@@ -29,18 +31,23 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     init_logging(cli.quiet, cli.verbose);
     runtime::install_interrupt_handler();
-    exit::code(run(cli))
+    let code = run(cli);
+    // A Ctrl-C that cancelled what the command was waiting for is the handler's to finish (130).
+    runtime::wait_for_interrupt_handler();
+    exit::code(code)
 }
 
 /// The crates of this workspace. The log is about what Yellowmoon does: the graphics stack and the
 /// libraries below it have their own opinions about drivers that are not installed, and a missing
 /// EGL driver is not an error on a machine that has Vulkan.
-const OUR_CRATES: [&str; 10] = [
+const OUR_CRATES: [&str; 12] = [
+    "ym_agents",
     "ym_cli",
     "ym_color",
     "ym_core",
     "ym_export",
     "ym_gpu",
+    "ym_lens",
     "ym_looks",
     "ym_ml",
     "ym_noise",
@@ -84,6 +91,8 @@ fn run(cli: Cli) -> u8 {
         Command::Render(args) => render::run(&args, &mut console),
         Command::Info(args) => info::run(&args, &mut console),
         Command::Looks(command) => looks_cmd::run(&command, &mut console),
+        Command::Film(command) => film_cmd::run(&command, &mut console),
+        Command::Lenses(command) => lenses_cmd::run(&command, &mut console),
         Command::Doctor(args) => doctor::run(&args, &mut console),
     }
 }

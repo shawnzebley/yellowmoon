@@ -22,6 +22,7 @@ Channel scale is not identifiable from white-balanced matrices, so each channel 
 4. **Fit:** find the curves whose own optimal matrices equal ARRI's at all 17 CCTs, via a Gauss–Newton step from ARRI's matrix with an analytic Jacobian. This objective is minimised exactly at the true curves when the recipe matches.
    - A first attempt asked instead that ARRI's matrices render the candidate colorimetrically. That objective turned out biased: it prefers "more colorimetric" cameras over the true one, so it was dropped.
 5. **Ensemble:** 24 variants: prior with all 52 / without Sony / without the D-21, 3 or 4 components, two penalty strengths, two illuminant models. The recommended curve is all 52, 4 components, penalty 1, rawtoaces illuminants, which validated best.
+6. **Hue push (the shipped curve; owner decisions 2026-10-25, "Move ALEXA estimate", and 2026-10-26, "4.5°").** Seventeen matrices do not fix the curve to better than the ensemble's spread, and Yellowmoon's pictures of ochre walls, oranges and reds came out more crimson than the camera's own. The shipped curve is the estimate of step 4 with one more residual: the median CIELAB hue shift of the orange, red and ochre training reflectances (Lab hue 25 to 95 degrees and chroma above 12 under the un-pushed estimate: 47 of the 190), rendered at 5200 K through ARRI's matrix at 5200 K, is pulled to +4.5 degrees (toward yellow), weight 10 against the matrix residuals. The push of 2026-10-25 was 1.5 degrees, the largest 0.5 degree step whose matrix RMS stays within the ensemble's maximum (0.0093): 0.5, 1.0, 1.5, 2.0, 3.0 and 4.5 degrees give 0.0070, 0.0081, 0.0092, 0.0112, 0.0166 and 0.0241 (the estimate without it: 0.0067). The owner then chose 4.5 degrees, **past that limit**: the curve agrees with ARRI's matrices less well than any of the 24 variants (0.0241 against 0.0064 to 0.0093), which is recorded as a decision (`training/alexa/push_decisions.py`, `beyond_matrix_limit`), not a result of the fit; the script refuses any other push past the limit. The result is 3.7 % RFSE from the estimate without the push (largest difference 0.14 of peak in R at 580 nm, 0.22 in G at 490 nm, 0.16 in B at 420 nm). `training/alexa/estimate_alexa.py` does it by default; `--push-deg 1.5` gives the estimate of 2026-10-25, `--no-push` the estimate of step 4 and the 24 variants, which stay without the push.
 
 ## Validation
 
@@ -38,48 +39,62 @@ Channel scale is not identifiable from white-balanced matrices, so each channel 
 
 **Failure mode.** The estimator cannot leave the span of its prior. The ARRI D-21 is unlike the stills cameras in the set; its matrices could only be reproduced with an RMS error of 0.10 per coefficient. Its estimate was no better than the average curve: 8.9% RFSE, emulation ΔE00 p95 6.6.
 
-**Where the ALEXA sits.** ARRI's matrices are reproduced to 0.0067 RMS per coefficient.
-- That is the 94th percentile of the held-out cameras (median 0.0021), and 15× better than the D-21 case.
+**Where the ALEXA sits.** ARRI's matrices are reproduced to 0.0067 RMS per coefficient by the estimate, to 0.0092 by the curve with the push of 1.5 degrees and to 0.0241 by the shipped curve (4.5 degrees).
+- That is the 94th percentile of the held-out cameras for the first two (median 0.0021, p90 0.0051), and 11× to 15× better than the D-21 case; 0.0241 is their 96th percentile (only the D-21 and the Canon EOS R10 are above it) and 4× better than the D-21 case.
 - The held-out cameras with similar residuals were estimated at **3.2–5.3% RFSE**, so that is the realistic accuracy to expect here, not the 2.2% median.
 - Part of the extra residual is probably ARRI's own matrix recipe (training set, rendering intent), which isn't public.
 
-**Ensemble spread.** All 24 variants lie within median 1.7% and max 2.6% RFSE of the recommended curve. This includes the prior with all Sony bodies removed, so the curve's closeness to Sony is not an artefact of the Sony-heavy prior.
+**Ensemble spread.** All 24 variants lie within median 1.7% and max 2.6% RFSE of the recommended curve (the estimate without the push). This includes the prior with all Sony bodies removed, so the curve's closeness to Sony is not an artefact of the Sony-heavy prior. The shipped curve is 3.7% RFSE from the recommended curve, outside that spread, and its matrix RMS (0.0241) is outside the ensemble's range (0.0064 to 0.0093); it leaves the band of the 24 variants at 146 of 243 samples, by 0.14 of peak at most (B at 415 nm; G at 490 nm 0.11). The push of 1.5 degrees (2.2% RFSE, matrix RMS 0.0092) was inside both, leaving the band at 68 samples by 0.019 at most.
+
+**The leave-one-out numbers belong to the estimate without the push.** The push moves the curve away from the one that agrees best with the matrices, so a held-out camera's curve would be moved away from its measured one by the same recipe: the validation has no counterpart for the pushed estimator, and the numbers above (and `check_loo`, run by `.github/workflows/alexa-curve.yml`) are those of the estimator the push starts from. What the push costs on the 52 known cameras is measured separately (next paragraph).
+
+**What the push costs on cameras whose curves are known** (`python3 -m training.alexa.loo_push`, 2026-10-25 for the push of 1.5 degrees and 2026-10-26 for 4.5 degrees with `--push-deg 4.5`; not a gate). The leave-one-out recipe run with and without the push, the push's reflectances taken from each held-out camera's own un-pushed estimate:
+
+| 52 held-out cameras | RFSE median / p90 | Emulation ΔE00 median | ΔE00 p95 (median over cameras) | Matrix RMS (median) |
+|---|---|---|---|---|
+| Estimate without the push | 2.17 % / 3.63 % | 0.233 | 0.63 | 0.0021 |
+| With the push (1.5 degrees) | 2.44 % / 3.96 % | 0.519 | 1.38 | 0.0091 |
+| With the push (4.5 degrees, the shipped amount; 2026-10-26) | 3.31 % / 5.07 % | 1.293 | 3.55 | 0.0256 |
+
+The push of 4.5 degrees brings the RFSE down for only 8 of the 52 cameras (median change +1.24 points, largest +3.30) and its emulation error, 1.293 in the median, is four times the gate's 0.3. The push of 1.5 degrees brought the RFSE down for 19 of the 52 cameras and up for 33 (median change +0.21 points, largest +1.66), and the emulation error rose for 49 of the 52 (median 0.519 against the gate's 0.3: the pushed recipe would fail the leave-one-out gate, which is why the gate scores the estimator without it). The same run says how large 1.5 degrees is next to the estimator's own hue error: the measured camera's warm-colour hue differs from its un-pushed estimate by a median of -0.04 degrees (10th to 90th percentile -0.17 to +0.25), within 0.5 degrees for 49 of the 52 cameras. The largest are the ARRI D-21 (−2.93, a camera whose matrices the prior cannot reproduce, RMS 0.10) and the Canon EOS R10 (−2.73, the other poor fit, RMS 0.08), both of the sign opposite to the push; the largest in the push's direction is the Canon PowerShot S90 (+0.98). For cameras with known curves the estimator is already right in hue to a fraction of a degree, so the push is not the correction of a bias that the validation can see: it is a choice about the picture, made inside what ARRI's matrices allow, and the ALEXA is the camera whose curves are not known.
 
 **D-21 check (confirms the earlier report).** ARRI's matrices were applied to each camera on the 99 CES samples under the 9 lights, and the result compared with true scene colour (mean ΔE00):
 
-| Camera | Mean ΔE00 | Rank of 54 |
+| Camera | Mean ΔE00 | Rank of 55 |
 |---|---|---|
-| Estimate | 1.45 | 1 (partly by construction) |
+| Estimate without the push | 1.45 | 1 (partly by construction) |
 | Sony A7R IV | 1.77 | 7 |
 | Average of 52 curves | 1.95 | 15 |
-| ARRI D-21 | 3.95 | 53 |
+| **Shipped estimate, push of 4.5 degrees (2026-10-26)** | **2.02** | **16** |
+| ARRI D-21 | 3.95 | 54 |
 
 ## What the curve says
 
-- **Peaks:** R 590, G 530, B 460 nm, the same as the A7R IV. The two curves are 4.4% RFSE apart, while each is about 9% from the D-21.
-- **Broader red shoulder than the A7R IV** from 610 to 660 nm: 0.44 vs 0.26 of peak at 650 nm. That fits ARRI's statements that the ALEXA keeps some far red for skin.
+- **Peaks:** R 590, G 520, B 460 nm (G 530 before the push of 4.5 degrees; the A7R IV has 590, 530, 460). The two curves are 4.1% RFSE apart, the estimate and the D-21 10.8% (the A7R IV and the D-21 9.4%).
+- **Broader red shoulder than the A7R IV** from 610 to 660 nm: 0.39 vs 0.26 of peak at 650 nm (0.44 before the push). That fits ARRI's statements that the ALEXA keeps some far red for skin.
+- **The push** (4.5 degrees) lowers R at 560 to 585 nm (0.46 of peak at 580 nm, 0.60 before), lowers it by 0.02 to 0.05 at 615 to 660 nm, raises G (by 0.22 at 490 nm and 0.12 at 580 to 590 nm; G's peak moves from 530 to 520 nm) and B at 405 to 425 nm (by 0.16 at 415 to 420 nm), and moves the red half-power point on the long side to 638 nm (643.5 before). R at 660, 670 and 680 nm: 0.29, 0.11 and 0.11 (0.31, 0.11 and 0.02 before: the matrices barely constrain the tail, and the push raises it by 0.09 at 670 to 680 nm).
 - **Beyond about 660 nm the curve is mostly the prior.** Human colour matching is nearly blind there, so the matrices barely constrain it. The estimate falls to near zero by 690 nm, but ALEXA's hot mirror is reported near 700 nm. Treat 660–720 nm as unknown (the ensemble spans 0–0.08 at 680 nm).
 
 ## First result for the sensor map: A7R IV → ALEXA estimate
 
-Fitted on the 190 training reflectances, scored on the 99 CES. Both images are rendered through ARRI's matrix at each light's CCT. Values are ΔE00 median / p95.
+(Numbers for the shipped curve, with the hue push of 4.5 degrees; the first version of this table, for the estimate without it, is in the history of this file and in `testdata/out/alexa/estimate_nopush/diagnostics.json` after `estimate_alexa --no-push`.) Fitted on the 190 training reflectances, scored on the 99 CES. Both images are rendered through ARRI's matrix at each light's CCT. Values are ΔE00 median / p95.
 
 | Light | No mapping | One 3×3 (5500 K) | 3×3 per light | Root-poly per light |
 |---|---|---|---|---|
-| Tungsten (A) | 1.39 / 2.88 | 1.19 / 2.62 | 0.36 / 0.85 | 0.33 / 0.82 |
-| Studio tungsten (ISO 7589) | 1.38 / 2.71 | 1.01 / 2.25 | 0.36 / 0.86 | 0.33 / 0.82 |
-| D55 | 1.43 / 2.93 | 0.42 / 1.06 | 0.42 / 1.06 | 0.31 / 0.93 |
-| D65 | 1.59 / 3.26 | 0.49 / 1.15 | 0.45 / 1.09 | 0.32 / 0.98 |
-| Fluorescent FL2 | 1.35 / 2.63 | 0.65 / 1.05 | 0.28 / 0.91 | 0.21 / 0.88 |
-| Tri-band fluorescent FL11 | 1.30 / 2.23 | 0.67 / 1.03 | 0.16 / 0.53 | 0.12 / 0.49 |
-| White LED (LED-B3) | 1.37 / 2.59 | 0.64 / 1.16 | 0.24 / 0.93 | 0.23 / 0.82 |
-| Hybrid LED (LED-BH1) | 1.43 / 2.72 | 1.16 / 2.77 | 0.20 / 0.68 | 0.20 / 0.64 |
-| RGB LED (LED-RGB1) | 1.39 / 3.33 | 1.13 / 2.73 | 0.25 / 0.80 | 0.22 / 0.72 |
+| Tungsten (A) | 1.14 / 2.79 | 1.10 / 2.16 | 0.65 / 1.88 | 0.53 / 1.62 |
+| Studio tungsten (ISO 7589) | 1.21 / 2.85 | 0.99 / 2.02 | 0.62 / 1.90 | 0.51 / 1.62 |
+| D55 | 1.72 / 3.85 | 0.67 / 1.82 | 0.67 / 1.82 | 0.48 / 1.47 |
+| D65 | 1.85 / 4.03 | 0.77 / 1.88 | 0.67 / 1.80 | 0.50 / 1.48 |
+| Fluorescent FL2 | 1.63 / 3.39 | 0.53 / 1.22 | 0.45 / 1.11 | 0.36 / 0.98 |
+| Tri-band fluorescent FL11 | 1.12 / 2.74 | 0.80 / 1.70 | 0.40 / 1.06 | 0.29 / 1.11 |
+| White LED (LED-B3) | 1.67 / 3.55 | 0.58 / 1.28 | 0.46 / 1.45 | 0.37 / 1.30 |
+| Hybrid LED (LED-BH1) | 1.16 / 2.69 | 0.89 / 1.63 | 0.34 / 0.95 | 0.28 / 0.92 |
+| RGB LED (LED-RGB1) | 0.73 / 1.76 | 0.90 / 1.92 | 0.39 / 1.03 | 0.28 / 0.98 |
 
 **Readings:**
-- **The sensor difference itself is moderate:** about 1.4 ΔE00 median and up to about 3.3 at p95 with no mapping.
-- **Conditioning on the light is the big win.** One global 3×3 works only near the light it was fitted at; tungsten stays at 1.19 / 2.62. A 3×3 chosen per light brings every case to 0.16–0.45 median and at most 1.09 at p95.
-- **Non-linearity adds little.** Root-polynomial per light gains another 0.00–0.13 median. A small model that predicts per-light coefficients from the illuminant estimate is enough; a large per-pixel network isn't justified by this data.
+- **The sensor difference itself is moderate:** about 0.7 to 1.9 ΔE00 median and up to about 4.0 at p95 with no mapping (1.0 to 1.7 and 3.6 with the push of 1.5 degrees, 1.3 to 1.6 and 3.3 before the pushes).
+- **Conditioning on the light is the big win.** One global 3×3 works only near the light it was fitted at; tungsten stays at 1.10 / 2.16. A 3×3 chosen per light brings every case to 0.34-0.67 median and at most 1.90 at p95 (0.27-0.51 and 1.33 at 1.5 degrees; 0.16-0.45 and 1.09 before the pushes: the pushed curve is harder for a Sony curve to reach with a 3×3, which is why the sensor-map gate has lights over, `docs/03`).
+- **Non-linearity adds little.** Root-polynomial per light gains another 0.06–0.19 median. A small model that predicts per-light coefficients from the illuminant estimate is enough; a large per-pixel network isn't justified by this data.
 - **Caveat:** the estimate is pulled toward the prior, so real Sony–ALEXA differences are probably somewhat larger than shown. Reflectance sets also miss narrow-band object colours.
 
 ## Caveats
@@ -100,7 +115,9 @@ Fitted on the 190 training reflectances, scored on the 99 CES. Both images are r
 ```bash
 tools/fetch/spectral.sh                       # the inputs, into testdata/ (pinned commits, SHA-256 checked)
 python3 -m training.alexa.validate_loo        # leave-one-camera-out, then: python3 -m training.alexa.check_loo
-python3 -m training.alexa.estimate_alexa      # the curve and its ensemble, then compare_estimate against data/alexa/
+python3 -m training.alexa.estimate_alexa      # the shipped curve (estimate + hue push of 4.5 degrees) and the ensemble, then compare_estimate against data/alexa/
+python3 -m training.alexa.estimate_alexa --push-deg 1.5   # the estimate of 2026-10-25 (into testdata/out/alexa/estimate_push_1.5/)
+python3 -m training.alexa.estimate_alexa --no-push   # the estimate of 2026-10-11 without the push (into testdata/out/alexa/estimate_nopush/)
 python3 -m training.sensor_map.evaluate       # reproduces out/sony_profiles.csv
 ```
 

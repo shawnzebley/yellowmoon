@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { openPhotos, openTab, renderApp, tools } from "../test/harness";
 import type { MockOptions } from "../api.mock";
 import type { Harness } from "../test/harness";
+import { inputPatch, mainGradePatch } from "../state/settingsGraph";
 
 /** A manual contrast or saturation (`docs/19` section 5: Auto or a value). */
 const manual = (value: number) => ({ kind: "manual", value }) as const;
@@ -22,7 +23,7 @@ async function setup(options: MockOptions = MOCKUP): Promise<Harness> {
   return h;
 }
 
-const lookOf = (): string | undefined => h?.store.currentSettings()?.values.look;
+const lookOf = (): string | undefined => h?.store.currentSettings()?.values.output.look;
 
 describe("the header", () => {
   it("shows the folder, its date and count, and the actions", async () => {
@@ -31,8 +32,23 @@ describe("the header", () => {
     expect(screen.getByText("2026-10-04 · 12 photos")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Before" })).toHaveAttribute("aria-pressed", "false");
     expect(screen.getByRole("button", { name: "Crop" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Pick white" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /^Fit/ })).toHaveAttribute("aria-haspopup", "menu");
+    // Pick white is not here: it is a row of the Colour tab's White balance card (`docs/11` §Pick white).
+    expect(within(screen.getByRole("navigation", { name: "Actions" })).queryByRole("button", { name: "Pick white" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Pick white" })).toBeNull();
+  });
+
+  it("gives Before, Crop and Nodes an icon before the label, and keeps each name", async () => {
+    await setup();
+    for (const name of ["Before", "Crop", "Nodes"]) {
+      const button = screen.getByRole("button", { name });
+      const svg = button.querySelector("svg");
+      expect(svg, name).not.toBeNull();
+      expect(svg).toHaveAttribute("aria-hidden", "true");
+      // The icon comes first, then the label.
+      expect(button.firstElementChild).toBe(svg);
+      expect(button.querySelector(".ym-header-label")?.textContent).toBe(name);
+    }
   });
 
   it("shows the render status from render_stats", async () => {
@@ -189,22 +205,23 @@ describe("Before, zoom and the viewport", () => {
 });
 
 describe("the tabs", () => {
-  it("has six tabs in order, the Look tab first", async () => {
+  it("has seven tabs in order, the Look tab first", async () => {
     await setup();
     const tabs = screen.getAllByRole("tab");
-    expect(tabs.map((t) => t.textContent)).toEqual(["Look", "Light", "Colour", "Detail", "Curve", "RAW"]);
+    expect(tabs.map((t) => t.textContent)).toEqual(["Look", "Lens", "Light", "Colour", "Detail", "Curve", "RAW"]);
     expect(tabs[0]).toHaveAttribute("aria-selected", "true");
     expect(within(tools()).getByRole("heading", { level: 2, name: "Look" })).toBeInTheDocument();
   });
 
-  it("⌘1 to ⌘6 switch tabs and each shows its title block and cards", async () => {
+  it("⌘1 to ⌘7 switch tabs and each shows its title block and cards", async () => {
     await setup();
     const expected: Array<[string, string, string[]]> = [
-      ["2", "Light", ["Exposure", "High dynamic range"]],
-      ["3", "Colour", ["White balance", "Colour balance"]],
-      ["4", "Detail", ["Sharpening", "Noise reduction"]],
-      ["5", "Curve", ["Curve"]],
-      ["6", "RAW", ["Camera", "Decode", "Range"]],
+      ["2", "Lens", ["Lens", "Amounts"]],
+      ["3", "Light", ["Exposure", "High dynamic range"]],
+      ["4", "Colour", ["White balance", "Colour balance"]],
+      ["5", "Detail", ["Sharpening", "Noise reduction"]],
+      ["6", "Curve", ["Curve"]],
+      ["7", "RAW", ["Camera", "Decode", "Range"]],
       ["1", "Look", ["Automatic", "Look"]],
     ];
     for (const [key, title, cards] of expected) {
@@ -233,7 +250,7 @@ describe("the Look tab", () => {
 
   it("flips a row to EDITED when its value is changed, and Re-run brings AUTO back", async () => {
     await setup();
-    await h!.store.update({ exposure: { kind: "manual", ev: 1.5 } });
+    await h!.store.update(inputPatch({ exposure: { kind: "manual", ev: 1.5 } }));
     const card = within(screen.getByRole("region", { name: "Automatic" }));
     expect(await card.findByRole("button", { name: "Exposure +1.50 EV, Edited. Open Light" })).toBeInTheDocument();
     await h!.user.click(card.getByRole("button", { name: "Re-run" }));
@@ -370,7 +387,7 @@ describe("the Look tab", () => {
     await waitFor(() => expect(lookOf()).toBe("arri:3000:night-blue"));
     await h!.user.click(within(screen.getByRole("region", { name: "Look" })).getByRole("button", { name: "Reset" }));
     await waitFor(() => expect(lookOf()).toBe("builtin:neutral"));
-    expect(h!.store.currentSettings()?.values.look_intensity).toBe(100);
+    expect(h!.store.currentSettings()?.values.output.look_intensity).toBe(100);
   });
 
   it("shows a look whose file is missing as disabled, with the reason, and won't pick it", async () => {
@@ -415,7 +432,7 @@ describe("undo, redo and closing", () => {
   it("⌘Z and ⇧⌘Z undo and redo a change for this photo", async () => {
     await setup();
     await openTab(h!, "Light");
-    await h!.store.update({ contrast: manual(30) });
+    await h!.store.update(mainGradePatch({ contrast: manual(30) }));
     await waitFor(() => expect(screen.getByRole("textbox", { name: "Contrast value" })).toHaveValue("+30"));
     await h!.user.keyboard("{Meta>}z{/Meta}");
     await waitFor(() => expect(screen.getByRole("textbox", { name: "Contrast value" })).toHaveValue("0"));
