@@ -28,6 +28,12 @@ Validation here (Linux, 2 cores): `cargo check --workspace --all-targets` (all b
 which needs GTK on Linux), the `ym-color` look tests, 2,993 frontend tests (9 skipped) and the
 production build pass. The Windows installer and render checks run in `windows.yml`.
 
+CI fixes after the merge: `.gitattributes` keeps every SHA256SUMS folder (`data/**`,
+`crates/ym-film/tests/oracle/**`) free of line-ending conversion, since Windows checked the new
+Film profiles out with CRLF and they missed their hashes. The owner-photo pin in `ci.yml` moves
+from `52a19c6` to `d49b00c` (readme-photos), which has the four photos upstream added to
+`owner-photos.sha256`; all ten files match their lines.
+
 ## Windows fork TLS dependency repair (2026-10-22)
 
 The October 21 and 22 scheduled CI runs failed only the `deny` job:

@@ -508,7 +508,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: ngriaznov/yellowmoon
-          ref: 52a19c660c151b8a78d0bdd86e1bc597ff625c8b # readme-photos; pinned with owner-photos.sha256
+          ref: d49b00cfbd46d587ff07f7fd8a54687ab653af6f # readme-photos; pinned with owner-photos.sha256
           lfs: true
           path: testdata/readme-photos/src
           persist-credentials: false
