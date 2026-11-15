@@ -228,8 +228,12 @@ let tidNext = 1;
 function startThread(tid, arg) {
   const w = new Worker(new URL('./thread.js', import.meta.url), { type: 'module' });
   const ctl = new Int32Array(new SharedArrayBuffer(16));
+  const own = run;
   run.workers.add(w);
   w.onmessage = (ev) => {
+    // A message from a thread of a run that has ended (cancelled, or a late one in flight) must
+    // not touch the run that replaced it.
+    if (run !== own) { w.terminate(); return; }
     const m = ev.data;
     if (m.t === 'sys') {
       let r;
@@ -261,6 +265,7 @@ function finish(code) {
 
 let limits = null;
 let run_maxPages = 0;
+let starting = false;
 onmessage = async (ev) => {
   const m = ev.data;
   if (m.t === 'init') {
@@ -276,19 +281,22 @@ onmessage = async (ev) => {
     const data = n && !n.dir ? n.data.slice(0, n.size) : null;
     postMessage({ t: 'file', id: m.id, data, names: n && n.dir ? children(norm(m.path)) : null }, data ? [data.buffer] : []);
   } else if (m.t === 'run') {
-    if (run || !limits) { postMessage({ t: 'exit', id: m.id, code: -1, ms: 0, busy: !!run }); return; }
-    // Reuse one memory across runs. Each new WebAssembly.Memory reserves its full maximum, and iOS
-    // frees the old reservations late, so a fresh one per run soon fails with "not enough memory"
-    // even with nothing else open. Zeroing it resets the module's statics, its init flag and heap.
-    if (memory) new Uint8Array(memory.buffer).fill(0);
-    else {
-      // iOS may refuse to reserve the full 4 GiB; try smaller maximums down to 256 MiB, which
-      // still fits a draft preview. Exports that need more fail inside ym with its own message.
-      for (const max of [limits.max, 49152, 32768, 24576, 16384, 12288, 8192, 6144, 4096]) {
-        if (max > limits.max || max < limits.min) continue;
+    if (run || starting || !limits) { postMessage({ t: 'exit', id: m.id, code: -1, ms: 0, busy: !!run }); return; }
+    // A fresh memory each run. It can't be reused: wasm memory never shrinks, and the allocator in
+    // `ym` takes the current size as the start of its heap, so a reused memory fills up run by run.
+    // Each new memory reserves its whole maximum, so a run asks only for what it needs (`maxPages`:
+    // previews need far less than a full-size export), and if iOS has not yet given back the last
+    // run's reservation, waits a moment and tries again.
+    memory = null; starting = true;
+    const top = Math.min(limits.max, m.maxPages || limits.max);
+    for (let attempt = 0; attempt < 4 && !memory; attempt++) {
+      if (attempt) await new Promise((r) => setTimeout(r, 250 * attempt));
+      for (const max of [top, 49152, 32768, 24576, 16384, 12288, 8192, 6144, 4096]) {
+        if (max > top || max < limits.min) continue;
         try { memory = new WebAssembly.Memory({ initial: limits.min, maximum: max, shared: true }); run_maxPages = max; break; } catch { /* try smaller */ }
       }
     }
+    starting = false;
     if (!memory) { postMessage({ t: 'exit', id: m.id, code: -3, ms: 0 }); return; }
     run = { id: m.id, args: m.args, env: m.env, workers: new Set(), start: performance.now(), done: false };
     tidNext = 1; fdNext = 4;

@@ -21,6 +21,12 @@ uploaded: the raw file, the colour data and the rendering all stay on the phone.
 - Previews run `ym render` with `YELLOWMOON_DRAFT=4`: `ym_raw::draft` averages each 4x4 block of
   same-colour photosites, so the pipeline runs on a sixteenth of the pixels. Exports run the same
   command at full size, so they match the desktop app's exports for the same options.
+- Each run gets a fresh wasm memory (the allocator can't start over in a used one), sized to the
+  job: previews may grow to 768 MiB (a 33 MP draft peaks near 260 MiB), exports to the most the
+  phone will give (a 33 MP full-size export peaks near 1.3 GiB). Asking for 4 GiB on every preview
+  is what made iOS refuse after a few changes.
+- A preview renders twice: a quick pass without noise reduction and output sharpening (most of the
+  time), then the full one. The preview is sized to the area it is shown in.
 - `sw.js` adds the cross-origin isolation headers threads need (GitHub Pages cannot send them) and
   caches the app for offline use.
 
@@ -29,6 +35,8 @@ uploaded: the raw file, the colour data and the rendering all stay on the phone.
 - CPU only: no Metal or WebGPU path yet. A full-size export takes about a minute.
 - The neural demosaic and the Object, Depth and Apple Auto features are not in this build.
 - No looks import yet: the two built-in looks only.
+- No colour warp, curves, manual crop or film nodes on the phone: the controls are the `ym render`
+  options (auto-crop included), not the `--settings` graph.
 
 ## Develop
 

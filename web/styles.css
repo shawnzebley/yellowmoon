@@ -32,6 +32,8 @@ h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .08em; color: v
 .chips { display: flex; flex-wrap: wrap; gap: 6px; padding: 4px 0 8px; }
 .chips button { background: transparent; color: var(--text); border: 1px solid var(--line); border-radius: 999px; padding: 6px 12px; font: inherit; font-size: 14px; }
 .chips button[aria-checked=true] { background: var(--accent); color: #1a1405; border-color: var(--accent); font-weight: 600; }
+.toggle { display: flex; justify-content: space-between; align-items: center; padding: 10px 0; }
+.toggle input { width: 22px; height: 22px; accent-color: var(--accent); }
 .foot { color: var(--muted); font-size: 12px; text-align: center; margin: 16px 0 4px; }
 nav { display: flex; gap: 10px; padding: 10px 16px calc(var(--safe-b) + 10px); border-top: 1px solid var(--line); background: var(--bg); }
 .btn { flex: 1; text-align: center; background: var(--panel); color: var(--text); border: 1px solid var(--line); border-radius: 12px; padding: 12px 0; font: inherit; font-weight: 600; }
