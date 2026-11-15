@@ -7,6 +7,7 @@ run is the CI job ``licences`` (``python3 tools/licences/generate.py``).
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import sys
@@ -42,6 +43,10 @@ BSD_NOTICE = (
     "THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS \"AS IS\"\n"
     "Copyright (c) 2026 Tim Mikeladze\n"
     "The above copyright notice and this permission notice shall be included in all\n"
+    "Copyright (c) Meta Platforms, Inc. and affiliates. https://github.com/facebookresearch/sam2\n"
+    "Depth Anything V2-Small by Lihe Yang et al. https://github.com/DepthAnything/Depth-Anything-V2\n"
+    "spektrafilm by Andrea Volpato https://github.com/andreavolpato/spektrafilm data/film/spektrafilm/LICENSE\n"
+    "International Commission on Illumination (CIE) data/film/cie/LICENSE and a table computed from it data/film/upsampling/LICENSE\n"
 )
 OFL = "Copyright 2022 The Figtree Project Authors\n\nSIL OPEN FONT LICENSE Version 1.1 - 26 February 2007\n"
 
@@ -244,13 +249,82 @@ class Config(unittest.TestCase):
         self.assertEqual(sorted(about["targets"]), ["aarch64-apple-darwin", "x86_64-apple-darwin"])
 
 
+SAM2_WEIGHTS = "sam2.1_hiera_small.f16.safetensors"
+DEPTH_WEIGHTS = "depth_anything_v2_vits.f16.safetensors"
+#: A depth folder whose weights are fetched and match their pin (for the tests that are about SAM's weights).
+DEPTH_READY = {"depth_sums": f"{hashlib.sha256(b'depth').hexdigest()}  {DEPTH_WEIGHTS}\n", "depth_weights": b"depth"}
+
+
 class Bundle(unittest.TestCase):
-    def tree(self, root: Path, *, resources: dict | None = None, notice: str | None = None, ofl: bool = True) -> None:
+    def tree(
+        self,
+        root: Path,
+        *,
+        resources: dict | None = None,
+        notice: str | None = None,
+        ofl: bool = True,
+        sums: str | None = None,
+        weights: bytes | None = None,
+        card: str | None = "Apache-2.0, https://github.com/facebookresearch/sam2\n",
+        ignore: str | None = "*.safetensors\n",
+        film: bool = True,
+        depth_sums: str | None = None,
+        depth_weights: bytes | None = None,
+        depth_card: str | None = "Apache-2.0, https://github.com/DepthAnything/Depth-Anything-V2\n",
+        depth_ignore: str | None = "*.safetensors\n",
+    ) -> None:
         (root / "src-tauri").mkdir(parents=True, exist_ok=True)
-        resources = {"../NOTICE": "NOTICE", "../LICENSE": "LICENSE", "../THIRD-PARTY.md": "THIRD-PARTY.md"} if resources is None else resources
+        resources = (
+            {
+                "../NOTICE": "NOTICE",
+                "../LICENSE": "LICENSE",
+                "../THIRD-PARTY.md": "THIRD-PARTY.md",
+                "../data/models": "data/models",
+                "../data/film": "data/film",
+            }
+            if resources is None
+            else resources
+        )
         (root / "src-tauri" / "tauri.conf.json").write_text(json.dumps({"bundle": {"resources": resources}}))
         (root / "NOTICE").write_text(notice if notice is not None else BSD_NOTICE)
         (root / "LICENSE").write_text("Apache License")
+        folder = root / "data" / "models" / "sam2"
+        folder.mkdir(parents=True, exist_ok=True)
+        if card is not None:
+            (folder / "MODEL_CARD.md").write_text(card)
+        if ignore is not None:
+            (folder / ".gitignore").write_text(ignore)
+        if sums is None:
+            sums = f"TBD-after-first-run  {SAM2_WEIGHTS}\n"
+        if sums:
+            (folder / "SHA256SUMS").write_text(sums)
+        if weights is not None:
+            (folder / SAM2_WEIGHTS).write_bytes(weights)
+        depth = root / "data" / "models" / "depth"
+        depth.mkdir(parents=True, exist_ok=True)
+        if depth_card is not None:
+            (depth / "MODEL_CARD.md").write_text(depth_card)
+        if depth_ignore is not None:
+            (depth / ".gitignore").write_text(depth_ignore)
+        if depth_sums is None:
+            depth_sums = f"TBD-after-first-run  {DEPTH_WEIGHTS}\n"
+        if depth_sums:
+            (depth / "SHA256SUMS").write_text(depth_sums)
+        if depth_weights is not None:
+            (depth / DEPTH_WEIGHTS).write_bytes(depth_weights)
+        if film:
+            self.film_tree(root)
+
+    def film_tree(self, root: Path) -> None:
+        """The three film data folders as the update scripts and the generator leave them: LICENSE, ATTRIBUTION.md, data files, SHA256SUMS."""
+        for folder, data in (("spektrafilm", "profiles/kodak_portra_400.json"), ("cie", "CIE_illum_D55.csv"), ("upsampling", "coeffs.f32"), ("oracle", "stage2.json")):
+            base = root / ("crates/ym-film/tests/oracle" if folder == "oracle" else f"data/film/{folder}")
+            (base / data).parent.mkdir(parents=True, exist_ok=True)
+            (base / data).write_text("data " + data)
+            (base / "LICENSE").write_text("Attribution-ShareAlike 4.0 International")
+            (base / "ATTRIBUTION.md").write_text("by someone")
+            lines = [f"{hashlib.sha256((base / name).read_bytes()).hexdigest()}  {name}\n" for name in (data, "LICENSE")]
+            (base / "SHA256SUMS").write_text("".join(sorted(lines, key=lambda line: line.split()[1])))
 
     def test_a_complete_tree_passes(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -259,7 +333,7 @@ class Bundle(unittest.TestCase):
 
     def test_third_party_must_be_in_the_bundle(self):
         with tempfile.TemporaryDirectory() as tmp:
-            self.tree(Path(tmp), resources={"../NOTICE": "NOTICE", "../LICENSE": "LICENSE"})
+            self.tree(Path(tmp), resources={"../NOTICE": "NOTICE", "../LICENSE": "LICENSE", "../data/models": "data/models"})
             problems = check_bundle.problems(Path(tmp))
         self.assertTrue(any("THIRD-PARTY.md" in p for p in problems), problems)
 
@@ -274,6 +348,203 @@ class Bundle(unittest.TestCase):
             self.tree(Path(tmp), notice=BSD_NOTICE.replace("Tim Mikeladze", "Someone"))
             problems = check_bundle.problems(Path(tmp))
         self.assertTrue(any("Tim Mikeladze" in p for p in problems), problems)
+
+    def test_meta_s_notice_and_the_link_must_be_in_the_notice(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.tree(Path(tmp), notice=BSD_NOTICE.replace("Meta Platforms, Inc. and affiliates", "Someone"))
+            problems = check_bundle.problems(Path(tmp))
+            self.assertTrue(any("Meta Platforms" in p for p in problems), problems)
+            self.tree(Path(tmp), notice=BSD_NOTICE.replace("github.com/facebookresearch/sam2", "example.org"))
+            problems = check_bundle.problems(Path(tmp))
+            self.assertTrue(any("facebookresearch" in p for p in problems), problems)
+
+    def test_the_models_folder_must_be_a_bundle_resource(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.tree(Path(tmp), resources={"../NOTICE": "NOTICE", "../LICENSE": "LICENSE", "../THIRD-PARTY.md": "THIRD-PARTY.md"})
+            problems = check_bundle.problems(Path(tmp))
+        self.assertTrue(any("data/models" in p and "SAM 2.1" in p for p in problems), problems)
+
+    def test_the_model_card_the_ignore_file_and_the_sums_line_must_be_there(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.tree(Path(tmp), card=None, ignore=None, sums="")
+            problems = check_bundle.problems(Path(tmp))
+        self.assertTrue(any("MODEL_CARD.md" in p for p in problems), problems)
+        self.assertTrue(any(".gitignore" in p for p in problems), problems)
+        self.assertTrue(any("SHA256SUMS has no line" in p for p in problems), problems)
+
+    def test_the_model_card_must_name_the_licence_and_the_source(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.tree(Path(tmp), card="A model.\n")
+            problems = check_bundle.problems(Path(tmp))
+        self.assertTrue(any("Apache-2.0" in p for p in problems), problems)
+        self.assertTrue(any("facebookresearch" in p for p in problems), problems)
+
+    def test_the_weights_must_not_be_committable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.tree(Path(tmp), ignore="*.part\n")
+            problems = check_bundle.problems(Path(tmp))
+        self.assertTrue(any("safetensors" in p for p in problems), problems)
+
+    def test_a_placeholder_pin_is_a_warning_without_the_flag_and_an_error_with_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.tree(Path(tmp))
+            self.assertEqual(check_bundle.problems(Path(tmp)), [])
+            self.assertTrue(any("TBD-after-first-run" in w for w in check_bundle.warnings(Path(tmp))))
+            problems = check_bundle.problems(Path(tmp), require_weights=True)
+        self.assertTrue(any("not a SHA-256" in p for p in problems), problems)
+
+    def test_the_fetched_weights_must_be_there_and_match_their_pin(self):
+        data = b"weights"
+        pin = hashlib.sha256(data).hexdigest()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.tree(root, sums=f"{pin}  {SAM2_WEIGHTS}\n", **DEPTH_READY)
+            self.assertEqual(check_bundle.warnings(root), [])
+            missing = check_bundle.problems(root, require_weights=True)
+            self.assertTrue(any("is missing" in p and "tools/fetch/sam2.sh" in p for p in missing), missing)
+            self.tree(root, sums=f"{pin}  {SAM2_WEIGHTS}\n", weights=b"damaged", **DEPTH_READY)
+            wrong = check_bundle.problems(root, require_weights=True)
+            self.assertTrue(any("does not have the SHA-256" in p for p in wrong), wrong)
+            self.tree(root, sums=f"{pin}  {SAM2_WEIGHTS}\n", weights=data, **DEPTH_READY)
+            self.assertEqual(check_bundle.problems(root, require_weights=True), [])
+            self.assertEqual(check_bundle.problems(root), [])
+
+    def test_the_command_line_takes_the_flag_and_a_folder(self):
+        data = b"weights"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.tree(root, sums=f"{hashlib.sha256(data).hexdigest()}  {SAM2_WEIGHTS}\n", weights=data, **DEPTH_READY)
+            self.assertEqual(check_bundle.main([str(root)]), 0)
+            self.assertEqual(check_bundle.main(["--require-weights", str(root)]), 0)
+            (root / "data" / "models" / "sam2" / SAM2_WEIGHTS).unlink()
+            self.assertEqual(check_bundle.main(["--require-weights", str(root)]), 1)
+            self.assertEqual(check_bundle.main(["--nope", str(root)]), 2)
+
+    def test_the_depth_notice_item_and_model_folder_are_checked_like_sams(self):
+        for phrase in ("Depth Anything V2-Small", "Lihe Yang", "github.com/DepthAnything/Depth-Anything-V2"):
+            with tempfile.TemporaryDirectory() as tmp:
+                self.tree(Path(tmp), notice=BSD_NOTICE.replace(phrase, "x"))
+                problems = check_bundle.problems(Path(tmp))
+            self.assertTrue(any(phrase in p for p in problems), (phrase, problems))
+        with tempfile.TemporaryDirectory() as tmp:
+            self.tree(Path(tmp), depth_card=None, depth_ignore=None, depth_sums="")
+            problems = check_bundle.problems(Path(tmp))
+        for needle in ("data/models/depth/MODEL_CARD.md", "data/models/depth/.gitignore", "data/models/depth/SHA256SUMS has no line"):
+            self.assertTrue(any(needle in p for p in problems), (needle, problems))
+        with tempfile.TemporaryDirectory() as tmp:
+            self.tree(Path(tmp), depth_card="A model.\n", depth_ignore="*.part\n")
+            problems = check_bundle.problems(Path(tmp))
+        self.assertTrue(any("depth/MODEL_CARD.md" in p and "Apache-2.0" in p for p in problems), problems)
+        self.assertTrue(any("depth/MODEL_CARD.md" in p and "DepthAnything" in p for p in problems), problems)
+        self.assertTrue(any("depth/.gitignore" in p for p in problems), problems)
+
+    def test_the_depth_weights_are_required_unless_depth_pending(self):
+        sam = b"sam"
+        depth = b"depth"
+        sam_sums = f"{hashlib.sha256(sam).hexdigest()}  {SAM2_WEIGHTS}\n"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            # SAM fetched, the depth pin still the placeholder: required -> an error, --depth-pending -> fine, no flag -> a warning only.
+            self.tree(root, sums=sam_sums, weights=sam)
+            self.assertTrue(any("depth" in p and "not a SHA-256" in p for p in check_bundle.problems(root, require_weights=True)))
+            self.assertEqual(check_bundle.problems(root, require_weights=True, depth_pending=True), [])
+            self.assertEqual(check_bundle.problems(root), [])
+            self.assertTrue(any("depth" in w and "TBD-after-first-run" in w for w in check_bundle.warnings(root)))
+            self.assertEqual(check_bundle.main(["--require-weights", "--depth-pending", str(root)]), 0)
+            self.assertEqual(check_bundle.main(["--require-weights", str(root)]), 1)
+            self.assertEqual(check_bundle.main(["--depth-pending", str(root)]), 2)
+            # A real pin: the file must be there and match.
+            pin = f"{hashlib.sha256(depth).hexdigest()}  {DEPTH_WEIGHTS}\n"
+            self.tree(root, sums=sam_sums, weights=sam, depth_sums=pin)
+            missing = check_bundle.problems(root, require_weights=True)
+            self.assertTrue(any("is missing" in p and "tools/fetch/depth.sh" in p for p in missing), missing)
+            self.tree(root, sums=sam_sums, weights=sam, depth_sums=pin, depth_weights=b"damaged")
+            self.assertTrue(any("does not have the SHA-256" in p and "depth" in p for p in check_bundle.problems(root, require_weights=True)))
+            self.tree(root, sums=sam_sums, weights=sam, depth_sums=pin, depth_weights=depth)
+            self.assertEqual(check_bundle.problems(root, require_weights=True), [])
+            self.assertEqual(check_bundle.main(["--require-weights", str(root)]), 0)
+
+    def test_the_film_notice_items_must_be_in_the_notice(self):
+        for phrase in ("Andrea Volpato", "github.com/andreavolpato/spektrafilm", "data/film/spektrafilm/LICENSE"):
+            with tempfile.TemporaryDirectory() as tmp:
+                self.tree(Path(tmp), notice=BSD_NOTICE.replace(phrase, "x"))
+                problems = check_bundle.problems(Path(tmp))
+            self.assertTrue(any(phrase in p for p in problems), (phrase, problems))
+        for phrase in ("International Commission on Illumination", "data/film/cie/LICENSE", "and a table computed from it", "data/film/upsampling/LICENSE"):
+            with tempfile.TemporaryDirectory() as tmp:
+                self.tree(Path(tmp), notice=BSD_NOTICE.replace(phrase, "x"))
+                problems = check_bundle.problems(Path(tmp))
+            self.assertTrue(any(phrase in p for p in problems), (phrase, problems))
+
+    def test_the_film_folder_must_be_a_bundle_resource(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.tree(Path(tmp), resources={"../NOTICE": "NOTICE", "../LICENSE": "LICENSE", "../THIRD-PARTY.md": "THIRD-PARTY.md", "../data/models": "data/models"})
+            problems = check_bundle.problems(Path(tmp))
+        self.assertTrue(any("data/film" in p for p in problems), problems)
+
+    def test_each_film_folder_needs_its_licence_attribution_and_sums(self):
+        for folder in ("data/film/spektrafilm", "data/film/cie", "data/film/upsampling", "crates/ym-film/tests/oracle"):
+            for name in ("LICENSE", "ATTRIBUTION.md", "SHA256SUMS"):
+                with tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    self.tree(root)
+                    (root / folder / name).unlink()
+                    problems = check_bundle.problems(root)
+                self.assertTrue(any(f"{folder}/{name}" in p for p in problems), (folder, name, problems))
+
+    def test_a_changed_oracle_fixture_must_match_its_sums_line(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.tree(root)
+            self.assertEqual(check_bundle.problems(root), [])
+            (root / "crates" / "ym-film" / "tests" / "oracle" / "stage2.json").write_text("changed")
+            problems = check_bundle.problems(root)
+        self.assertTrue(any("oracle/stage2.json" in p and "does not match" in p for p in problems), problems)
+
+    def test_a_film_file_must_have_a_matching_sums_line(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.tree(root)
+            (root / "data" / "film" / "cie" / "CIE_illum_D55.csv").write_text("changed")
+            problems = check_bundle.problems(root)
+        self.assertTrue(any("CIE_illum_D55.csv" in p and "does not match" in p for p in problems), problems)
+
+    def test_a_changed_upsampling_table_must_match_its_sums_line(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.tree(root)
+            self.assertEqual(check_bundle.problems(root), [])
+            (root / "data" / "film" / "upsampling" / "coeffs.f32").write_text("changed")
+            problems = check_bundle.problems(root)
+        self.assertTrue(any("upsampling/coeffs.f32" in p and "does not match" in p for p in problems), problems)
+
+    def test_the_licence_must_be_listed_in_the_sums(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.tree(root)
+            sums = root / "data" / "film" / "spektrafilm" / "SHA256SUMS"
+            sums.write_text("".join(line for line in sums.read_text().splitlines(True) if " LICENSE" not in line))
+            problems = check_bundle.problems(root)
+        self.assertTrue(any("LICENSE" in p and "SHA256SUMS" in p for p in problems), problems)
+
+    def test_a_file_the_sums_do_not_list_is_an_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.tree(root)
+            (root / "data" / "film" / "spektrafilm" / "profiles" / "extra.json").write_text("{}")
+            problems = check_bundle.problems(root)
+        self.assertTrue(any("profiles/extra.json" in p and "not listed" in p for p in problems), problems)
+
+    def test_a_line_for_a_missing_file_is_an_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.tree(root)
+            (root / "data" / "film" / "cie" / "CIE_illum_D55.csv").unlink()
+            problems = check_bundle.problems(root)
+        self.assertTrue(any("CIE_illum_D55.csv" in p and "missing" in p for p in problems), problems)
+
+    def test_the_repository_itself_passes_without_the_weights(self):
+        self.assertEqual(check_bundle.problems(REPO), [])
 
 
 if __name__ == "__main__":

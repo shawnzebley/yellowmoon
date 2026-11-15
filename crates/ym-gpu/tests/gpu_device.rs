@@ -1237,6 +1237,118 @@ mod existing_kernels {
     }
 
     #[test]
+    fn the_method_a_denoise_kernel_reads_nothing_it_did_not_write() {
+        use ym_gpu::cpu::bm_dct::LevelNoise;
+        use ym_gpu::cpu::frame_denoise::{DenoiseMethod, FrameDenoise};
+        use ym_gpu::cpu::tiling::{Halo, Rect, tile_grid};
+        use ym_gpu::kernels::bm_dct::{HALO_PX, frame_denoise, frame_denoise_core};
+        let g0 = [1.9f32, 1.0, 1.5];
+        let mut images = [
+            balanced_scene(67, 49, 41, g0),
+            balanced_scene(44, 58, 42, g0),
+        ];
+        for img in &mut images {
+            synth::add_noise(&mut img.data, 0.005, 43);
+        }
+        let stage = |luma, chroma, radius, blend| FrameDenoise {
+            method: DenoiseMethod::BmDct,
+            luma,
+            chroma,
+            radius,
+            blend,
+            level: None,
+        };
+        // The chroma threshold per reference block (switch 8): the reference block's means are read from the
+        // scratch the prep wrote.
+        let level = FrameDenoise {
+            level: Some(LevelNoise {
+                a: 2e-4,
+                b: 3e-7,
+                gains: g0.map(f64::from),
+                encoding_gain: ym_gpu::cpu::denoise_space::WORKING_GAIN_EV.exp2(),
+                chroma_scale: 181.0,
+            }),
+            ..stage(10.0, 40.0, 1, 15.0)
+        };
+        neutral("method A", |g| {
+            let images = images.clone();
+            g.run(JobSpec::new(Priority::Export), move |ctx, _| {
+                let mut out = Vec::new();
+                for img in &images {
+                    for fd in [
+                        stage(10.0, 40.0, 1, 15.0),
+                        stage(10.0, 0.0, 2, 0.0),
+                        stage(0.0, 40.0, 0, 15.0),
+                        level,
+                    ] {
+                        out.extend(frame_denoise(ctx, img, &fd)?.data);
+                        // Tiles with the halo recycle the buffers of the tile before them.
+                        let frame = Rect::whole(img.width, img.height);
+                        for core in tile_grid(img.width, img.height, 24, 24, 2) {
+                            let rect = core.grow(Halo::uniform(HALO_PX), frame);
+                            let sub = img.extract(rect);
+                            out.extend(
+                                frame_denoise_core(ctx, &sub, core.relative_to(&rect), &fd)?.data,
+                            );
+                        }
+                    }
+                }
+                Ok(out)
+            })
+            .expect("method A job")
+        });
+    }
+
+    #[test]
+    fn the_false_colour_kernels_read_nothing_they_did_not_write() {
+        use ym_gpu::cpu::tiling::{Halo, Rect, tile_grid};
+        use ym_gpu::kernels::bilateral::SigmaInput;
+        use ym_gpu::kernels::false_color::{false_color, false_color_weights, halo_px};
+        let g0 = [1.9f32, 1.0, 1.5];
+        let mut images = [
+            balanced_scene(67, 49, 51, g0),
+            balanced_scene(44, 58, 52, g0),
+        ];
+        // Stripes of 2 px on the right half, so that the gate opens.
+        for img in &mut images {
+            let (w, h, n) = (img.width, img.height, img.plane_len());
+            for c in 0..3 {
+                for y in 0..h {
+                    for x in w / 2..w {
+                        img.data[c * n + y * w + x] = if x % 2 == 0 { 0.05 } else { 0.5 };
+                    }
+                }
+            }
+            synth::add_noise(&mut img.data, 0.003, 53);
+        }
+        neutral("false colour", |g| {
+            let images = images.clone();
+            g.run(JobSpec::new(Priority::Export), move |ctx, _| {
+                let mut out = Vec::new();
+                for img in &images {
+                    let frame = Rect::whole(img.width, img.height);
+                    out.extend(false_color_weights(ctx, img, frame)?);
+                    for color in [60.0f32, 20.0] {
+                        let sigma = SigmaInput::Scalar(0.004);
+                        out.extend(false_color(ctx, img, frame, &sigma, color)?.data);
+                        // Tiles with the halo recycle the buffers of the tile before them.
+                        for core in tile_grid(img.width, img.height, 24, 24, 2) {
+                            let rect = core.grow(Halo::uniform(halo_px(color)), frame);
+                            let sub = img.extract(rect);
+                            out.extend(
+                                false_color(ctx, &sub, core.relative_to(&rect), &sigma, color)?
+                                    .data,
+                            );
+                        }
+                    }
+                }
+                Ok(out)
+            })
+            .expect("false colour job")
+        });
+    }
+
+    #[test]
     fn the_output_sharpening_kernel_reads_nothing_it_did_not_write() {
         let images = [
             balanced_scene(70, 60, 31, [1.0; 3]),

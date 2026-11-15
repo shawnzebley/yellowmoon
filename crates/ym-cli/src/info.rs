@@ -23,19 +23,21 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
+use ym_core::auto_crop::{CropSuggestion, StraightenKind, SubjectSource};
 use ym_core::camera::PhotoCamera;
 use ym_core::session::{OpenOptions, PhotoId, PhotoView};
-use ym_core::settings::ResolvedSettings;
+use ym_core::settings::{Orientation, ResolvedSettings};
 use ym_core::version::PIPELINE_VERSION;
 use ym_raw::error::RawError;
 use ym_raw::layout::{DecodeKind, Rect};
 use ym_raw::metadata::{LensTags, LevelSource, RawMetadata, probe};
 
-use crate::cli::{AppleAutoArg, InfoArgs};
+use crate::cli::{InfoArgs, auto_choice};
 use crate::console::Console;
 use crate::exit::{self, Failure};
 use crate::report::{
-    AppleAutoField, Object, apple_auto_text, camera_json, develop_fields, error_value, match_word,
+    AppleAutoField, Object, auto_text, camera_json, develop_fields, error_value_with_detail,
+    match_word,
 };
 use crate::runtime::{CoreSettings, Runtime, interrupted, read_instructions};
 use crate::text::{lossy, path_text};
@@ -102,9 +104,9 @@ fn run_to(args: &InfoArgs, console: &mut Console, out: &mut dyn Write) -> Result
         .collect();
 
     // The estimates need the core; files that cannot even be read do not.
-    let apple_auto = AppleAutoArg::mode(args.apple_auto);
-    let apple_auto_instructions = args
-        .apple_auto_instructions
+    let choice = auto_choice(args.auto_provider, args.apple_auto).map_err(Failure::usage)?;
+    let auto_instructions = args
+        .auto_instructions
         .as_deref()
         .map(read_instructions)
         .transpose()?;
@@ -112,14 +114,14 @@ fn run_to(args: &InfoArgs, console: &mut Console, out: &mut dyn Write) -> Result
         Some(Runtime::open(&CoreSettings {
             jobs: None,
             forced_profile: args.profile.clone(),
-            apple_auto: Some(apple_auto),
-            apple_auto_instructions,
+            auto: Some(choice),
+            auto_instructions,
         })?)
     } else {
         None
     };
     if let Some(rt) = &runtime {
-        if let Some(notice) = rt.apple_auto_notice(apple_auto) {
+        for notice in rt.auto_notices() {
             console.warn(&notice);
         }
         let mut opened: HashMap<PathBuf, Option<PhotoId>> = HashMap::new();
@@ -138,19 +140,24 @@ fn run_to(args: &InfoArgs, console: &mut Console, out: &mut dyn Write) -> Result
                     .flatten()
             });
         }
+        let asking = rt.asking().name();
         let finished = rt.wait_developed(|w| {
             console.progress(match w.answers {
-                Some((answered, n)) => format!("Asking Apple Intelligence {answered}/{n}"),
+                Some((answered, n)) => format!("Asking {asking} {answered}/{n}"),
                 None => format!("Reading {}/{}", w.ready, w.total),
             });
         });
         console.finish_progress();
+        if let Some(notice) = rt.breaker_notice() {
+            console.warn(&notice);
+        }
         if !finished {
             console.info("Interrupted.");
             return Ok(exit::INTERRUPTED);
         }
     }
 
+    let auto_note = runtime.as_ref().map(auto_note).unwrap_or_default();
     let mut failures = 0usize;
     let mut printed_text = false;
     for entry in &entries {
@@ -165,6 +172,9 @@ fn run_to(args: &InfoArgs, console: &mut Console, out: &mut dyn Write) -> Result
                 } else {
                     out.flush()?;
                     console.error(&format!("{}: {error}", path_text(&entry.path)));
+                    if let Some(detail) = error.detail() {
+                        console.detail(&format!("{}: {detail}", path_text(&entry.path)));
+                    }
                 }
             }
             Ok(meta) => {
@@ -184,17 +194,39 @@ fn run_to(args: &InfoArgs, console: &mut Console, out: &mut dyn Write) -> Result
                     Ok((view, resolved)) => Ok((view, resolved)),
                     Err(reason) => Err(reason.as_str()),
                 };
+                // Auto crop only when asked: it renders the photo's picture (`docs/20` section 8).
+                let auto_crop = match (args.suggest_crop, entry.photo, &developed) {
+                    (Some(aspect), Some(id), Ok(_)) => Some(
+                        rt.core
+                            .session
+                            .suggest_crop(id, aspect, Orientation::Deg0)
+                            .map_err(|e| e.to_string()),
+                    ),
+                    (Some(_), _, Err(reason)) => Some(Err(reason.clone())),
+                    _ => None,
+                };
                 if args.json {
-                    writeln!(
-                        out,
-                        "{}",
-                        json_ok(&entry.path, meta, &camera, shown).to_line()
-                    )?;
+                    let mut obj = json_ok(&entry.path, meta, &camera, shown);
+                    if let Some(result) = &auto_crop {
+                        obj.insert("auto_crop", auto_crop_json(result));
+                    }
+                    writeln!(out, "{}", obj.to_line())?;
                 } else {
                     if printed_text {
                         writeln!(out)?;
                     }
-                    write!(out, "{}", render_text(&entry.path, meta, &camera, shown))?;
+                    write!(
+                        out,
+                        "{}",
+                        render_text(
+                            &entry.path,
+                            meta,
+                            &camera,
+                            shown,
+                            auto_crop.as_ref(),
+                            &auto_note
+                        )
+                    )?;
                     printed_text = true;
                 }
             }
@@ -206,6 +238,44 @@ fn run_to(args: &InfoArgs, console: &mut Console, out: &mut dyn Write) -> Result
     } else {
         exit::SOME_FAILED
     })
+}
+
+/// What the **Auto grading** row needs that the photo's estimates do not say (`docs/22` section 3.4).
+#[derive(Debug, Clone, Default)]
+pub struct AutoNote {
+    /// The version the chosen provider's program printed, for "Claude Code 2.1.100 is too old".
+    pub tool_version: Option<String>,
+    /// The saved choice is a program whose consent is not saved and the run did not name it: it was
+    /// not asked to probe (a run touches no program it does not use). The core reads that as
+    /// `not_consented` itself (`Activity::decide`); the row keeps the mapping below for a photo
+    /// whose state was read before the core knew.
+    pub not_consented: bool,
+}
+
+impl AutoNote {
+    /// The photo's Auto state, with `checking` of an unconsented program read as `not_consented`.
+    fn state(&self, apple: &ym_core::apple_auto::AppleAuto) -> ym_core::apple_auto::AppleAuto {
+        use ym_core::apple_auto::{AppleAuto, UnavailableReason};
+        match apple {
+            AppleAuto::Unavailable {
+                reason: UnavailableReason::Checking,
+            } if self.not_consented => AppleAuto::Unavailable {
+                reason: UnavailableReason::NotConsented,
+            },
+            other => other.clone(),
+        }
+    }
+}
+
+/// What the run knows about its provider for the row.
+fn auto_note(rt: &Runtime) -> AutoNote {
+    let status = rt.auto_status();
+    let chosen = status.chosen;
+    let tool_version = status.provider(chosen).and_then(|p| p.tool_version.clone());
+    AutoNote {
+        tool_version,
+        not_consented: chosen.is_cloud() && !rt.explicit_choice() && !status.consent.get(chosen),
+    }
 }
 
 /// The session's view of a developed photo with its settings resolved, or why there is none.
@@ -223,10 +293,8 @@ fn is_arw_name(path: &Path) -> bool {
 /// Probes one input. A folder is an error, not a read attempt.
 fn probe_file(path: &Path) -> Result<RawMetadata, RawError> {
     if path.is_dir() {
-        return Err(RawError::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "this is a folder, not a file",
-        )));
+        // A folder is not a photo; the catalogue has no sentence for it, so it is "not an ARW file".
+        return Err(RawError::NotArw);
     }
     probe(path)
 }
@@ -236,7 +304,10 @@ pub fn json_error(path: &Path, error: &RawError) -> Object {
     let mut obj = Object::new();
     obj.insert("input", absolute(path));
     obj.insert("status", "error");
-    obj.insert("error", error_value(error.kind(), &error.to_string()));
+    obj.insert(
+        "error",
+        error_value_with_detail(error.kind(), &error.to_string(), error.detail().as_deref()),
+    );
     obj.insert("pipeline_version", PIPELINE_VERSION);
     obj
 }
@@ -271,6 +342,7 @@ pub fn json_ok(
             obj.insert("auto", Value::Null);
             obj.insert("auto_source", Value::Null);
             obj.insert("apple_auto", Value::Null);
+            obj.insert("auto_advisor", Value::Null);
             obj.insert("settings", Value::Null);
             obj.insert("notes", json!([reason]));
         }
@@ -375,20 +447,24 @@ fn profile_text(camera: &PhotoCamera) -> String {
 }
 
 /// The rows of what the automatic development makes of a photo.
-fn develop_rows(view: &PhotoView, resolved: &ResolvedSettings) -> Vec<(&'static str, String)> {
+fn develop_rows(
+    view: &PhotoView,
+    resolved: &ResolvedSettings,
+    note: &AutoNote,
+) -> Vec<(&'static str, String)> {
     let e = &resolved.estimates;
     vec![
         (
             "Look",
             format!(
                 "{} at {}%",
-                view.settings.look,
-                trim_number(view.settings.look_intensity, 1)
+                view.settings.output().look,
+                trim_number(view.settings.output().look_intensity, 1)
             ),
         ),
         (
             "Auto exposure",
-            format!("{} EV", format_signed_ev(e.exposure_ev)),
+            format!("{} EV", format_signed_ev(e.input.exposure_ev)),
         ),
         (
             "Auto light",
@@ -402,14 +478,19 @@ fn develop_rows(view: &PhotoView, resolved: &ResolvedSettings) -> Vec<(&'static 
             "Auto white",
             format!(
                 "{} K, tint {}",
-                trim_number(e.kelvin, 0),
-                trim_number(e.tint, 1)
+                trim_number(e.input.kelvin, 0),
+                trim_number(e.input.tint, 1)
             ),
         ),
-        // What Apple Auto did to the values above (`docs/19` section 8).
+        // What the Auto provider did to the values above (`docs/19` section 8, `docs/22` section 13.4).
         (
-            "Apple Auto",
-            apple_auto_text(&e.apple, view.estimates.apple_steps),
+            "Auto grading",
+            auto_text(
+                &note.state(&e.apple),
+                view.estimates.apple_steps,
+                view.estimates.provider,
+                note.tool_version.as_deref(),
+            ),
         ),
         (
             "Noise model",
@@ -419,17 +500,17 @@ fn develop_rows(view: &PhotoView, resolved: &ResolvedSettings) -> Vec<(&'static 
             "Auto sharpen",
             format!(
                 "amount {}, radius {} px",
-                trim_number(e.sharpen.amount, 0),
-                trim_number(e.sharpen.radius_px, 2)
+                trim_number(e.input.sharpen.amount, 0),
+                trim_number(e.input.sharpen.radius_px, 2)
             ),
         ),
         (
             "Auto noise red.",
             format!(
                 "luminance {}, colour {}, detail {}",
-                trim_number(e.noise_reduction.luminance, 0),
-                trim_number(e.noise_reduction.color, 0),
-                trim_number(e.noise_reduction.detail, 0)
+                trim_number(e.input.noise_reduction.luminance, 0),
+                trim_number(e.input.noise_reduction.color, 0),
+                trim_number(e.input.noise_reduction.detail, 0)
             ),
         ),
     ]
@@ -476,6 +557,8 @@ pub fn render_text(
     meta: &RawMetadata,
     camera: &PhotoCamera,
     developed: Result<Developed<'_>, &str>,
+    auto_crop: Option<&Result<CropSuggestion, String>>,
+    note: &AutoNote,
 ) -> String {
     let mut rows: Vec<(&str, String)> = Vec::new();
 
@@ -613,7 +696,7 @@ pub fn render_text(
     }
 
     match developed {
-        Ok((view, resolved)) => rows.extend(develop_rows(view, resolved)),
+        Ok((view, resolved)) => rows.extend(develop_rows(view, resolved, note)),
         Err(reason) => {
             // ARW 6.0 and unknown layouts already said so above.
             if !matches!(meta.decode, DecodeKind::Arw6 | DecodeKind::Unknown { .. }) {
@@ -622,12 +705,53 @@ pub fn render_text(
         }
     }
 
+    if let Some(result) = auto_crop {
+        rows.push((
+            "Auto crop",
+            match result {
+                Ok(s) => auto_crop_text(s),
+                Err(reason) => format!("not available: {reason}"),
+            },
+        ));
+    }
+
     let width = rows.iter().map(|(label, _)| label.len()).max().unwrap_or(0);
     let mut text = format!("{}\n", path_text(path));
     for (label, value) in rows {
         text.push_str(&format!("  {label:<width$}  {value}\n"));
     }
     text
+}
+
+/// The Auto crop row of `ym info --suggest-crop` (`docs/20-auto-crop.md` §8): the angle, the
+/// frame (x, y, width, height of the canvas, 4 decimals) and where the subject came from.
+fn auto_crop_text(s: &CropSuggestion) -> String {
+    let angle = match s.straighten {
+        StraightenKind::Level => "Already level".to_owned(),
+        StraightenKind::Rotate => format!("Levelled by {}°", trim_number(s.angle_deg, 1)),
+        StraightenKind::Unsure => "No horizon found".to_owned(),
+    };
+    let frame = match s.frames.first() {
+        Some(f) if !s.keep => format!(
+            "frame {:.4} {:.4} {:.4} {:.4}",
+            f.rect.x, f.rect.y, f.rect.width, f.rect.height
+        ),
+        _ => "whole photo kept".to_owned(),
+    };
+    let subject = match s.subject {
+        SubjectSource::Camera => "from the camera's focus point",
+        SubjectSource::Picture => "from the picture",
+    };
+    format!("{angle} · {frame} ({subject})")
+}
+
+/// The `auto_crop` field of `ym info --suggest-crop --json`: the app's answer field for field, or
+/// `{"error": "..."}`.
+fn auto_crop_json(result: &Result<CropSuggestion, String>) -> Value {
+    match result {
+        Ok(s) => serde_json::to_value(s).unwrap_or(Value::Null),
+        Err(reason) => json!({ "error": reason }),
+    }
 }
 
 /// The shutter speed the way ExifTool prints it: `1/N s` up to a quarter of a second, one
@@ -772,8 +896,10 @@ mod tests {
                 files: vec![path.clone()],
                 json,
                 profile: None,
+                auto_provider: None,
                 apple_auto: None,
-                apple_auto_instructions: None,
+                auto_instructions: None,
+                suggest_crop: None,
             };
             let mut console = Console::new(true, false, true);
             let result = run_to(&args, &mut console, &mut Closed);
@@ -794,8 +920,10 @@ mod tests {
             files: vec![bad, good.clone()],
             json: false,
             profile: None,
+            auto_provider: None,
             apple_auto: None,
-            apple_auto_instructions: None,
+            auto_instructions: None,
+            suggest_crop: None,
         };
         let mut out = Vec::new();
         let mut console = Console::new(true, false, true);

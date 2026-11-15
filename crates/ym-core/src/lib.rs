@@ -6,14 +6,17 @@
 //! `ym-*` library crates; only `src-tauri` and `ym-cli` depend on it.
 //!
 //! The modules: [`settings`] (`DevelopSettings`, its patch, `ResolvedSettings`), [`auto`] (the
-//! per-photo automatic estimates), [`apple_auto`] (Apple Auto's advisor, steps and table,
-//! `docs/19`), [`camera`] (camera match, STAND-IN and REDUCED, the camera
+//! per-photo automatic estimates), [`apple_auto`] (the Auto advisor, steps and table,
+//! `docs/19`), [`auto_provider`] (who grades: Apple Intelligence, Claude Code, Antigravity, `docs/22`),
+//! [`camera`] (camera match, STAND-IN and REDUCED, the camera
 //! card), [`session`] (opening files, the decode pool, progress events, the mosaic cache and the
 //! settings commands), [`pipeline`] (the render graph: `Renderer`, the stage caches, geometry, the
 //! viewport state and frames, thumbnails, look tiles, histogram, Pick white sampling, full-size
 //! renders), [`scheduler`] (priorities, cancellation, the memory budget), [`preferences`]
 //! (`preferences.json`), [`looks`] (the look library with the default look, the display rendering
-//! and `looks_changed`), [`export`] (the one export function the app and the CLI share),
+//! and `looks_changed`), [`vision`] (Subject and People masks from the computer's Vision framework, `docs/23`
+//! section 4.5), [`export`] (the one export function the app and the CLI share),
+//! [`memory`] (what is let go when the computer is short of memory, and the poll that notices),
 //! [`export_queue`] (jobs, snapshots, progress, cancel, the updater's busy flag), [`cli_preview`]
 //! (the `ym render …` command of a job) and [`app`] (all of them wired together, one method per IPC
 //! command).
@@ -27,15 +30,23 @@
 pub mod app;
 pub mod apple_auto;
 pub mod auto;
+pub mod auto_crop;
+pub mod auto_provider;
 pub mod camera;
 pub mod cli_preview;
 pub mod data_dir;
 pub mod export;
 pub mod export_queue;
+pub mod film;
+pub mod film_tiles;
 pub mod looks;
+pub mod media;
+pub mod memory;
+pub mod perf;
 pub mod pipeline;
 pub mod preferences;
 pub mod scheduler;
 pub mod session;
 pub mod settings;
 pub mod version;
+pub mod vision;

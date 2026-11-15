@@ -270,10 +270,13 @@ fn kelvin_rounding_costs_at_most_a_percent_and_a_half_of_red_blue_balance() {
     // `Manual` at the shown pair is off by the colour of that difference. A fixed number of kelvin is a
     // bigger step in colour at the warm end (6 mired at 2000 K, 1.6 mired at 4000 K), so the bound is
     // stated per band, over the whole range (every 3 K, all 11 profiles, lights on the locus):
-    // 2000-2300 K 1.6 %, 2300-4000 K 1.3 % (the 4000 K junction included), above 4000 K 0.5 %.
+    // 2000-2300 K 1.6 %, 2300-4000 K 1.3 % (the 4000 K junction included), above 4000 K 0.5 %. With the
+    // ALEXA estimate pushed 4.5 degrees (the owner's decision of 2026-10-26, docs/03) the `w_A` step at the
+    // 4000 K junction grew and 2300-4000 K measures 1.65 % (the RX100 IV at 3986 K): its bound is 1.7 %, raised
+    // from 1.4 % with the owner's agreement.
     let bands = [
         (2000.0, 2300.0, 0.017),
-        (2300.0, 4000.0, 0.014),
+        (2300.0, 4000.0, 0.017),
         (4000.0, 11_000.0, 0.006),
     ];
     let mut worst = [0.0_f64; 3];
@@ -416,8 +419,8 @@ fn user_white_follows_the_four_thousand_kelvin_rule() {
     assert_eq!(above, p.white.daylight_white(4000.0));
     let red_step = above[0] / below[0] - 1.0;
     let blue_step = above[2] / below[2] - 1.0;
-    assert!((red_step + 0.012).abs() < 0.002, "red {red_step}");
-    assert!((blue_step + 0.034).abs() < 0.003, "blue {blue_step}");
+    assert!((red_step + 0.0075).abs() < 0.002, "red {red_step}");
+    assert!((blue_step + 0.040).abs() < 0.003, "blue {blue_step}");
 }
 
 #[test]

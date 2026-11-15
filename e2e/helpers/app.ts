@@ -3,10 +3,26 @@ import { expect } from "@playwright/test";
 import type { MockOptions } from "../../src/api.mock";
 import "../../src/testHooks";
 
+/** Options added to every page this process opens, under the options a test gives (see `useMockDefaults`). */
+let mockDefaults: Record<string, string | number> = {};
+
+/**
+ * Adds `options` to every page `openApp` opens (and every `mockQuery`) until the returned function is called, so that a spec can run the states
+ * of `helpers/states.ts` with an option on (the contrast test's display options, `?mockDisplay=`). A worker runs one test at a time, so the
+ * setting is the test's own; always restore it in a `finally`.
+ */
+export function useMockDefaults(options: Record<string, string | number>): () => void {
+  const before = mockDefaults;
+  mockDefaults = { ...before, ...options };
+  return () => {
+    mockDefaults = before;
+  };
+}
+
 /** The mock's query string for a state: `mockSpeed=Infinity` runs development at once. */
 export function mockQuery(options: Record<string, string | number> = {}): string {
   const params = new URLSearchParams({ mockSpeed: "Infinity" });
-  for (const [key, value] of Object.entries(options)) params.set(key, String(value));
+  for (const [key, value] of Object.entries({ ...mockDefaults, ...options })) params.set(key, String(value));
   return `/?${params.toString()}`;
 }
 
@@ -27,6 +43,39 @@ export async function openApp(page: Page, options: Record<string, string | numbe
 
 /** The hooks the app publishes in a browser (`src/testHooks.ts`): the very mock and updater it runs on. */
 type Hooks = NonNullable<Window["__yellowmoon"]>;
+
+/**
+ * Imports a look package through the mock and waits until the import has finished and the page has settled on the result.
+ *
+ * Not `await mockApi.looksImport(...)` inside one `page.evaluate`: Chromium's DevTools holds the promise that `page.evaluate` awaits
+ * only weakly, and a look import ends with the store refreshing its looks, a long run of microtasks that allocate. If a garbage
+ * collection comes after the evaluated promise is settled and before DevTools has read it, DevTools answers "Promise was collected" and
+ * Playwright reports it as "Execution context was destroyed, most likely because of a navigation" (a page that has not navigated at
+ * all), about 1 run in 50 on a busy machine. Here the evaluate returns at once, and the wait is a poll on a flag.
+ */
+export async function importLooks(page: Page, path: string): Promise<void> {
+  await page.evaluate((zip) => {
+    const job: LooksImportJob = (window as unknown as { __looksImport: LooksImportJob }).__looksImport = { done: false };
+    void window.__yellowmoon!.mockApi.looksImport(zip).then(
+      () => {
+        job.done = true;
+      },
+      (error: unknown) => {
+        job.error = JSON.stringify(error);
+        job.done = true;
+      },
+    );
+  }, path);
+  await page.waitForFunction(() => (window as unknown as { __looksImport: LooksImportJob }).__looksImport.done);
+  const error = await page.evaluate(() => (window as unknown as { __looksImport: LooksImportJob }).__looksImport.error);
+  if (error !== undefined) throw new Error(`Importing ${path} failed: ${error}`);
+}
+
+/** What `importLooks` leaves on the page. */
+interface LooksImportJob {
+  done: boolean;
+  error?: string;
+}
 
 /** Changes the mock's options in the page, before a session is open. */
 export async function configureMock(page: Page, options: MockOptions): Promise<void> {
@@ -59,7 +108,10 @@ export async function showUpdateReady(page: Page): Promise<void> {
  */
 export async function openPhotos(page: Page): Promise<void> {
   await page.getByRole("button", { name: "Open files…" }).click();
-  await expect(page.getByRole("heading", { level: 2, name: /^\d+ photos? ready$/ })).toBeVisible();
+  // Developed; with the mock's provider `pending` the photos stay "Grading N photos with Apple Intelligence" (or Claude Code, or Antigravity; `docs/11` §Start).
+  await expect(
+    page.getByRole("heading", { level: 2, name: /^(\d+ photos? ready|Grading \d+ photos? with (Apple Intelligence|Claude Code|Antigravity))$/ }),
+  ).toBeVisible();
   await page.getByRole("button", { name: /Open photos/ }).click();
   await expect(page.getByRole("tab", { name: "Look" })).toBeVisible();
   await expect(page.getByRole("region", { name: "Automatic" })).toBeVisible();
@@ -128,6 +180,23 @@ export async function dropFiles(page: Page, names: string[]): Promise<void> {
 /** What `recordCalls` keeps for each call of a command. */
 export interface RecordedCall {
   args: unknown[];
+}
+
+/**
+ * An arrow key in a radio list (the Lens tab's lenses), held until the focus has moved to the next row and let go after. Radix focuses the
+ * next row a tick after `keydown` and chooses it only if the key is still down at that moment (`isArrowKeyPressedRef`, cleared on `keyup`),
+ * so a key pressed and released at once, or held for a fixed 60 ms on a machine that is busy enough to run the tick after the release,
+ * moves the focus and chooses nothing. A hand holds the key for 80 ms or more with an idle page behind it; this does the same without
+ * counting on either.
+ */
+export async function arrowInList(page: Page, key: "ArrowDown" | "ArrowUp"): Promise<void> {
+  const was = await page.evaluateHandle(() => document.activeElement);
+  await page.keyboard.down(key);
+  try {
+    await page.waitForFunction((before) => document.activeElement !== before, was);
+  } finally {
+    await page.keyboard.up(key);
+  }
 }
 
 /**

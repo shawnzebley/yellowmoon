@@ -11,13 +11,14 @@ use ym_color::look::{LookInput, LookTransform};
 use ym_color::warp::{WarpPin, chroma_of};
 use ym_core::pipeline::color::{GradeRequest, color_plan, grade_key, grade_plan};
 use ym_core::pipeline::{
-    ChromaSample, DisplayChoice, FrameOptions, FullRequest, FullTarget, LookProblem, LookProvider,
-    NeutralOnly, PhotoSource, RenderError, RenderOptions, Renderer, ResolvedLook, ViewportMode,
-    ViewportRect, ViewportState,
+    ChromaSample, FrameOptions, FullRequest, FullTarget, LookProblem, LookProvider, NeutralOnly,
+    PhotoSource, RenderError, RenderOptions, Renderer, ResolvedLook, ViewportMode, ViewportRect,
+    ViewportState,
 };
 use ym_core::scheduler::MemoryBudget;
 use ym_core::session::{EventSink, OpenOptions, Session, SessionEvent};
 use ym_core::settings::{AutoOr, DevelopSettings, ExposureValue, Orientation, SettingsPatch};
+use ym_core::settings::{NodeId, NodePatch};
 use ym_gpu::queue::CancelToken;
 use ym_looks::library::LookId;
 
@@ -137,7 +138,7 @@ fn a_click_maps_back_to_the_pick_white_space_through_orientation_and_turns() {
             );
         }
         // With the user's turn the click is in the turned photo; the pick stays in the camera's.
-        let turned = edit(&src, |s| s.orientation = Orientation::Deg90);
+        let turned = edit(&src, |s| s.input_mut().orientation = Orientation::Deg90);
         let (tw, th) = (ch, cw);
         let p = r
             .pick_point_at(
@@ -201,10 +202,13 @@ fn pick_white_turns_a_wrong_as_shot_balance_neutral_end_to_end() {
     d.session
         .update_settings(
             d.id,
-            &SettingsPatch {
-                white_pick: Some(Some(point)),
-                ..SettingsPatch::default()
-            },
+            &SettingsPatch::default().and(
+                NodeId::Input,
+                NodePatch {
+                    white_pick: Some(Some(point)),
+                    ..NodePatch::default()
+                },
+            ),
         )
         .expect("pick white");
     let src = d.source();
@@ -245,7 +249,7 @@ fn thumbnails_are_small_pngs_with_the_photos_shape() {
     );
     assert_eq!((w, h), (160, 240));
     let cropped = edit(&d.source(), |s| {
-        s.crop = Some(ym_core::settings::Crop {
+        s.input_mut().crop = Some(ym_core::settings::Crop {
             rect: ym_core::settings::NormRect {
                 x: 0.0,
                 y: 0.0,
@@ -254,6 +258,7 @@ fn thumbnails_are_small_pngs_with_the_photos_shape() {
             },
             angle_deg: 0.0,
             aspect: ym_core::settings::CropAspect::Free,
+            auto: false,
         })
     });
     let (w, h, _) = decode_png(&r.thumbnail_png(&cropped, &CancelToken::new()).expect("png"));
@@ -335,13 +340,6 @@ impl LookProvider for TestLooks {
             )),
         }
     }
-
-    fn display_transform(
-        &self,
-        id: &LookId,
-    ) -> Result<(ym_color::display::DisplayTransform, String), LookProblem> {
-        NeutralOnly.display_transform(id)
-    }
 }
 
 #[test]
@@ -383,7 +381,7 @@ fn look_tiles_apply_one_look_to_the_current_render_and_share_the_raw_group() {
     }
     // In the viewport the same missing look renders as Neutral and says so.
     let st = state(300.0, 200.0);
-    let missing = edit(&src, |s| s.look = gone.clone());
+    let missing = edit(&src, |s| s.output_mut().look = gone.clone());
     let f = r
         .viewport_frame(&missing, &st, &FrameOptions::default(), &CancelToken::new())
         .expect("frame");
@@ -431,7 +429,7 @@ fn the_histogram_of_a_flat_field_is_one_spike_per_channel() {
     let lo = r
         .histogram(
             &edit(&src, |s| {
-                s.exposure = AutoOr::Manual(ExposureValue { ev: -1.0 })
+                s.input_mut().exposure = AutoOr::Manual(ExposureValue { ev: -1.0 })
             }),
             &CancelToken::new(),
         )
@@ -439,7 +437,7 @@ fn the_histogram_of_a_flat_field_is_one_spike_per_channel() {
     let hi = r
         .histogram(
             &edit(&src, |s| {
-                s.exposure = AutoOr::Manual(ExposureValue { ev: 1.0 })
+                s.input_mut().exposure = AutoOr::Manual(ExposureValue { ev: 1.0 })
             }),
             &CancelToken::new(),
         )
@@ -478,7 +476,7 @@ fn render_stats_say_which_path_ran_how_long_and_in_which_space() {
         "{:?}",
         f.report.notes
     );
-    let off = edit(&src, |s| s.decode.neural_demosaic = false);
+    let off = edit(&src, |s| s.input_mut().decode.neural_demosaic = false);
     let f = r
         .viewport_frame(
             &off,
@@ -539,6 +537,20 @@ fn a_full_render_that_does_not_fit_the_budget_is_refused_and_one_that_does_relea
         .render_full(&src, &req, &CancelToken::new())
         .expect("full render");
     assert_eq!((full.width, full.height), (600, 400));
+    // The picture stays counted while it is held (`FullImage::held`), with the sigma plane the graph caches;
+    // the working set is gone.
+    let picture = (600 * 400 * 12) as u64;
+    let with_picture = r.ledger().used();
+    assert!(with_picture >= picture, "{with_picture}");
+    drop(full.clone());
+    assert_eq!(r.ledger().used(), with_picture, "a clone shares it");
+    drop(full);
+    assert_eq!(
+        r.ledger().used(),
+        with_picture - picture,
+        "only the picture was released"
+    );
+    r.forget_all();
     assert_eq!(r.ledger().used(), 0, "the reservation is released");
     assert!(
         r.ledger().peak() > (600 * 400 * 12) as u64,
@@ -562,13 +574,118 @@ fn a_full_render_that_does_not_fit_the_budget_is_refused_and_one_that_does_relea
     );
 }
 
+/// `docs/26` H-13: the raw group a viewport frame caches on the host is reserved in the ledger for as long
+/// as the cache holds it, and a render that finds the ledger full is refused with the group counted.
+#[test]
+fn the_raw_group_a_frame_caches_is_counted_in_the_ledger_until_it_is_forgotten() {
+    let d = Developed::new(&patchwork(), MODEL);
+    let src = d.source();
+    let r = Renderer::neutral_only().expect("render thread");
+    assert_eq!(r.ledger().used(), 0);
+    r.viewport_frame(
+        &src,
+        &state(300.0, 200.0),
+        &FrameOptions::default(),
+        &CancelToken::new(),
+    )
+    .expect("frame");
+    let held = r.ledger().used();
+    // One group at 1/2 of 600 x 400 is 300 x 200 x 3 planes x 4 B at least.
+    assert!(held >= 300 * 200 * 12, "the group is counted: {held}");
+    assert!(r.ledger().peak() >= held);
+    // The same frame again reuses the group and reserves nothing more.
+    r.viewport_frame(
+        &src,
+        &state(300.0, 200.0),
+        &FrameOptions::default(),
+        &CancelToken::new(),
+    )
+    .expect("frame");
+    assert_eq!(r.ledger().used(), held);
+    r.forget_all();
+    assert_eq!(
+        r.ledger().used(),
+        0,
+        "forgetting the photo gives the bytes back"
+    );
+}
+
+/// `docs/26` H-13: what the caches hold is counted, but a cache must never be the reason an export is refused. With
+/// the ledger full of cached groups and sigma planes (the budget is exactly what the export needs) the export frees
+/// them, other photos' first, and its bytes are those of the export made with an empty ledger.
+#[test]
+fn an_export_that_fits_an_empty_ledger_is_not_refused_for_what_the_caches_hold() {
+    let a = Developed::new(&patchwork(), MODEL);
+    let b = Developed::new(&patchwork(), MODEL);
+    let (src_a, src_b) = (a.source(), b.source());
+    // `b` has the id of `a` (each session numbers from 1): give the second one another.
+    let src_b = PhotoSource {
+        id: ym_core::session::PhotoId(src_a.id.0 + 1),
+        ..src_b
+    };
+    let req = FullRequest {
+        target: FullTarget::DisplayLinear(OutputTarget::Srgb),
+    };
+    let empty = Renderer::neutral_only().expect("render thread");
+    let reference = empty
+        .render_full(&src_a, &req, &CancelToken::new())
+        .expect("export with an empty ledger");
+    let need = empty.ledger().peak();
+    drop(reference.clone());
+
+    let r = Renderer::new(
+        Arc::new(NeutralOnly),
+        RenderOptions {
+            budget: MemoryBudget::default().with_cpu_bytes(need),
+            ..RenderOptions::default()
+        },
+    )
+    .expect("render thread");
+    for src in [&src_b, &src_a] {
+        r.viewport_frame(
+            src,
+            &state(300.0, 200.0),
+            &FrameOptions::default(),
+            &CancelToken::new(),
+        )
+        .expect("frame");
+    }
+    let cached = r.ledger().used();
+    assert!(cached > 0, "the frames left caches in the ledger");
+    assert!(cached + need > need, "the budget has no room for both");
+    let full = r
+        .render_full(&src_a, &req, &CancelToken::new())
+        .expect("the caches do not cause a refusal");
+    assert!(
+        full.rgb == reference.rgb,
+        "the same bytes as with an empty ledger"
+    );
+    assert!(
+        r.ledger().peak() <= need,
+        "within the budget the whole time"
+    );
+    drop(full);
+    r.release_caches();
+    assert_eq!(r.ledger().used(), 0);
+
+    // With nothing to free the refusal is real: a held picture is not a cache.
+    let held = r
+        .render_full(&src_a, &req, &CancelToken::new())
+        .expect("fits again");
+    match r.render_full(&src_a, &req, &CancelToken::new()) {
+        Err(RenderError::Memory) => {}
+        other => panic!("{:?}", other.map(|i| i.width)),
+    }
+    drop(held);
+}
+
 #[test]
 fn full_renders_apply_crop_straighten_and_turns() {
     let d = Developed::new(&patchwork(), MODEL);
     let r = Renderer::neutral_only().expect("render thread");
     let src = edit(&d.source(), |s| {
-        s.orientation = Orientation::Deg90;
-        s.crop = Some(ym_core::settings::Crop {
+        s.input_mut().orientation = Orientation::Deg90;
+        s.input_mut().crop = Some(ym_core::settings::Crop {
             rect: ym_core::settings::NormRect {
                 x: 0.1,
                 y: 0.2,
@@ -577,6 +694,7 @@ fn full_renders_apply_crop_straighten_and_turns() {
             },
             angle_deg: 0.0,
             aspect: ym_core::settings::CropAspect::Free,
+            auto: false,
         });
     });
     let full = r
@@ -592,10 +710,11 @@ fn full_renders_apply_crop_straighten_and_turns() {
     assert_eq!((full.width, full.height), (200, 360));
     // A straightened crop leaves zeros in the empty corners of the canvas.
     let tilted = edit(&d.source(), |s| {
-        s.crop = Some(ym_core::settings::Crop {
+        s.input_mut().crop = Some(ym_core::settings::Crop {
             rect: ym_core::settings::NormRect::FULL,
             angle_deg: 20.0,
             aspect: ym_core::settings::CropAspect::Original,
+            auto: false,
         });
     });
     let t = r
@@ -685,7 +804,7 @@ fn a_viewport_frame_reports_its_zoom_and_the_fit_zoom_in_the_render_stats() {
 
     // A crop changes the final image and with it the Fit zoom, which the core alone can say.
     let cropped = edit(&src, |s| {
-        s.crop = Some(ym_core::settings::Crop {
+        s.input_mut().crop = Some(ym_core::settings::Crop {
             rect: ym_core::settings::NormRect {
                 x: 0.0,
                 y: 0.0,
@@ -694,6 +813,7 @@ fn a_viewport_frame_reports_its_zoom_and_the_fit_zoom_in_the_render_stats() {
             },
             angle_deg: 0.0,
             aspect: ym_core::settings::CropAspect::Free,
+            auto: false,
         });
     });
     let st = state(300.0, 200.0);
@@ -739,7 +859,7 @@ fn a_thumbnail_keeps_its_detail_statistic_for_the_size_estimate_and_a_look_tile_
     // A look tile is the photo through another look: it leaves the figure alone, even for a tile
     // of a picture that differs (here by 2.5 stops more exposure).
     let brighter = edit(&src, |s| {
-        s.exposure = AutoOr::Manual(ExposureValue { ev: 2.5 });
+        s.input_mut().exposure = AutoOr::Manual(ExposureValue { ev: 2.5 });
     });
     let warm = LookId::parse("user:warm").expect("id");
     r.look_thumbnail_png(&brighter, &warm, &CancelToken::new())
@@ -772,7 +892,7 @@ fn a_thumbnail_keeps_its_detail_statistic_for_the_size_estimate_and_a_look_tile_
 
 fn with_pins(src: &PhotoSource, pins: &[WarpPin]) -> PhotoSource {
     edit(src, |s| {
-        s.color_warp.pins = pins.iter().copied().map(Into::into).collect();
+        s.main_grade_mut().color_warp.pins = pins.iter().copied().map(Into::into).collect();
     })
 }
 
@@ -793,14 +913,15 @@ fn moving_pin(c: [f64; 2]) -> WarpPin {
     WarpPin::moving(c, [c[0] - 0.05 * c[1] / r, c[1] + 0.05 * c[0] / r])
 }
 
-/// The grade chain the renderer makes for `src` (Neutral-only looks, ACES 2), built here.
+/// The grade chain the renderer makes for `src` (Neutral-only looks, the cine rendering), built here.
 fn chain_of(src: &PhotoSource) -> std::sync::Arc<ym_color::display::ColorChain> {
     let color = color_plan(src).expect("colour plan");
     let req = GradeRequest {
         target: OutputTarget::Viewport,
         dither: false,
-        display: &DisplayChoice::Aces2,
         looks: &NeutralOnly,
+        background: None,
+        objects: None,
     };
     grade_plan(src, &color, &req).expect("grade plan").chain
 }
@@ -853,8 +974,25 @@ fn a_colour_warp_moves_the_picture_and_locked_pins_alone_change_nothing() {
     ] {
         assert!(frame(&with_pins(&src, &pins), false) == none, "{what}");
     }
+    // A pin that stays and only changes saturation is not that: it changes the picture, and the
+    // same pin at saturation 0 is byte for byte no warp.
+    let saturated = |saturation: f64| WarpPin {
+        saturation,
+        ..WarpPin::moving(colour, colour)
+    };
+    for saturation in [0.5, -1.0] {
+        let out = frame(&with_pins(&src, &[saturated(saturation)]), false);
+        assert_ne!(out, none, "saturation {saturation} changes the picture");
+        let changed = out.iter().zip(&none).filter(|(a, b)| a != b).count();
+        assert!(
+            changed < none.len() / 2,
+            "only the pin's colours change: {changed}"
+        );
+    }
+    assert!(frame(&with_pins(&src, &[saturated(0.0)]), false) == none);
     // Before is the camera default: the warp is not in it.
     assert!(frame(&with_pins(&src, &[moving_pin(colour)]), true) == frame(&src, true));
+    assert!(frame(&with_pins(&src, &[saturated(0.5)]), true) == frame(&src, true));
 }
 
 #[test]
@@ -865,8 +1003,9 @@ fn the_grade_key_follows_the_warp_as_the_chain_prepares_it() {
     let req = GradeRequest {
         target: OutputTarget::Viewport,
         dither: true,
-        display: &DisplayChoice::Aces2,
         looks: &NeutralOnly,
+        background: None,
+        objects: None,
     };
     let key = |pins: &[WarpPin]| grade_key(&with_pins(&src, pins), &color, &req);
     let none = key(&[]);
@@ -882,6 +1021,15 @@ fn the_grade_key_follows_the_warp_as_the_chain_prepares_it() {
     // What changes nothing keeps the key, so the cached frame is served.
     assert_eq!(key(&[WarpPin::locked_at([0.1, 0.0])]), none);
     assert_eq!(key(&[WarpPin::moving([0.1, 0.0], [0.1, 0.0])]), none);
+    // A pin that stays but changes saturation (or exposure) is not that: it re-renders, and so does
+    // every other value of it.
+    let sat = |saturation: f64| WarpPin {
+        saturation,
+        ..WarpPin::moving([0.1, 0.0], [0.1, 0.0])
+    };
+    assert_ne!(key(&[sat(0.5)]), none, "a saturation re-renders");
+    assert_ne!(key(&[sat(0.5)]), key(&[sat(0.6)]), "so does changing it");
+    assert_eq!(key(&[sat(0.0)]), none);
     // The plan's chain carries the pins (the device path reads them from its parameters).
     let plan = grade_plan(&with_pins(&src, &[a]), &color, &req).expect("plan");
     assert_eq!(plan.chain.params().warp.pins, vec![a]);
@@ -936,7 +1084,7 @@ fn the_chroma_scatter_is_a_fixed_sample_of_the_photo_at_the_warps_input() {
         scatter(
             &r,
             &edit(&src, |s| {
-                s.white_balance =
+                s.input_mut().white_balance =
                     AutoOr::Manual(ym_core::settings::WhiteBalanceValue { kelvin, tint: 0.0 });
             }),
         )

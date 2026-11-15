@@ -12,10 +12,12 @@ export const HAS_COUNTERPART: ReadonlyArray<readonly [string, string]> = [
   [".ym-cube-list > li", "Item"], [".ym-wizard__option", "Item"], [".ym-wizard__watch", "Item"], [".ym-wizard__callout", "Item"],
   [".ym-wizard__waiting", "Item"], [".ym-wizard__problem", "Item"], [".ym-wizard__received > li", "Item"], [".ym-error-bar", "Item"],
   [".ym-wizard__package", "Item"], [".ym-info-row", "Item"], [".ym-switch-row", "Item"], [".ym-auto-row", "Item"],
-  [".ym-drop-zone__notice", "Item"], [".ym-develop__notice", "Item"], [".ym-about-dialog__adobe", "Item"],
+  [".ym-drop-zone__notice", "Item"], [".ym-develop__notice", "Item"], [".ym-about-dialog__adobe", "Item"], [".ym-nodes-notice", "Item"],
+  [".ym-mask-row:not([data-slot=item])", "Item"],
   [".ym-drop-zone", "Card"], [".ym-wizard__tile", "Card"],
-  [".ym-photo-cell__before", "Badge"], [".ym-photo-cell__chip", "Badge"], [".ym-photo-cell__readout", "Badge"],
-  ["[role=progressbar]", "Progress"], ["hr, [role=separator]", "Separator"], ["kbd", "Kbd"], ["progress", "Progress"], ["select", "Select"],
+  [".ym-photo-cell__before", "Badge"], [".ym-photo-cell__chip", "Badge"], [".ym-photo-cell__readout", "Badge"], [".ym-menu-later", "Badge"],
+  // The graph's divider is a focusable window splitter, which glasscn's static Separator is not: it is listed below.
+  ["[role=progressbar]", "Progress"], ["hr, [role=separator]:not(.ym-divider)", "Separator"], ["kbd", "Kbd"], ["progress", "Progress"], ["select", "Select"],
   ["input, textarea", "Input"], ["button, [role=button]", "Button"], ["[role=switch]", "Switch"], ["[role=slider]", "Slider"], ["[role=tab]", "Tabs"],
   ["[role=radio]:not([role=radio][aria-checked]) ", "Segmented control"],
 ];
@@ -30,12 +32,26 @@ export const NO_COUNTERPART: ReadonlyArray<readonly [string, string]> = [
   [".ym-moon", "moon mark"], [".ym-card", "tool-panel section (a ruled band of one glass pane, by the layout rule; glasscn's Card is a floating pane)"],
   [".ym-title-block", "title block (a tinted band of the pane)"], [".ym-field", "label + control row (glasscn has no Field)"],
   [".ym-photo-cell__camera", "camera line over the photo (text)"],
+  [".ym-divider", "graph divider (a focusable window splitter; glasscn's Separator is a static hairline)"],
+  [".ym-graph__canvas", "graph canvas (@xyflow/react's: the pane, the viewport, the links)"], [".ym-viewer", "photo row (paper beside the cell in the node view)"],
+  // The graph's nodes (N-08): a card and a marker are picture-like buttons drawn on the canvas (a thumbnail, a number chip, ports); glasscn has
+  // no node. The things inside that have a counterpart are glasscn's: the rename box (Input), the tooltips, the zoom buttons (Button), the menus.
+  ["[data-node-card]", "node card or marker (a picture button on the graph canvas)"], [".ym-gnode__num", "number chip of a card (a small label)"],
+  [".ym-port", "port of a node (a triangle or a square on the canvas)"], [".react-flow__edge", "link between two ports (an SVG path)"],
+  [".ym-filmstrip__nodes", "nodes glyph on a filmstrip thumbnail"],
+  // The node's head (N-09): its chip is a small label (the number, or a lock) and its name and line are text; the three buttons are glasscn's.
+  [".ym-nodehead__chip", "number chip or lock of the node's head (a small label)"],
+  // The handles of a Linear or a Radial on the photo (N-12): a focusable handle drawn over the cell, like the crop frame's; glasscn has none.
+  [".ym-mask-handles", "mask handles on the photo (the layer, its lines and its handles)"], [".ym-mask-handle", "mask handle (a focusable dot on the photo)"],
+  // The Brush tool on the photo (N-14): a surface to draw on over the cell, not a control (no role, no Tab stop), with the cursor circle and the stroke being
+  // drawn inside it. glasscn has no drawing surface.
+  [".ym-brush-layer", "brush layer on the photo (the surface a stroke is drawn on)"], [".ym-brush-cursor", "brush cursor circle (the brush's size on the photo)"],
   [".ym-wizard__tile-picture img, .ym-look-tile__picture img", "look picture"],
 ];
 
 /** The `data-slot` values of glasscn's components (`src/components/glass/`) that a control can be or sit in. */
 export const GLASS_SLOT =
-  /^(tabs-list|segmented-control|button|toggle|tabs-trigger|segmented-control-item|slider-thumb|slider|switch|select-trigger|select-item|input|search-field-input|search-field-clear|dropdown-menu-[a-z-]+|dialog-close|dialog-content|item|card|badge|progress|separator|kbd|collapsible-trigger|toggle-group-item|tooltip-trigger|popover-trigger|textarea|tabs|spinner)$/;
+  /^(tabs-list|segmented-control|button|toggle|tabs-trigger|segmented-control-item|slider-thumb|slider|switch|radio-group|radio-group-item|select-trigger|select-item|input|search-field-input|search-field-clear|dropdown-menu-[a-z-]+|context-menu-[a-z-]+|dialog-close|dialog-content|item|card|badge|progress|separator|kbd|collapsible-trigger|toggle-group-item|tooltip-trigger|popover-trigger|textarea|tabs|spinner)$/;
 
 /** What the audit found on one page. */
 export interface PageAudit {

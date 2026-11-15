@@ -1,5 +1,6 @@
 import { formats, Slider } from "../../components";
 import type { ResolvedSettings } from "../../api/types";
+import { inputOf, inputPatch, MAIN_ID, mainGradePatch, patchOf, resolvedCorrector } from "../../state/settingsGraph";
 import type { AppStore } from "../../state/store";
 import { AUTO, manualOrAuto } from "./shared";
 
@@ -21,15 +22,15 @@ export interface WhiteBalanceState {
   isAuto: boolean;
 }
 
-/** Whether the white balance is automatic, and whether a white was picked. */
+/** Whether the white balance is automatic, and whether a white was picked (all of it is the Input's: `docs/23` section 2). */
 export function whiteBalanceState(rs: ResolvedSettings): WhiteBalanceState {
-  const picked = rs.settings.white_pick !== null;
-  return { picked, isAuto: rs.auto.white_balance && rs.auto.light_source && !picked };
+  const picked = inputOf(rs.settings).white_pick !== null;
+  return { picked, isAuto: rs.auto.input.white_balance && rs.auto.input.light_source && !picked };
 }
 
 /** Back to Auto: white balance, light preset and picked white (the AUTO button and the cards' Reset). */
 export function whiteBalanceToAuto(store: AppStore): void {
-  void store.update({ white_balance: AUTO, light_source: "auto", white_pick: null });
+  void store.update(inputPatch({ white_balance: AUTO, light_source: "auto", white_pick: null }));
 }
 
 /**
@@ -39,7 +40,7 @@ export function whiteBalanceToAuto(store: AppStore): void {
  */
 export function setWhiteBalance(store: AppStore, rs: ResolvedSettings, kelvin: number, tint: number, final: boolean): void {
   const { estimates } = rs;
-  void store.update({ white_balance: manualOrAuto({ kelvin, tint }, { kelvin: estimates.kelvin, tint: estimates.tint }) }, final, rs.photo_id);
+  void store.update(inputPatch({ white_balance: manualOrAuto({ kelvin, tint }, { kelvin: estimates.input.kelvin, tint: estimates.input.tint }) }), final, rs.photo_id);
 }
 
 interface ControlProps {
@@ -53,7 +54,8 @@ interface ControlProps {
  * the Colour tab and "Temperature" on the Look tab's Tone card.
  */
 export function KelvinSlider({ store, rs, label = "Kelvin" }: ControlProps & { label?: string }) {
-  const { values, estimates } = rs;
+  const { estimates } = rs;
+  const values = rs.values.input;
   return (
     <Slider
       label={label}
@@ -61,16 +63,39 @@ export function KelvinSlider({ store, rs, label = "Kelvin" }: ControlProps & { l
       min={2000}
       max={11000}
       step={50}
-      defaultValue={estimates.kelvin}
+      defaultValue={estimates.input.kelvin}
       format={formats.kelvin}
       onChange={(kelvin, final) => setWhiteBalance(store, rs, kelvin, values.tint, final)}
       onReset={() =>
-        void store.update({
-          white_balance: manualOrAuto({ kelvin: estimates.kelvin, tint: values.tint }, { kelvin: estimates.kelvin, tint: estimates.tint }),
-          light_source: "auto",
-          white_pick: null,
-        })
+        void store.update(
+          inputPatch({
+            white_balance: manualOrAuto({ kelvin: estimates.input.kelvin, tint: values.tint }, { kelvin: estimates.input.kelvin, tint: estimates.input.tint }),
+            light_source: "auto",
+            white_pick: null,
+          }),
+        )
       }
+    />
+  );
+}
+
+/**
+ * The Input's Exposure slider (Light › Exposure; the Input's Light tab in the node view): −4 to +4 EV, Auto or a value, the detent at the
+ * photo's own exposure. A value equal to it is sent as Auto, and Reset sends Auto, not a manual copy of it.
+ */
+export function ExposureSlider({ store, rs }: ControlProps) {
+  const { estimates } = rs;
+  return (
+    <Slider
+      label="Exposure"
+      value={rs.values.input.exposure_ev}
+      min={-4}
+      max={4}
+      step={0.01}
+      defaultValue={estimates.input.exposure_ev}
+      format={formats.ev}
+      onChange={(ev, final) => void store.update(inputPatch({ exposure: manualOrAuto({ ev }, { ev: estimates.input.exposure_ev }) }), final, rs.photo_id)}
+      onReset={() => void store.update(inputPatch({ exposure: AUTO }))}
     />
   );
 }
@@ -78,34 +103,56 @@ export function KelvinSlider({ store, rs, label = "Kelvin" }: ControlProps & { l
 /** The settings that are Auto or a value from −100 to 100 (`PercentSetting`, `docs/19` section 5). */
 export type PercentField = "contrast" | "saturation" | "highlights" | "shadows" | "black";
 
+/** What these controls act on: the node view's tabs edit the selected corrector, the simple view's Main. */
+interface NodeControlProps extends ControlProps {
+  /** The corrector (Main is 1, the default). On any other corrector the values are plain numbers: no Auto, the detent and Reset at 0 (`docs/23` §7.5). */
+  node?: number;
+}
+
 /**
- * Contrast, Saturation, Highlights, Shadows or Black: −100 to 100, Auto or a value (`docs/19` section 10). They behave like the
+ * Contrast, Saturation, Highlights, Shadows or Black: −100 to 100, Auto or a value (`docs/19` section 10). On **Main** they behave like the
  * Exposure slider: the detent and Reset are at the photo's Auto value (0, or Apple Auto's answer, `AutoEstimates.contrast`, …), a
  * value equal to it is sent as Auto (`manualOrAuto`) and any other value as Manual, and Reset sends Auto, not a manual copy of the
- * Auto value.
+ * Auto value. On any **other corrector** Auto belongs to Main (`docs/23` §3.2): the value is a plain number, the detent and Reset are at 0
+ * and a manual value is always what is sent.
  */
-export function PercentSlider({ store, rs, field, label }: ControlProps & { field: PercentField; label: string }) {
-  const auto = rs.estimates[field];
+export function PercentSlider({ store, rs, field, label, node = MAIN_ID }: NodeControlProps & { field: PercentField; label: string }) {
+  if (node !== MAIN_ID) {
+    const send = (value: number, final: boolean): void =>
+      void store.update(patchOf(node, { grade: { [field]: { kind: "manual", value } } }), final, rs.photo_id);
+    return (
+      <Slider
+        label={label}
+        value={resolvedCorrector(rs.values, node)?.grade[field] ?? 0}
+        min={-100}
+        max={100}
+        defaultValue={0}
+        format={formats.signed}
+        onChange={send}
+      />
+    );
+  }
+  const auto = rs.estimates.main[field];
   return (
     <Slider
       label={label}
-      value={rs.values[field]}
+      value={rs.values.main.grade[field]}
       min={-100}
       max={100}
       defaultValue={auto}
       format={formats.signed}
-      onChange={(value, final) => void store.update({ [field]: manualOrAuto({ value }, { value: auto }) }, final, rs.photo_id)}
-      onReset={() => void store.update({ [field]: AUTO }, true, rs.photo_id)}
+      onChange={(value, final) => void store.update(mainGradePatch({ [field]: manualOrAuto({ value }, { value: auto }) }), final, rs.photo_id)}
+      onReset={() => void store.update(mainGradePatch({ [field]: AUTO }), true, rs.photo_id)}
     />
   );
 }
 
 /** Contrast (Light › Exposure and Look › Tone): Auto or −100…100, the detent at the Auto value. */
-export function ContrastSlider({ store, rs }: ControlProps) {
-  return <PercentSlider store={store} rs={rs} field="contrast" label="Contrast" />;
+export function ContrastSlider({ store, rs, node }: NodeControlProps) {
+  return <PercentSlider store={store} rs={rs} field="contrast" label="Contrast" node={node} />;
 }
 
 /** Saturation (Colour › Colour balance and Look › Tone): Auto or −100…100, the detent at the Auto value. It keeps the luminance (`docs/02` C9). */
-export function SaturationSlider({ store, rs }: ControlProps) {
-  return <PercentSlider store={store} rs={rs} field="saturation" label="Saturation" />;
+export function SaturationSlider({ store, rs, node }: NodeControlProps) {
+  return <PercentSlider store={store} rs={rs} field="saturation" label="Saturation" node={node} />;
 }

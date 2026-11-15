@@ -54,7 +54,9 @@ fn centre(frame: &RenderedFrame) -> [f64; 3] {
 }
 
 fn manual_ev(src: &PhotoSource, ev: f64) -> PhotoSource {
-    edit(src, |s| s.exposure = AutoOr::Manual(ExposureValue { ev }))
+    edit(src, |s| {
+        s.input_mut().exposure = AutoOr::Manual(ExposureValue { ev })
+    })
 }
 
 /// The balanced camera value of a neutral field of luminance `level` under `white` (green = 1):
@@ -122,7 +124,8 @@ fn the_exposed_signal_of_a_neutral_field_is_two_to_the_ev_times_the_balanced_val
 /// The highlight range (`rolloff.highlights`, `docs/02` C7) on a neutral ramp whose top third clips on
 /// the sensor, at a manual EV of +1 (the clip is then `log2(2 / 0.18)` = 3.47 stops over grey, about
 /// where a Sony photo at Auto has it): 0 against 1 moves the clipped highlights a long way, 0.5 lands
-/// between them, and every pixel under the knee (one stop below the clip) is the same bit for bit. The
+/// between them, and every pixel under the knee (two stops below the clip since the gentler range of
+/// 2026-10-30; it was one) is the same bit for bit. The
 /// DNG's pixels carry it: at 1 the clip lands on the ALEXA's EI 800 clip, `HIGHLIGHT_CAP_STOPS` over
 /// grey, and nothing goes past it.
 #[test]
@@ -133,14 +136,16 @@ fn the_highlight_range_moves_the_clipped_highlights_and_nothing_under_the_knee()
     let white = light(PROFILE, 5500.0);
     // `Layout::Ramp`: luminance from 0.1 to 1 of the level along x. The balanced neutral is
     // `0.9 * lum / max(white)` and clips at 1, so with a level of 1.6 the clip is at t = 0.66 and the
-    // knee (half the clip) at t = 0.27.
+    // knee (a quarter of the clip, two stops under it) at t = 0.08.
     let level = 1.6;
     let scene = Scene::new(640, 48, white, Layout::Ramp, level);
     let d = Developed::new(&scene, MODEL);
     let r = Renderer::neutral_only().expect("render thread");
-    let base = edit(&manual_ev(&d.source(), 1.0), |s| s.output_sharpening = 0.0);
+    let base = edit(&manual_ev(&d.source(), 1.0), |s| {
+        s.output_mut().output_sharpening = 0.0
+    });
     let render = |highlights: f64, target: FullTarget| {
-        let src = edit(&base, |s| s.rolloff.highlights = highlights);
+        let src = edit(&base, |s| s.input_mut().rolloff.highlights = highlights);
         r.render_full(&src, &FullRequest { target }, &CancelToken::new())
             .expect("render")
     };
@@ -150,7 +155,7 @@ fn the_highlight_range_moves_the_clipped_highlights_and_nothing_under_the_knee()
         0.9 * level * (0.1 + 0.9 * t) / peak
     };
     // The mean of a band of columns, per channel; and the columns under the knee with a margin
-    // (balanced under 0.45, 0.15 stop under the knee, for the demosaic's reach across the ramp).
+    // (balanced under 0.225, 0.15 stop under the knee at 0.25, for the demosaic's reach across the ramp).
     let band = |img: &ym_core::pipeline::FullImage, x0: usize, x1: usize| {
         let mut sum = [0.0f64; 3];
         for y in 0..img.height {
@@ -170,8 +175,8 @@ fn the_highlight_range_moves_the_clipped_highlights_and_nothing_under_the_knee()
         render(1.0, display),
     );
     let w = lo.width;
-    let under = (0..w).take_while(|&x| balanced_at(x, w) < 0.45).count();
-    assert!(under > w / 5, "{under} columns under the knee");
+    let under = (0..w).take_while(|&x| balanced_at(x, w) < 0.225).count();
+    assert!(under > w / 20, "{under} columns under the knee");
     for img in [&mid, &hi] {
         for y in 0..img.height {
             let row = (y * w) * 3;
@@ -183,7 +188,7 @@ fn the_highlight_range_moves_the_clipped_highlights_and_nothing_under_the_knee()
         }
     }
     // The clipped band: brighter with each step of the range (measured: about 0.809, 0.985 and 0.992;
-    // ACES 2 compresses the last step, sRGB codes 232, 253 and 254).
+    // the cine rendering compresses the last step, sRGB codes 232, 253 and 254 under the former display transform).
     let clipped = (0..w)
         .find(|&x| balanced_at(x, w) > 1.1)
         .expect("a clipped band");
@@ -370,7 +375,7 @@ fn exif_orientation_and_the_users_turn_put_every_patch_where_it_belongs() {
                 .write_to(&dir.path().join("DSC00001.ARW"), &scene.mosaic())
                 .expect("write");
             let d = Developed::open(dir);
-            let rot = edit(&d.source(), |s| s.orientation = orientation);
+            let rot = edit(&d.source(), |s| s.input_mut().orientation = orientation);
             let swapped = (5..=8).contains(&exif) != (turns % 2 == 1);
             let (cw, ch) = if swapped {
                 (200.0, 300.0)
@@ -414,10 +419,11 @@ fn straightening_rotates_about_the_centre_and_leaves_the_corners_empty() {
     let tilted = render(
         &r,
         &edit(&src, |s| {
-            s.crop = Some(Crop {
+            s.input_mut().crop = Some(Crop {
                 rect: NormRect::FULL,
                 angle_deg: 12.0,
                 aspect: CropAspect::Original,
+                auto: false,
             })
         }),
         &state(300.0, 200.0),
@@ -453,7 +459,7 @@ fn a_crop_renders_exactly_the_pixels_of_that_part_of_the_photo_at_100_percent() 
     let src = d.source();
     // A crop of the middle half of the photo, viewed in a cell the size of the crop.
     let cropped = edit(&src, |s| {
-        s.crop = Some(Crop {
+        s.input_mut().crop = Some(Crop {
             rect: NormRect {
                 x: 0.25,
                 y: 0.25,
@@ -462,6 +468,7 @@ fn a_crop_renders_exactly_the_pixels_of_that_part_of_the_photo_at_100_percent() 
             },
             angle_deg: 0.0,
             aspect: CropAspect::Free,
+            auto: false,
         })
     });
     assert_eq!(
@@ -573,7 +580,9 @@ fn vignetting_is_corrected_when_the_switch_is_on_and_only_then() {
         corner / mid
     };
     let on = ratio(&src);
-    let off = ratio(&edit(&src, |s| s.decode.lens_corrections = false));
+    let off = ratio(&edit(&src, |s| {
+        s.input_mut().decode.lens_corrections = false
+    }));
     assert!((on - 1.0).abs() < 0.02, "corrected corner/centre {on:.3}");
     assert!(off < 0.975, "uncorrected corner/centre {off:.3}");
     // The 100 % tiles agree with the half-resolution image on the correction too.
@@ -607,7 +616,7 @@ fn distortion_tables_crop_the_image_and_the_switch_restores_it() {
         (w as f64 / h as f64 - 4.0 / 3.0).abs() < 0.01,
         "aspect kept: {w}x{h}"
     );
-    let off = edit(&src, |s| s.decode.lens_corrections = false);
+    let off = edit(&src, |s| s.input_mut().decode.lens_corrections = false);
     assert_eq!(
         r.final_size(&off, &CancelToken::new()).expect("size"),
         (800, 600)
@@ -782,7 +791,7 @@ fn an_exported_full_render_matches_the_viewport_pixel_for_pixel_at_100_percent()
     let r = Renderer::neutral_only().expect("render thread");
     // With the output sharpening off: the same camera pixels through the same chain. (With it on,
     // the viewport shows the sharpened picture the export writes; `tests/render_sharpen.rs`.)
-    let src = edit(&d.source(), |s| s.output_sharpening = 0.0);
+    let src = edit(&d.source(), |s| s.output_mut().output_sharpening = 0.0);
     let full = r
         .render_full(
             &src,

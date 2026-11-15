@@ -1,9 +1,10 @@
 //! `ym doctor`: the diagnostics that go into a bug report (`docs/10-cli.md`).
 //!
 //! The report says what it includes and nothing else: the version, the GPU, the render path,
-//! whether Apple Auto is available (and which model answers, `docs/19` section 8), the model weights
-//! with their hashes, the camera profiles, how many looks are imported and the folders Yellowmoon
-//! uses. No photo, file name, location or look name is in it.
+//! whether Apple Intelligence, Claude Code and Antigravity are available (which model answers and,
+//! for the two programs, where they were found, `docs/19` section 8, `docs/22` section 13.3), the
+//! model weights with their hashes, the camera profiles, how many looks are imported and the folders
+//! Yellowmoon uses. No photo, file name, location or look name is in it.
 
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -11,19 +12,25 @@ use std::sync::Arc;
 
 use serde_json::{Value, json};
 use ym_core::app::gpu::{
-    CpuReason, GpuOutcome, GpuPolicy, GpuStages, PolicyChoice, PolicySource, open_gpu,
-    probe_adapter,
+    CpuReason, GpuOutcome, GpuPolicy, GpuStages, PolicyChoice, PolicySource, probe_adapter,
 };
-use ym_core::apple_auto::{
-    Activity, AppleAutoMode, AppleAutoStatus, Availability, DEFAULT_INSTRUCTIONS,
-    INSTRUCTIONS_MAX_CHARS, InstructionsId, PROMPT_VERSION, TABLE_VERSION, effective_instructions,
+use ym_core::app::metal::{METAL_WORKING_SET_FACTOR, MetalDevice, MetalLimit, metal_limit_of};
+use ym_core::apple_auto::{PROMPT_VERSION, TABLE_VERSION, UnavailableReason};
+use ym_core::auto_provider::{
+    AGY_MIN_VERSION, AdvisorDetails, AutoChoice, AutoProvider, AutoStatus, CLAUDE_DEFAULT_MODEL,
+    CLAUDE_MIN_VERSION, IMAGE_ENCODING, ProviderState, ProviderStatus, SCHEMA_VERSION, StatusInput,
 };
 use ym_core::data_dir::find_data_dir;
 use ym_core::looks::{LookGroupInfo, LookService};
 use ym_core::pipeline::NeuralStatus;
+use ym_core::pipeline::{DepthModel, ObjectModel};
 use ym_core::preferences::PreferencesStore;
 use ym_core::scheduler::MemoryBudget;
+use ym_core::settings::{
+    MaskKind, MaskSupport, MaskUnavailable, mask_kinds_with, mask_unavailable_with,
+};
 use ym_core::version::{PIPELINE_VERSION, app_version};
+use ym_core::vision::VisionMasks;
 use ym_gpu::device::GpuInfo;
 use ym_profiles::registry::ProfileStore;
 
@@ -35,7 +42,7 @@ use crate::exit::{self, Failure};
 use crate::text::{json_line, line_text, lossy, path_text};
 
 /// The sentence at the top of the report: what it includes, and what it leaves out.
-pub const INCLUDES: &str = "This report lists the version, the GPU, the render path, whether Apple Auto is available, the model weights and their hashes, the camera profiles, how many looks are imported, and the folders Yellowmoon uses. It does not include photos, file names, locations or look names.";
+pub const INCLUDES: &str = "This report lists the version, the GPU, the render path, whether Apple Intelligence, Claude Code and Antigravity are available (with the places where Claude Code and Antigravity were found), the model weights and their hashes, the camera profiles, how many looks are imported, and the folders Yellowmoon uses. It does not include photos, file names, locations or look names.";
 
 /// A model file shipped in `data/models/`.
 struct ModelFile {
@@ -58,6 +65,20 @@ struct GpuPlan {
     budget: MemoryBudget,
     /// The adapter shares the machine's RAM.
     shared_memory: bool,
+    /// The RAM `YELLOWMOON_RAM_GB` says, when it is set to a number the budget rule accepts.
+    ram_override: Option<u64>,
+    /// The Metal working-set limit of the adapter (`None`: no adapter opened, so nothing to look for) and the
+    /// Metal devices it was looked up in. The budget above is already capped by it.
+    metal: Option<MetalLimit>,
+    metal_devices: Vec<MetalDevice>,
+}
+
+/// The Auto providers as the report says them: the status the app's Preferences would show, and what each
+/// advisor said besides (how the program is signed in).
+struct AutoReport {
+    status: AutoStatus,
+    /// By [`AutoProvider::slot`].
+    details: [Option<AdvisorDetails>; 3],
 }
 
 /// Everything the report says.
@@ -65,14 +86,18 @@ struct Report {
     gpu: Result<GpuInfo, String>,
     plan: GpuPlan,
     neural: NeuralStatus,
-    apple_auto: AppleAutoStatus,
+    auto: AutoReport,
     weights: Vec<ModelFile>,
+    /// What this machine can make (`mask_kinds()`): whether the SAM weights are there and load (checked against their
+    /// checksum), and what this Mac's Vision framework said when each request was tried on a 64 x 64 picture.
+    masks: MaskSupport,
     illuminant_models: Vec<ModelFile>,
     profiles: Vec<(String, String, String)>,
+    /// The film data (`docs/24`): profiles and version, or why not.
+    film: Result<ym_core::film::FilmDataStatus, String>,
     looks_built_in: usize,
     looks_imported: usize,
     looks_missing: usize,
-    display_luts: usize,
     preferences_path: PathBuf,
     preferences_exist: bool,
     preference_warnings: usize,
@@ -137,14 +162,28 @@ fn run_bench(path: &Path, args: &DoctorArgs, console: &mut Console) -> u8 {
     }
 }
 
-fn hash_models(dir: &Path, skip: &[&str]) -> Vec<ModelFile> {
+/// The Object model's weights as the list of weights names them (`data/models/`, `ym_ml::sam2::WEIGHTS_FILE`).
+const OBJECT_WEIGHTS_NAME: &str = "sam2/sam2.1_hiera_small.f16.safetensors";
+
+/// The Depth model's weights as the list of weights names them (`data/models/`, `ym_ml::depth::WEIGHTS_FILE`).
+const DEPTH_WEIGHTS_NAME: &str = "depth/depth_anything_v2_vits.f16.safetensors";
+
+/// The weights under `dir` with their hashes. `known` are files whose hashes the report has already made (their paths
+/// relative to `dir` and their SHA-256): they are not read a second time.
+fn hash_models(dir: &Path, skip: &[&str], known: &[(&str, &str)]) -> Vec<ModelFile> {
     let mut files = Vec::new();
-    collect_models(dir, dir, skip, &mut files);
+    collect_models(dir, dir, skip, known, &mut files);
     files.sort_by(|a, b| a.name.cmp(&b.name));
     files
 }
 
-fn collect_models(root: &Path, dir: &Path, skip: &[&str], out: &mut Vec<ModelFile>) {
+fn collect_models(
+    root: &Path,
+    dir: &Path,
+    skip: &[&str],
+    known: &[(&str, &str)],
+    out: &mut Vec<ModelFile>,
+) {
     let Ok(read) = std::fs::read_dir(dir) else {
         return;
     };
@@ -155,23 +194,43 @@ fn collect_models(root: &Path, dir: &Path, skip: &[&str], out: &mut Vec<ModelFil
             continue;
         }
         if path.is_dir() {
-            collect_models(root, &path, skip, out);
+            collect_models(root, &path, skip, known, out);
         } else if path
             .extension()
             .is_some_and(|e| matches!(e.to_str(), Some("json" | "safetensors" | "onnx" | "bin")))
-            && let Ok(sha256) = ym_looks::manifest::hash_file(&path)
         {
             let relative = path
                 .strip_prefix(root)
                 .unwrap_or(&path)
                 .to_string_lossy()
                 .replace('\\', "/");
-            out.push(ModelFile {
-                name: relative,
-                sha256,
-            });
+            let sha256 = match known.iter().find(|(name, _)| *name == relative) {
+                Some((_, sha256)) => Some((*sha256).to_owned()),
+                None => ym_looks::manifest::hash_file(&path).ok(),
+            };
+            if let Some(sha256) = sha256 {
+                out.push(ModelFile {
+                    name: relative,
+                    sha256,
+                });
+            }
         }
     }
+}
+
+/// The SHA-256 of the Object model's weights when they are in the data folder and load: the file is read once and
+/// checked against its line of `SHA256SUMS`, so a truncated or changed file gives `None` here (`weights_missing`) as it
+/// does for an export. The same hash goes in the report's list of weights, so the 77 MB file is read once.
+fn object_model_sha256(data_folder: &Path) -> Option<String> {
+    let model = ObjectModel::probe(data_folder)?;
+    let sam = model.sam().ok()?;
+    Some(sam.sha256().to_owned())
+}
+
+/// The SHA-256 of the Depth model's weights when they are in the data folder and load (the same check as the Object
+/// model's: a truncated or changed file gives `None`, `weights_missing`).
+fn depth_model_sha256(data_folder: &Path) -> Option<String> {
+    DepthModel::probe(data_folder)?.checked_sha256()
 }
 
 fn build() -> Result<Report, Failure> {
@@ -180,7 +239,16 @@ fn build() -> Result<Report, Failure> {
     let models = data_folder.join("models");
     // The illuminant models of `models/illum/` are the shipped estimator parameters; everything
     // else under `models/` (the demosaic network, `jdd/`) is a weight file.
-    let all = hash_models(&models, &["metrics"]);
+    let object_sha256 = object_model_sha256(&data_folder);
+    let depth_sha256 = depth_model_sha256(&data_folder);
+    let known: Vec<(&str, &str)> = [
+        (OBJECT_WEIGHTS_NAME, object_sha256.as_deref()),
+        (DEPTH_WEIGHTS_NAME, depth_sha256.as_deref()),
+    ]
+    .into_iter()
+    .filter_map(|(name, sha256)| Some((name, sha256?)))
+    .collect();
+    let all = hash_models(&models, &["metrics"], &known);
     let (illuminant_models, weights): (Vec<_>, Vec<_>) =
         all.into_iter().partition(|m| m.name.starts_with("illum/"));
 
@@ -208,10 +276,18 @@ fn build() -> Result<Report, Failure> {
         gpu,
         plan,
         neural: NeuralStatus::probe(Some(&data_folder)),
-        apple_auto: apple_auto_status(prefs.get().apple_auto, &prefs.get().apple_auto_instructions),
+        auto: auto_report(&prefs.get()),
         weights,
+        masks: MaskSupport::new(
+            object_sha256.is_some(),
+            // The probe, once: Vision answers for Subject and People, or the reason it cannot (not a Mac, macOS too old,
+            // a Mac that cannot run the requests).
+            VisionMasks::new(ym_apple::system_vision()).support(),
+        )
+        .with_depth(depth_sha256.is_some()),
         illuminant_models,
         profiles,
+        film: ym_core::film::data_status(&data_folder).map_err(|e| e.to_string()),
         looks_built_in: looks
             .iter()
             .filter(|l| matches!(l.group, LookGroupInfo::BuiltIn))
@@ -221,7 +297,6 @@ fn build() -> Result<Report, Failure> {
             .filter(|l| !matches!(l.group, LookGroupInfo::BuiltIn))
             .count(),
         looks_missing: looks.iter().filter(|l| l.missing).count(),
-        display_luts: service.display_luts().len(),
         preferences_exist: preferences_path.exists(),
         preferences_path,
         preference_warnings,
@@ -238,7 +313,7 @@ fn build() -> Result<Report, Failure> {
 /// leaves alone, and the one on a machine where the setting is `off`, are still listed.
 fn gpu_report() -> (Result<GpuInfo, String>, GpuPlan) {
     let choice = GpuPolicy::from_environment(None);
-    let slot = open_gpu(choice.policy, MemoryBudget::detect());
+    let slot = ym_apple::gpu_opener(choice.policy, MemoryBudget::detect()).open();
     let gpu = match (slot.adapter(), slot.missing_device_reason()) {
         (Some(info), _) => Ok(info.clone()),
         (None, Some(reason)) => Err(reason.to_owned()),
@@ -254,83 +329,220 @@ fn gpu_report() -> (Result<GpuInfo, String>, GpuPlan) {
             Some(format!("no adapter opened ({reason})"))
         }
     };
+    // The same list the opener capped the budget with (`ym_apple::gpu_opener`), looked up for the adapter
+    // reported. With no adapter there is nothing to look up, and the list is not read.
+    let metal_devices = if gpu.is_ok() {
+        ym_apple::system_metal_devices().devices()
+    } else {
+        Vec::new()
+    };
+    let metal = gpu
+        .as_ref()
+        .ok()
+        .map(|info| metal_limit_of(info, &metal_devices));
     let plan = GpuPlan {
         uses_gpu: slot.is_using(),
         reason,
         stages: slot.stages(),
         budget: slot.budget(),
         shared_memory: slot.shares_memory(),
+        ram_override: ym_core::scheduler::ram_override(),
+        metal,
+        metal_devices,
         choice,
     };
     (gpu, plan)
 }
 
-/// Apple Auto on this computer, as `Core::apple_auto_status` gives it to the app's Preferences
-/// (`docs/19` sections 1, 2 and 8), without opening a session: the advisor the app and `ym` use
-/// (`ym_apple::system_advisor`, read now), the `apple_auto` preference and the person's own
-/// instructions (`apple_auto_instructions`, `""` for the default).
-fn apple_auto_status(preference: bool, own_instructions: &str) -> AppleAutoStatus {
-    let availability = ym_apple::system_advisor().availability();
-    let active = Activity::decide(
-        true,
-        AppleAutoMode::FromPreference,
-        preference,
-        Some(&availability),
-    )
-    .is_active();
-    let text = effective_instructions(own_instructions);
-    let (available, reason, info) = match availability {
-        Availability::Available(info) => (true, None, Some(info.with_instructions(text))),
-        Availability::Unavailable(reason) => (false, Some(reason), None),
-    };
-    AppleAutoStatus {
-        available,
-        reason,
-        info,
-        preference,
-        mode: AppleAutoMode::FromPreference,
-        active,
-        prompt: PROMPT_VERSION,
-        table: TABLE_VERSION,
-        instructions: InstructionsId::of(text),
-        own_instructions: own_instructions.to_owned(),
-        default_instructions: DEFAULT_INSTRUCTIONS.to_owned(),
-        instructions_max_chars: INSTRUCTIONS_MAX_CHARS,
+/// The Auto providers on this computer, as `Core::auto_status` gives them to the app's Preferences
+/// (`docs/22` sections 11 and 13.3), without opening a session: the advisors the app and `ym` use
+/// (`ym_apple::system_advisor`, `ym_agents::system_advisors`), every one asked to read its
+/// availability now and waited for (up to 30 s: a program that hangs ends at its own probe limit), the
+/// saved choice and consent, and the person's own instructions (`""` for the default).
+fn auto_report(prefs: &ym_core::preferences::Preferences) -> AutoReport {
+    let advisors = crate::runtime::system_provider_advisors();
+    crate::runtime::register_advisors(&advisors);
+    advisors.refresh(None);
+    advisors.settle(crate::runtime::AUTO_SETTLE);
+    let details: [Option<AdvisorDetails>; 3] = std::array::from_fn(|slot| {
+        AutoProvider::from_slot(slot)
+            .and_then(|p| advisors.get(p))
+            .map(|a| a.details())
+    });
+    let readings = std::array::from_fn(|slot| {
+        let advisor = AutoProvider::from_slot(slot).and_then(|p| advisors.get(p))?;
+        Some((advisor.availability(), advisor.details()))
+    });
+    let status = AutoStatus::build(&StatusInput {
+        has_advisors: true,
+        readings,
+        preference: prefs.auto_provider,
+        choice: AutoChoice::FromPreference,
+        consent: prefs.auto_consent,
+        own_instructions: &prefs.apple_auto_instructions,
+    });
+    AutoReport { status, details }
+}
+
+/// The model a provider is asked for until a request has answered: the alias or slug (`docs/22`
+/// section 13.3). A developer's variable replaces the default (`docs/22` D18).
+fn asked_model(provider: AutoProvider) -> Option<String> {
+    let var = |name: &str| std::env::var(name).ok().filter(|v| !v.trim().is_empty());
+    match provider {
+        AutoProvider::Claude => {
+            Some(var("YELLOWMOON_CLAUDE_MODEL").unwrap_or_else(|| CLAUDE_DEFAULT_MODEL.to_owned()))
+        }
+        AutoProvider::Agy => {
+            Some(var("YELLOWMOON_AGY_MODEL").unwrap_or_else(|| "default".to_owned()))
+        }
+        AutoProvider::Yellowmoon | AutoProvider::Apple => None,
     }
 }
 
-/// The `apple_auto` object of `doctor --json`: `{ "available", "reason", "model", "os",
-/// "preference", "prompt", "table", "instructions", "instructions_sha256" }` (`docs/19` section 8).
-fn apple_auto_value(s: &AppleAutoStatus) -> Value {
+/// The `auto` object of `doctor --json` (`docs/22` section 13.3): the saved choice, the consent, the
+/// provider in effect, the instructions' digest and each provider. Keys are sorted. `path` is the
+/// person's own and appears here only, never in a report of a photo.
+fn auto_value(r: &AutoReport) -> Value {
+    let s = &r.status;
+    let mut providers = serde_json::Map::new();
+    for status in &s.providers {
+        let reason = status.reason.and_then(|r| serde_json::to_value(r).ok());
+        let mut entry = json!({ "state": status.state, "reason": reason });
+        if let (Value::Object(map), Some(slot)) = (&mut entry, status.provider.slot()) {
+            let details = r.details[slot].as_ref();
+            let info = status.info.as_ref();
+            match status.provider {
+                AutoProvider::Apple => {
+                    map.insert("model".to_owned(), json!(info.map(|i| i.model.as_str())));
+                    map.insert("os".to_owned(), json!(info.map(|i| i.os.as_str())));
+                    map.insert("prompt".to_owned(), json!(PROMPT_VERSION));
+                }
+                _ => {
+                    map.insert("path".to_owned(), json!(status.path.as_deref().map(lossy)));
+                    map.insert("tool_version".to_owned(), json!(status.tool_version));
+                    map.insert(
+                        "model".to_owned(),
+                        json!(
+                            info.map(|i| i.model.clone())
+                                .or_else(|| asked_model(status.provider))
+                        ),
+                    );
+                    let api = info
+                        .and_then(|i| i.tool.as_ref())
+                        .and_then(|t| t.api.clone())
+                        .or_else(|| details.and_then(|d| d.api.clone()));
+                    let auth = info
+                        .and_then(|i| i.tool.as_ref())
+                        .and_then(|t| t.auth.clone())
+                        .or_else(|| details.and_then(|d| d.auth.clone()));
+                    map.insert("api".to_owned(), json!(api));
+                    map.insert("auth".to_owned(), json!(auth));
+                    map.insert("prompt".to_owned(), json!(status.provider.prompt_version()));
+                    map.insert("schema".to_owned(), json!(SCHEMA_VERSION));
+                    map.insert("image".to_owned(), json!(IMAGE_ENCODING));
+                }
+            }
+        }
+        providers.insert(status.provider.id().to_owned(), entry);
+    }
     json!({
-        "available": s.available,
-        "reason": s.reason.and_then(|r| serde_json::to_value(r).ok()),
-        "model": s.info.as_ref().map(|i| i.model.as_str()),
-        "os": s.info.as_ref().map(|i| i.os.as_str()),
-        "preference": s.preference,
-        "prompt": s.prompt,
+        "preference": s.preference.id(),
+        "effective": s.effective.id(),
+        "consent": { "claude": s.consent.claude, "agy": s.consent.agy },
+        "instructions": s.instructions.instructions,
+        "instructions_sha256": s.instructions.instructions_sha256,
         "table": s.table,
+        "providers": providers,
+    })
+}
+
+/// The `apple_auto` object of `doctor --json`, **kept one version, deprecated**, computed for the Apple
+/// provider only (`docs/19` section 8, `docs/22` section 13.3): `{ "available", "reason", "model",
+/// "os", "preference", "prompt", "table", "instructions", "instructions_sha256" }`, where
+/// `preference` says whether the saved choice is Apple Intelligence.
+fn apple_auto_value(s: &AutoStatus) -> Value {
+    let apple = s.provider(AutoProvider::Apple);
+    let info = apple.and_then(|a| a.info.as_ref());
+    json!({
+        "available": apple.is_some_and(|a| a.state == ProviderState::Available),
+        "reason": apple.and_then(|a| a.reason).and_then(|r| serde_json::to_value(r).ok()),
+        "model": info.map(|i| i.model.as_str()),
+        "os": info.map(|i| i.os.as_str()),
+        "preference": s.preference == AutoProvider::Apple,
+        "prompt": PROMPT_VERSION,
+        "table": TABLE_VERSION,
         "instructions": s.instructions.instructions,
         "instructions_sha256": s.instructions.instructions_sha256,
     })
 }
 
-/// The `Apple Auto` row: `available · Apple Intelligence · AFM 3 Core · macOS 27.0.1 (27A404) ·
-/// prompt 3 · table 2` (with `· edited instructions (<digest>)` when the person wrote their own, and
-/// `· turned off in Preferences` when the preference is off), or `not available (this is not a
-/// Mac)`.
-fn apple_auto_text(s: &AppleAutoStatus) -> String {
-    match (&s.info, s.reason) {
-        (Some(info), _) if s.available => {
-            let mut text = format!("available · {}", line_text(&info.version_string()));
-            if !s.preference {
-                text.push_str(" · turned off in Preferences");
-            }
-            text
-        }
-        (_, Some(reason)) => format!("not available ({})", reason.words()),
-        _ => "not available".to_owned(),
+/// The `Auto grading` row: `Claude Code (saved in Preferences)`, or `Default Auto`, with
+/// ` · not agreed to yet; naming it with --auto-provider is enough for ym` when it is a program whose
+/// consent is not saved.
+fn auto_grading_text(s: &AutoStatus) -> String {
+    let mut text = if s.preference == AutoProvider::Yellowmoon {
+        s.preference.name().to_owned()
+    } else {
+        format!("{} (saved in Preferences)", s.preference.name())
+    };
+    if s.preference.is_cloud() && !s.consent.get(s.preference) {
+        text.push_str(" · not agreed to yet; naming it with --auto-provider is enough for ym");
     }
+    text
+}
+
+/// The row of one provider (`docs/22` section 13.3): `available · Apple Intelligence · AFM 3 Core ·
+/// macOS 27.0.1 (27A404) · prompt 3 · table 2` (with ` · edited instructions (<digest>)` when the person
+/// wrote their own), `available · Claude Code 2.1.310 · sonnet · prompt 1 · schema 1 · table 2 ·
+/// /Users/me/.local/bin/claude`, `installed but not signed in · 1.4.7 · <path>`, `too old (2.1.100;
+/// 2.1.169 or later is needed) · <path>`, `didn't answer its check · <path>`, `found only as a script
+/// that Yellowmoon can't run safely`, `not installed`, `still checking`, or for Apple Intelligence `not
+/// available (this is not a Mac)`.
+fn provider_text(p: &ProviderStatus) -> String {
+    let path = p.path.as_deref().map(path_text);
+    let version = p.tool_version.as_deref().map(line_text);
+    let mut parts: Vec<String> = Vec::new();
+    match (p.provider, p.state) {
+        (AutoProvider::Yellowmoon, _) => return "always available".to_owned(),
+        (_, ProviderState::Available) => {
+            if let Some(info) = &p.info {
+                parts.push(format!("available · {}", line_text(&info.version_string())));
+            }
+            parts.extend(path);
+        }
+        (AutoProvider::Apple, _) => {
+            return match p.reason {
+                Some(reason) => format!("not available ({})", reason.words()),
+                None => "not available".to_owned(),
+            };
+        }
+        (_, ProviderState::SignedOut) => {
+            parts.push("installed but not signed in".to_owned());
+            parts.extend(version);
+            parts.extend(path);
+        }
+        (provider, ProviderState::TooOld) => {
+            let min = if provider == AutoProvider::Agy {
+                AGY_MIN_VERSION
+            } else {
+                CLAUDE_MIN_VERSION
+            };
+            let have = version.map_or(String::new(), |v| format!("{v}; "));
+            parts.push(format!("too old ({have}{min} or later is needed)"));
+            parts.extend(path);
+        }
+        (_, ProviderState::NotInstalled) => parts.push("not installed".to_owned()),
+        (_, ProviderState::Checking) => parts.push("still checking".to_owned()),
+        (_, ProviderState::Unavailable) => {
+            if p.reason == Some(UnavailableReason::UnsafeLauncher) {
+                parts.push("found only as a script that Yellowmoon can't run safely".to_owned());
+            } else {
+                parts.push("didn't answer its check".to_owned());
+                parts.extend(path);
+            }
+        }
+    }
+    parts.join(" · ")
 }
 
 fn source_word(source: PolicySource) -> &'static str {
@@ -377,6 +589,86 @@ fn model_values(files: &[ModelFile]) -> Value {
     )
 }
 
+/// The kinds of mask this machine can make and why it cannot make the others (`docs/10` *doctor*, `docs/23`
+/// section 9): `mask_kinds()` as the app's Add mask menu reads it, and the reasons by their wire names.
+fn masks_value(masks: MaskSupport) -> Value {
+    let unavailable: serde_json::Map<String, Value> = mask_unavailable_with(masks)
+        .into_iter()
+        .map(|(kind, why)| (kind.name().to_owned(), Value::String(why.wire().to_owned())))
+        .collect();
+    json!({
+        "kinds": mask_kinds_with(masks).into_iter().map(|k| k.name()).collect::<Vec<_>>(),
+        "unavailable": unavailable,
+    })
+}
+
+/// Names joined as a sentence does: "A", "A and B", "A, B and C".
+fn joined(names: &[&str]) -> String {
+    match names {
+        [] => String::new(),
+        [one] => (*one).to_owned(),
+        [init @ .., last] => format!("{} and {last}", init.join(", ")),
+    }
+}
+
+/// The `Masks` row: the kinds this machine can make in the order of the Add mask menu, and, for the others, the
+/// reason, kinds that share one named together: `Object, Subject, People, Background, Depth, Linear, Radial, Brush, Colour
+/// range, Brightness range` on a Mac that supports them all (with both weights); on Linux `Object, Background, Linear, … · not available:
+/// Subject and People (this is not a Mac that supports them)`; without the SAM weights `Subject, People, Background, … ·
+/// not available: Object (the SAM weights are missing)`; the depth weights are another file with a reason of their own: `… ·
+/// not available: Depth (the depth weights are missing)`.
+fn masks_text(masks: MaskSupport) -> String {
+    let kinds: Vec<&str> = mask_kinds_with(masks)
+        .into_iter()
+        .map(MaskKind::label)
+        .collect();
+    let mut text = kinds.join(", ");
+    let unavailable = mask_unavailable_with(masks);
+    if unavailable.is_empty() {
+        return text;
+    }
+    // Groups of kinds by reason, in the order each reason first appears.
+    let mut groups: Vec<(MaskUnavailable, Vec<&str>)> = Vec::new();
+    for (kind, why) in unavailable {
+        match groups.iter_mut().find(|(w, _)| *w == why) {
+            Some((_, names)) => names.push(kind.label()),
+            None => groups.push((why, vec![kind.label()])),
+        }
+    }
+    let parts: Vec<String> = groups
+        .iter()
+        .map(|(why, names)| format!("{} ({})", joined(names), why.doctor_text(names.len() > 1)))
+        .collect();
+    text.push_str(" · not available: ");
+    text.push_str(&parts.join(", "));
+    text
+}
+
+/// The `Film` row: `28 profiles, data version 0.3.2`, with the problem if the data has one.
+fn film_text(film: &Result<ym_core::film::FilmDataStatus, String>) -> String {
+    match film {
+        Ok(f) => {
+            let mut text = format!("{} profiles, data version {}", f.profiles, f.data_version);
+            if let Some(problem) = &f.problem {
+                text.push_str(&format!(" · {problem}"));
+            }
+            text
+        }
+        Err(why) => format!("missing ({why})"),
+    }
+}
+
+fn film_value(film: &Result<ym_core::film::FilmDataStatus, String>) -> Value {
+    match film {
+        Ok(f) => json!({
+            "profiles": f.profiles,
+            "data_version": f.data_version,
+            "problem": f.problem,
+        }),
+        Err(why) => json!({ "profiles": 0, "data_version": null, "problem": why }),
+    }
+}
+
 fn to_json(r: &Report) -> Value {
     json!({
         "includes": INCLUDES,
@@ -399,6 +691,17 @@ fn to_json(r: &Report) -> Value {
             "cpu_bytes": r.plan.budget.cpu_bytes,
             "gpu_bytes": r.plan.budget.gpu_bytes,
             "shared_memory": r.plan.shared_memory,
+            "ram_override_bytes": r.plan.ram_override,
+            "metal_limit_bytes": r.plan.metal.as_ref().and_then(MetalLimit::bytes),
+            "metal_limit_reason": metal_reason(r.plan.metal.as_ref()),
+            "metal_factor": METAL_WORKING_SET_FACTOR,
+            "metal_devices": r.plan.metal_devices.iter().map(|d| json!({
+                "name": d.name,
+                "recommended_max_working_set_bytes": d.recommended_max_working_set_bytes,
+                "has_unified_memory": d.has_unified_memory,
+                "is_low_power": d.is_low_power,
+                "is_removable": d.is_removable,
+            })).collect::<Vec<_>>(),
         },
         "render_path": {
             "demosaic": if r.neural.available { "neural" } else { "classical" },
@@ -406,15 +709,17 @@ fn to_json(r: &Report) -> Value {
             "reason": r.neural.reason,
             "device": "cpu",
         },
-        "apple_auto": apple_auto_value(&r.apple_auto),
+        "apple_auto": apple_auto_value(&r.auto.status),
+        "auto": auto_value(&r.auto),
         "model_weights": model_values(&r.weights),
+        "masks": masks_value(r.masks),
         "illuminant_models": model_values(&r.illuminant_models),
+        "film": film_value(&r.film),
         "profiles": r.profiles.iter().map(|(id, version, name)| json!({ "id": id, "version": version, "name": name })).collect::<Vec<_>>(),
         "looks": {
             "built_in": r.looks_built_in,
             "imported": r.looks_imported,
             "missing": r.looks_missing,
-            "display_luts": r.display_luts,
         },
         "preferences": {
             "path": lossy(&r.preferences_path),
@@ -424,6 +729,25 @@ fn to_json(r: &Report) -> Value {
         "looks_folder": lossy(&r.looks_folder),
         "data_folder": lossy(&r.data_folder),
     })
+}
+
+/// Why there is no Metal limit, in a short sentence: `None` when there is one.
+fn metal_reason(limit: Option<&MetalLimit>) -> Option<String> {
+    match limit {
+        Some(limit) => limit.why_none(),
+        None => Some("no GPU adapter opened".to_owned()),
+    }
+}
+
+/// The `GPU Metal limit` row: the limit and the share of it the GPU budget uses, or why there is none.
+fn metal_text(limit: Option<&MetalLimit>) -> String {
+    match limit.and_then(MetalLimit::bytes) {
+        Some(bytes) => format!(
+            "{:.1} GiB (working set; the GPU budget uses {METAL_WORKING_SET_FACTOR} of it)",
+            bytes as f64 / f64::from(1u32 << 30)
+        ),
+        None => format!("none ({})", metal_reason(limit).unwrap_or_default()),
+    }
 }
 
 /// The `GPU policy` row: the setting, where it came from, and what it comes to here.
@@ -496,6 +820,7 @@ fn to_text(r: &Report) -> String {
         }
         Err(reason) => row("GPU", format!("none, CPU fallback ({reason})")),
     }
+    row("GPU Metal limit", metal_text(r.plan.metal.as_ref()));
     row("GPU policy", policy_text(&r.plan));
     row(
         "GPU stages",
@@ -505,6 +830,16 @@ fn to_text(r: &Report) -> String {
             GpuStages::ALL
         ),
     );
+    if let Some(ram) = r.plan.ram_override {
+        row(
+            "RAM",
+            format!(
+                "{} GiB (set by {})",
+                ram as f64 / f64::from(1u32 << 30),
+                ym_core::scheduler::RAM_ENV
+            ),
+        );
+    }
     row(
         "Memory budget",
         format!(
@@ -531,7 +866,17 @@ fn to_text(r: &Report) -> String {
             .to_owned()
         },
     );
-    row("Apple Auto", apple_auto_text(&r.apple_auto));
+    row("Auto grading", auto_grading_text(&r.auto.status));
+    for p in &r.auto.status.providers {
+        if p.provider != AutoProvider::Yellowmoon {
+            let label = if p.provider == AutoProvider::Agy {
+                "Antigravity (agy)"
+            } else {
+                p.provider.name()
+            };
+            row(label, provider_text(p));
+        }
+    }
     if r.weights.is_empty() {
         row("Model weights", "none installed".to_owned());
     } else {
@@ -542,6 +887,8 @@ fn to_text(r: &Report) -> String {
             );
         }
     }
+    row("Masks", masks_text(r.masks));
+    row("Film", film_text(&r.film));
     for (i, m) in r.illuminant_models.iter().enumerate() {
         row(
             if i == 0 { "Illuminant models" } else { "" },
@@ -561,16 +908,14 @@ fn to_text(r: &Report) -> String {
     row(
         "Looks",
         format!(
-            "{} built in, {} imported{}, {} display {}",
+            "{} built in, {} imported{}",
             r.looks_built_in,
             r.looks_imported,
             if r.looks_missing > 0 {
                 format!(" ({} need importing again)", r.looks_missing)
             } else {
                 String::new()
-            },
-            r.display_luts,
-            if r.display_luts == 1 { "LUT" } else { "LUTs" }
+            }
         ),
     );
     row(
@@ -609,58 +954,289 @@ mod tests {
         assert!(INCLUDES.contains("does not include photos, file names, locations"));
     }
 
-    fn status(available: bool, preference: bool, own: &str) -> AppleAutoStatus {
-        let text = effective_instructions(own);
-        let info = ym_core::apple_auto::AdvisorInfo::new("AFM 3 Core", "27.0.1 (27A404)")
-            .with_instructions(text);
-        AppleAutoStatus {
-            available,
-            reason: (!available).then_some(ym_core::apple_auto::UnavailableReason::MacosTooOld),
-            info: available.then_some(info),
-            preference,
-            mode: AppleAutoMode::FromPreference,
-            active: available && preference,
-            prompt: PROMPT_VERSION,
-            table: TABLE_VERSION,
-            instructions: InstructionsId::of(text),
-            own_instructions: own.to_owned(),
-            default_instructions: DEFAULT_INSTRUCTIONS.to_owned(),
-            instructions_max_chars: INSTRUCTIONS_MAX_CHARS,
-        }
+    /// The Masks row with the depth weights there or not, and with the SAM weights missing too: two files, two reasons.
+    #[test]
+    fn the_masks_row_names_the_depth_weights_apart_from_the_sam_weights() {
+        use ym_core::vision::VisionSupport;
+        let supported = VisionSupport {
+            subject: ym_core::vision::VisionStatus::Supported,
+            people: ym_core::vision::VisionStatus::Supported,
+        };
+        let all = MaskSupport::new(true, supported).with_depth(true);
+        assert_eq!(
+            masks_text(all),
+            "Object, Subject, People, Background, Depth, Linear, Radial, Brush, Colour range, Brightness range"
+        );
+        let json = masks_value(all);
+        assert_eq!(json["kinds"][4], "depth");
+        assert_eq!(json["unavailable"], json!({}));
+        let no_depth = MaskSupport::new(true, supported);
+        assert_eq!(
+            masks_text(no_depth),
+            "Object, Subject, People, Background, Linear, Radial, Brush, Colour range, Brightness range · not available: Depth (the depth weights are missing)"
+        );
+        assert_eq!(
+            masks_value(no_depth)["unavailable"],
+            json!({ "depth": "weights_missing" })
+        );
+        let neither = MaskSupport::new(false, supported);
+        assert_eq!(
+            masks_text(neither),
+            "Subject, People, Background, Linear, Radial, Brush, Colour range, Brightness range · not available: Object (the SAM weights are missing), Depth (the depth weights are missing)"
+        );
+        assert_eq!(
+            masks_value(neither)["unavailable"],
+            json!({ "object": "weights_missing", "depth": "weights_missing" })
+        );
     }
 
     #[test]
-    fn the_apple_auto_row_names_the_model_or_why_not() {
+    fn a_hash_the_report_already_has_is_not_made_again() {
+        let dir = tempfile::tempdir().expect("a folder");
+        for (name, bytes) in [(OBJECT_WEIGHTS_NAME, "sam"), ("crop/a.safetensors", "crop")] {
+            let path = dir.path().join(name);
+            std::fs::create_dir_all(path.parent().expect("a parent")).expect("a folder");
+            std::fs::write(path, bytes).expect("a file");
+        }
+        // A made-up hash for the known file shows that the file was not read: the other one is hashed.
+        let files = hash_models(dir.path(), &[], &[(OBJECT_WEIGHTS_NAME, "feedface")]);
+        let sha = |name: &str| {
+            files
+                .iter()
+                .find(|f| f.name == name)
+                .map(|f| f.sha256.clone())
+        };
+        assert_eq!(sha(OBJECT_WEIGHTS_NAME).as_deref(), Some("feedface"));
+        let crop = sha("crop/a.safetensors").expect("listed");
+        assert_eq!(crop.len(), 64);
+        assert_ne!(crop, "feedface");
+        let plain = hash_models(dir.path(), &[], &[]);
+        assert_eq!(plain.len(), 2);
         assert_eq!(
-            apple_auto_text(&status(true, true, "")),
+            plain[1].sha256.len(),
+            64,
+            "without a known hash all are made"
+        );
+    }
+
+    use ym_core::apple_auto::{AdvisorInfo, Availability, InstructionsId};
+    use ym_core::auto_provider::{AutoConsent, ToolInfo};
+
+    fn claude_info() -> AdvisorInfo {
+        AdvisorInfo::cli(
+            AutoProvider::Claude,
+            "sonnet",
+            ToolInfo {
+                version: "2.1.310".to_owned(),
+                api: Some("firstParty".to_owned()),
+                auth: Some("oauth_token".to_owned()),
+            },
+        )
+    }
+
+    fn details(version: &str, path: &str) -> AdvisorDetails {
+        AdvisorDetails {
+            path: Some(PathBuf::from(path)),
+            tool_version: Some(version.to_owned()),
+            ..AdvisorDetails::default()
+        }
+    }
+
+    /// A report where Apple is `apple`, Claude Code `claude` and Antigravity `agy`.
+    fn report(
+        apple: Availability,
+        claude: (Availability, AdvisorDetails),
+        agy: (Availability, AdvisorDetails),
+        preference: AutoProvider,
+        consent: AutoConsent,
+        own: &str,
+    ) -> AutoReport {
+        let details = [None, Some(claude.1.clone()), Some(agy.1.clone())];
+        let status = AutoStatus::build(&StatusInput {
+            has_advisors: true,
+            readings: [
+                Some((apple, AdvisorDetails::default())),
+                Some(claude),
+                Some(agy),
+            ],
+            preference,
+            choice: AutoChoice::FromPreference,
+            consent,
+            own_instructions: own,
+        });
+        AutoReport { status, details }
+    }
+
+    fn row(r: &AutoReport, p: AutoProvider) -> String {
+        provider_text(r.status.provider(p).unwrap())
+    }
+
+    #[test]
+    fn the_provider_rows_name_the_model_the_program_and_where_it_is() {
+        use UnavailableReason as R;
+        let apple = Availability::Available(AdvisorInfo::new("AFM 3 Core", "27.0.1 (27A404)"));
+        let ok = (
+            Availability::Available(claude_info()),
+            details("2.1.310", "/Users/me/.local/bin/claude"),
+        );
+        let out = |reason, d: AdvisorDetails| (Availability::Unavailable(reason), d);
+        let r = report(
+            apple.clone(),
+            ok.clone(),
+            out(R::SignedOut, details("1.4.7", "/Users/me/.local/bin/agy")),
+            AutoProvider::Claude,
+            AutoConsent {
+                claude: true,
+                agy: false,
+            },
+            "",
+        );
+        assert_eq!(
+            row(&r, AutoProvider::Apple),
             "available · Apple Intelligence · AFM 3 Core · macOS 27.0.1 (27A404) · prompt 3 · table 2"
         );
-        assert!(
-            apple_auto_text(&status(true, false, ""))
-                .ends_with("table 2 · turned off in Preferences")
-        );
-        let edited = InstructionsId::of("Moody.").instructions_sha256;
         assert_eq!(
-            apple_auto_text(&status(true, true, "Moody.")),
+            row(&r, AutoProvider::Claude),
+            "available · Claude Code 2.1.310 · sonnet · prompt 1 · schema 1 · table 2 · /Users/me/.local/bin/claude"
+        );
+        assert_eq!(
+            row(&r, AutoProvider::Agy),
+            "installed but not signed in · 1.4.7 · /Users/me/.local/bin/agy"
+        );
+        assert_eq!(
+            auto_grading_text(&r.status),
+            "Claude Code (saved in Preferences)"
+        );
+        // Edited instructions are in the version string, before the path.
+        let edited = InstructionsId::of("Moody.").instructions_sha256;
+        let r = report(
+            apple,
+            ok,
+            out(R::NotInstalled, AdvisorDetails::default()),
+            AutoProvider::Claude,
+            AutoConsent::default(),
+            "Moody.",
+        );
+        assert_eq!(
+            row(&r, AutoProvider::Claude),
             format!(
-                "available · Apple Intelligence · AFM 3 Core · macOS 27.0.1 (27A404) · prompt 3 · table 2 · edited instructions ({edited})"
+                "available · Claude Code 2.1.310 · sonnet · prompt 1 · schema 1 · table 2 · edited instructions ({edited}) · /Users/me/.local/bin/claude"
             )
         );
+        assert_eq!(row(&r, AutoProvider::Agy), "not installed");
+        // A saved program that was not agreed to yet says how `ym` can use it all the same.
         assert_eq!(
-            apple_auto_text(&status(false, true, "")),
-            "not available (it needs macOS 27 or later)"
+            auto_grading_text(&r.status),
+            "Claude Code (saved in Preferences) · not agreed to yet; naming it with --auto-provider is enough for ym"
+        );
+        // The other states.
+        let gone = Availability::Unavailable(R::NotAMac);
+        let r = report(
+            gone,
+            out(R::TooOld, details("2.1.100", "/opt/claude")),
+            out(R::ProbeFailed, details("1.4.7", "/opt/agy")),
+            AutoProvider::Yellowmoon,
+            AutoConsent::default(),
+            "",
+        );
+        assert_eq!(
+            row(&r, AutoProvider::Apple),
+            "not available (this is not a Mac)"
+        );
+        assert_eq!(
+            row(&r, AutoProvider::Claude),
+            "too old (2.1.100; 2.1.169 or later is needed) · /opt/claude"
+        );
+        assert_eq!(
+            row(&r, AutoProvider::Agy),
+            "didn't answer its check · /opt/agy"
+        );
+        assert_eq!(auto_grading_text(&r.status), "Default Auto");
+        let r = report(
+            Availability::Unavailable(R::NotAMac),
+            out(R::UnsafeLauncher, AdvisorDetails::default()),
+            out(R::Checking, AdvisorDetails::default()),
+            AutoProvider::Apple,
+            AutoConsent::default(),
+            "",
+        );
+        assert_eq!(
+            row(&r, AutoProvider::Claude),
+            "found only as a script that Yellowmoon can't run safely"
+        );
+        assert_eq!(row(&r, AutoProvider::Agy), "still checking");
+    }
+
+    #[test]
+    fn the_auto_object_lists_every_provider_with_sorted_keys_and_the_path_here_only() {
+        use UnavailableReason as R;
+        let ok = (
+            Availability::Available(claude_info()),
+            details("2.1.310", "/Users/me/.local/bin/claude"),
+        );
+        let r = report(
+            Availability::Unavailable(R::NotAMac),
+            ok,
+            (
+                Availability::Unavailable(R::SignedOut),
+                details("1.4.7", "/Users/me/.local/bin/agy"),
+            ),
+            AutoProvider::Claude,
+            AutoConsent {
+                claude: true,
+                agy: false,
+            },
+            "",
         );
         let sha = InstructionsId::default().instructions_sha256;
         assert_eq!(
-            apple_auto_value(&status(false, true, "")),
-            json!({ "available": false, "reason": "macos_too_old", "model": null, "os": null,
-                    "preference": true, "prompt": 3, "table": 2,
+            auto_value(&r),
+            json!({
+                "preference": "claude", "effective": "claude",
+                "consent": { "claude": true, "agy": false },
+                "instructions": "default", "instructions_sha256": sha, "table": 2,
+                "providers": {
+                    "yellowmoon": { "state": "available", "reason": null },
+                    "apple": { "state": "unavailable", "reason": "not_a_mac", "model": null, "os": null, "prompt": 3 },
+                    "claude": { "state": "available", "reason": null, "path": "/Users/me/.local/bin/claude",
+                                "tool_version": "2.1.310", "model": "sonnet", "api": "firstParty", "auth": "oauth_token",
+                                "prompt": 1, "schema": 1, "image": "jpeg444q92@768" },
+                    "agy": { "state": "signed_out", "reason": "signed_out", "path": "/Users/me/.local/bin/agy",
+                             "tool_version": "1.4.7", "model": "default", "api": null, "auth": null,
+                             "prompt": 1, "schema": 1, "image": "jpeg444q92@768" },
+                }
+            })
+        );
+        // The old object stays for one version, Apple only.
+        assert_eq!(
+            apple_auto_value(&r.status),
+            json!({ "available": false, "reason": "not_a_mac", "model": null, "os": null,
+                    "preference": false, "prompt": 3, "table": 2,
                     "instructions": "default", "instructions_sha256": sha })
         );
+    }
+
+    #[test]
+    fn the_old_apple_auto_object_says_whether_apple_is_the_saved_choice() {
+        let r = report(
+            Availability::Available(AdvisorInfo::new("AFM 3 Core", "27.0.1 (27A404)")),
+            (
+                Availability::Unavailable(UnavailableReason::NotInstalled),
+                AdvisorDetails::default(),
+            ),
+            (
+                Availability::Unavailable(UnavailableReason::NotInstalled),
+                AdvisorDetails::default(),
+            ),
+            AutoProvider::Apple,
+            AutoConsent::default(),
+            "Moody.",
+        );
+        let edited = InstructionsId::of("Moody.").instructions_sha256;
         assert_eq!(
-            apple_auto_value(&status(true, false, "Moody.")),
+            apple_auto_value(&r.status),
             json!({ "available": true, "reason": null, "model": "AFM 3 Core", "os": "27.0.1 (27A404)",
-                    "preference": false, "prompt": 3, "table": 2,
+                    "preference": true, "prompt": 3, "table": 2,
                     "instructions": "edited", "instructions_sha256": edited })
         );
     }

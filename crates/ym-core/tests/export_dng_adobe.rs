@@ -1,6 +1,6 @@
 //! A DNG of a look with its own display rendering, through Adobe's own renderer (`dng_validate` of the
 //! DNG SDK, `tools/dng/build_dng_validate.sh`): how close to the app's picture is what Adobe's pipeline
-//! shows with the profile fitted to ACES 2? (`docs/09`, "What a DNG carries".) The look is a LogC3 to
+//! shows with the profile fitted to the cine rendering? (`docs/09`, "What a DNG carries".) The look is a LogC3 to
 //! Rec.709 look of our own (`common::dng_looks`, a filmic tone curve with a little colour; never an ARRI
 //! file). The numbers are measured and printed, and the asserts are only sanity bounds: "close", not a
 //! gate (the DNG gate of `docs/09` is the median ΔE00 of 1.5 against the JPEG, `tools/dngfit`).
@@ -22,6 +22,7 @@ use ym_core::export::{ExportContext, ExportControl, ExportParams, ExportPhoto, e
 use ym_core::pipeline::{RenderOptions, Renderer};
 use ym_core::session::{OpenOptions, Session};
 use ym_core::settings::{AutoOr, SettingsPatch, SharpenManualPatch};
+use ym_core::settings::{NodeId, NodePatch};
 use ym_export::{BitDepth, ExportOptions, FormatKind, TiffCompression};
 use ym_looks::library::LookId;
 
@@ -153,23 +154,36 @@ fn adobes_renderer_shows_a_look_with_its_own_display_rendering_close_to_the_apps
             .expect("export");
             std::fs::read(report.path).expect("read")
         };
-        let look = SettingsPatch {
-            look: Some(LookId::parse(look).expect("look id")),
-            look_intensity: Some(100.0),
-            ..SettingsPatch::default()
-        };
+        let look = SettingsPatch::default().and(
+            NodeId::Output,
+            NodePatch {
+                look: Some(LookId::parse(look).expect("look id")),
+                look_intensity: Some(100.0),
+                ..NodePatch::default()
+            },
+        );
         // The DNG and the JPEG as the app writes them (R8 and output sharpening at their defaults) ...
         let dng = export(look.clone(), FormatKind::Dng);
         let jpeg = export(look.clone(), FormatKind::Jpeg);
         // ... and the same picture without any sharpening, which isolates what the DNG model costs.
-        let unsharpened = SettingsPatch {
-            sharpen: Some(AutoOr::Manual(SharpenManualPatch {
-                amount: Some(0.0),
-                radius_px: Some(1.0),
-            })),
-            output_sharpening: Some(0.0),
-            ..look
-        };
+        let unsharpened = look
+            .and(
+                NodeId::Input,
+                NodePatch {
+                    sharpen: Some(AutoOr::Manual(SharpenManualPatch {
+                        amount: Some(0.0),
+                        radius_px: Some(1.0),
+                    })),
+                    ..NodePatch::default()
+                },
+            )
+            .and(
+                NodeId::Output,
+                NodePatch {
+                    output_sharpening: Some(0.0),
+                    ..NodePatch::default()
+                },
+            );
         let tiff = export(unsharpened, FormatKind::Tiff);
         let tiff_ifd = Tiff::new(&tiff).expect("a TIFF");
         let (tw, th, t16) = tiff_ifd.uncompressed_u16_rgb(tiff_ifd.ifd0());
@@ -256,16 +270,26 @@ fn adobes_renderer_keeps_the_tint_of_the_highlights_of_a_look_that_reaches_displ
         .expect("export");
         std::fs::read(report.path).expect("read")
     };
-    let patch = SettingsPatch {
-        look: Some(LookId::parse("user:rec709bright").expect("look id")),
-        look_intensity: Some(100.0),
-        sharpen: Some(AutoOr::Manual(SharpenManualPatch {
-            amount: Some(0.0),
-            radius_px: Some(1.0),
-        })),
-        output_sharpening: Some(0.0),
-        ..SettingsPatch::default()
-    };
+    let patch = SettingsPatch::default()
+        .and(
+            NodeId::Input,
+            NodePatch {
+                sharpen: Some(AutoOr::Manual(SharpenManualPatch {
+                    amount: Some(0.0),
+                    radius_px: Some(1.0),
+                })),
+                ..NodePatch::default()
+            },
+        )
+        .and(
+            NodeId::Output,
+            NodePatch {
+                look: Some(LookId::parse("user:rec709bright").expect("look id")),
+                look_intensity: Some(100.0),
+                output_sharpening: Some(0.0),
+                ..NodePatch::default()
+            },
+        );
     let dng = export(patch.clone(), FormatKind::Dng);
     let tiff = export(patch, FormatKind::Tiff);
     let tiff_ifd = Tiff::new(&tiff).expect("a TIFF");
@@ -277,21 +301,34 @@ fn adobes_renderer_keeps_the_tint_of_the_highlights_of_a_look_that_reaches_displ
     assert_eq!((w, h), (tw, th));
 
     let all = delta_e(&adobe, &picture);
-    let highlights: Vec<f64> = picture
-        .chunks_exact(3)
-        .zip(&all)
-        .filter(|(p, _)| p.iter().copied().fold(0.0, f64::max) >= 0.9)
-        .map(|(_, &d)| d)
-        .collect();
+    // The pictures this test is about are the tinted near-whites: every channel at or above 0.8 and one at or above 0.9.
+    // The cine rendering is not onto (it darkens saturated colours), and a saturated highlight of this look, a per-channel
+    // filmic curve and not a rendering like the cine one, is a display colour that no scene colour below the profile's
+    // top (scene 16) makes: the DNG holds the nearest colour it can (`docs/02`, Inverse, step 4; the dimming of
+    // `DNG_SCENE_LIMIT`), which differs more. Those are counted and reported, with the pale ones held to the bound.
+    let mut pale = Vec::new();
+    let mut saturated = Vec::new();
+    for (p, &d) in picture.chunks_exact(3).zip(&all) {
+        let top = p.iter().copied().fold(0.0, f64::max);
+        let low = p.iter().copied().fold(1.0, f64::min);
+        if top >= 0.9 {
+            if low >= 0.8 {
+                pale.push(d);
+            } else {
+                saturated.push(d);
+            }
+        }
+    }
+    let highlights = pale;
     assert!(
         highlights.len() > w * h / 20,
         "the scene has highlights: {} of {} pixels",
         highlights.len(),
         w * h
     );
-    let (a, hl) = (summary(&all), summary(&highlights));
+    let (a, hl, sat) = (summary(&all), summary(&highlights), summary(&saturated));
     eprintln!(
-        "bright LogC3 to Rec.709 look: Adobe's render of the DNG against the unsharpened TIFF: all {} pixels median {:.3}, p95 {:.3}, p99 {:.3}, max {:.2}; the {} highlight pixels median {:.3}, p95 {:.3}, p99 {:.3}, max {:.2}",
+        "bright LogC3 to Rec.709 look: Adobe's render of the DNG against the unsharpened TIFF: all {} pixels median {:.3}, p95 {:.3}, p99 {:.3}, max {:.2}; the {} pale highlight pixels median {:.3}, p95 {:.3}, p99 {:.3}, max {:.2}; the {} saturated highlight pixels median {:.3}, p95 {:.3}, p99 {:.3}, max {:.2}",
         all.len(),
         a.0,
         a.1,
@@ -301,13 +338,22 @@ fn adobes_renderer_keeps_the_tint_of_the_highlights_of_a_look_that_reaches_displ
         hl.0,
         hl.1,
         hl.2,
-        hl.3
+        hl.3,
+        saturated.len(),
+        sat.0,
+        sat.1,
+        sat.2,
+        sat.3
     );
-    // The loss of a white (display 1.0 comes out at 0.9435) and the profile's own fit: measured p95 0.70, p99 0.76, worst
-    // 1.00. The first version, which scaled the scene value down, measured p95 3.0, p99 3.3 and worst 3.6 on this scene.
+    // The loss of a white: the top of the profile is scene 16, where the cine rendering is at display 0.9567 (code
+    // 0.981), so display 1.0 comes out at 0.9567 and a tinted white (1, 1, 0.958), the brightest patch of this
+    // scene and 80 % of its highlights, comes out as the same colour dimmed by 4.3 %: CIEDE2000 2.66, the whole of
+    // the p95 and p99 (measured median 0.033). The first version, which scaled the scene value down and not the display
+    // colour, measured p95 3.0, p99 3.3 and worst 3.6 on a scene of ordinary highlights. The bound is the loss of a
+    // white with a little room, and a cast would show far above it.
     assert!(hl.0 < 0.5, "highlights: median {}", hl.0);
     assert!(
-        hl.1 < 1.5 && hl.2 < 1.5,
+        hl.1 < 3.0 && hl.2 < 3.0,
         "highlights: p95 {}, p99 {}",
         hl.1,
         hl.2

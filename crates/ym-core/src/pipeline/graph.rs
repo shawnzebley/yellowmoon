@@ -12,8 +12,15 @@
 //! | `plan` | levels, vignetting profile, lens maps and their auto crop; one for the final picture and one for the Before view (the same plan without the vignetting profile) | `lens_corrections`, `chromatic_aberration`, and whether R3 runs |
 //! | `sigma` | the half-resolution noise sigma | the noise model and the gains `g0` |
 //! | `groups` | the raw group's image at 1/k | [`RawParams`] (all of `decode.*`, whether R3 runs, noise reduction, sharpening, `g0`, noise) and k |
+//! | `lens_planes` | the lens's planes and lists of the photo (`docs/21` section 3), kept outside the evictable caches | [`RawParams`], the lens, its data version, the camera, the frame, the axis, `g0`, the focus point; not the three amounts |
+//! | `lens_field_groups` | the raw group at 1/k after the lens's field stage only, `Z = L2(L1(X))` | [`RawParams`], the lens, its data versions, Edges, Anamorphic, the camera, the frame, the axis, the f-number, the focus point (`LensPlan::field_key`: not Flares), and k |
+//! | `lens_flare_groups` | the flare terms of L3 at 1/k, `f64` planes | [`RawParams`], the lens, its data versions, Flares, Anamorphic, the camera, the frame, the axis, `g0`, the f-number (`LensPlan::flares_key`: not Edges), and k |
+//! | `lens_groups` | the raw group at 1/k after the lens (L1 to L3) | [`RawParams`], the lens setting and its inputs, and k |
 //! | `full` | the prepared full-resolution chain; one for the final picture and one for the Before view | [`RawParams`] |
 //! | `tiles` | 512 px tiles of the full-resolution raw group | [`RawParams`] and the tile |
+//! | `lens_field_tiles` | 512 px tiles after the lens's field stage only | as `lens_field_groups`, and the tile |
+//! | `lens_flare_tiles` | the flare terms of the 512 px tiles | as `lens_flare_groups`, and the tile |
+//! | `lens_tiles` | 512 px tiles of the full-resolution raw group after the lens, made from the raw tiles grown by the lens halo | [`RawParams`], the lens setting and its inputs, and the tile |
 //! | `color` | the fused matrix and C7 | [`ColorKey`] |
 //! | `grade` | the prepared `ColorChain` | [`GradeKey`] |
 //! | `display` | the display-linear frame of a view before output sharpening | everything above plus geometry and the cell, not the sharpening amount |
@@ -23,28 +30,32 @@
 //! keys hold the numbers the group reads, so a burst median that moves only the exposure recomputes
 //! the colour group and leaves the raw group alone.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock, Weak};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use ym_export::{ColorSpace, DetailStat};
 use ym_gpu::chain::StageRange;
 use ym_gpu::cpu::demosaic::{DEFAULT_METHOD, Method};
 use ym_gpu::cpu::detail::NoiseReduction;
+use ym_gpu::cpu::frame_denoise::{DEFAULT_DENOISE, DenoiseMethod};
 use ym_gpu::cpu::sharpen::SharpenParams;
 use ym_gpu::cpu::sharpen::diffraction::DiffractionParams;
-use ym_gpu::cpu::{Rect, RgbImage};
+use ym_gpu::cpu::{Placement, Rect, RgbImage};
 use ym_gpu::device::{Gpu, GpuContext, GpuError, GpuInfo};
 use ym_gpu::image::{GpuImage, RowBands};
 use ym_gpu::kernels::copy::Piece;
 use ym_gpu::kernels::prep::DeviceRaw;
 use ym_gpu::queue::{CancelToken, JobHandle, JobSpec, Priority};
+use ym_lens::{CameraResponse, LensLibrary, LensPlanes, ReshapeReport};
+use ym_ml::bokeh_net::BokehNet;
 
 use super::color::{
-    ColorKey, ColorPlan, DisplayChoice, GradeKey, GradePlan, GradeRequest, LookProvider,
-    PhotoSource, color_key, color_plan, grade_plan,
+    ColorKey, ColorPlan, GradeKey, GradePlan, GradeRequest, LookProvider, PhotoSource, color_key,
+    color_plan, grade_key_to, grade_plan_to, has_background_row, only_row,
 };
 use super::geometry::Geometry;
 use super::raw::{
@@ -53,15 +64,35 @@ use super::raw::{
     noise_model_is_usable, reduced_bayer, reduced_params, reduced_rgb, sigma_plane,
     usable_noise_model,
 };
+use super::viewport::{MaskStyle, MaskView};
 use super::{FrameZoom, NeuralStatus, RenderError, RenderPath, RenderStats};
 use crate::app::gpu::GpuStages;
-use crate::scheduler::{ByteLru, JobScheduler, MemoryBudget, MemoryLedger};
+use crate::scheduler::{ByteLru, JobScheduler, MemoryBudget, MemoryLedger, Reservation};
 use crate::session::PhotoId;
 use ym_color::display::OutputTarget;
+use ym_color::plan::Stop as PlanStop;
+
+use crate::settings::MaskShape;
+
+mod background;
+mod depth;
+mod lens;
+mod lens_device;
+mod object;
+mod vision;
+
+pub use depth::DepthKey;
+pub(crate) use object::plane_text;
 
 /// The note of a render whose demosaic method is not the adaptive ratio (the test-only switch of
 /// `RenderOptions::demosaic`): the device runs that one only.
 const METHOD_NOT_ON_DEVICE_NOTE: &str = "The graphics card runs the adaptive ratio demosaic only, so the CPU ran the one that was asked for.";
+const DENOISE_NOT_ON_DEVICE_NOTE: &str =
+    "The graphics card does not run this denoise method, so the CPU ran the raw stages.";
+/// The note of a render whose lens setting asks for a lens while the lens data could not be loaded
+/// ([`RenderOptions::lens`] is `None`): the photo is developed with no lens effect.
+const LENS_UNAVAILABLE_NOTE: &str =
+    "The lens data could not be loaded, so this photo has no lens effect.";
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
@@ -72,9 +103,48 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// among the two is uploaded again when it is next rendered.
 pub const RESIDENT_PHOTOS: usize = 2;
 
-/// The default of [`RenderOptions::view_band_bytes`]: 128 MiB, the storage binding every device
-/// pass is designed for (`docs/17-gpu.md` section 4, K4).
+/// The storage binding every device pass is designed for: 128 MiB (`docs/17-gpu.md` section 4, K4), the one Mesa
+/// lavapipe has. A cap to give [`RenderOptions::view_band_bytes`] to cut as lavapipe does on any device; views are
+/// cut to the opened device's own limits otherwise ([`ViewLimits`]).
 pub const VIEW_BAND_BYTES: u64 = 128 << 20;
+
+/// What the device allows a view: the limits its pieces are cut to (`docs/23-nodes.md` section 5.12, *Limits*).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ViewLimits {
+    /// The largest storage binding: `min(max_storage_buffer_binding_size, max_buffer_size)`
+    /// ([`ym_gpu::tiles::device_binding_bytes`]).
+    pub binding_bytes: u64,
+    /// The GPU memory budget of the pool (`GpuInfo::memory_budget_bytes`).
+    pub budget_bytes: u64,
+}
+
+impl ViewLimits {
+    /// A piece's buffers together are at most this part of the memory budget, counted as the piece's wider picture
+    /// at 16 bytes a pixel (four f32 planes) times this many: a view with raster masks, Film nodes and the colour
+    /// pass holds about 225 bytes a pixel of its wider picture at the peak (the sampled picture of six planes, the
+    /// camera RGB, seven raster planes, the Film pictures and passes: measured by `tests/view_cut.rs` on a 24 MP
+    /// photo), which is 14 times 16; 24 leaves room for the photo's raw group and the planes the device keeps, so a
+    /// 4 GiB budget (the Mac's) allows a picture of 170 MB (about 11 million pixels) and a 2 GiB one 85 MB.
+    pub const BUDGET_DIVISOR: u64 = 24;
+
+    /// The limits of an opened device.
+    #[must_use]
+    pub fn of_device(info: &ym_gpu::device::GpuInfo) -> Self {
+        Self {
+            binding_bytes: ym_gpu::tiles::device_binding_bytes(&info.limits),
+            budget_bytes: info.memory_budget_bytes,
+        }
+    }
+
+    /// The largest picture of four f32 planes (16 bytes a pixel) one piece of a view may hold: the binding, a share of
+    /// the budget ([`Self::BUDGET_DIVISOR`]) and the cap `cap` ([`RenderOptions::view_band_bytes`]).
+    #[must_use]
+    pub fn picture_bytes(self, cap: u64) -> u64 {
+        self.binding_bytes
+            .min(self.budget_bytes / Self::BUDGET_DIVISOR)
+            .min(cap)
+    }
+}
 
 /// What [`Renderer::prefetch_raw`] did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,6 +156,37 @@ pub enum RawPrefetch {
     /// Nothing was done: there is no device for the raw front, the file has no mosaic, two photos are
     /// resident already, or the upload failed.
     Skipped,
+}
+
+/// Opens a new graphics device when the renderer's is lost: the same adapter policy, memory budget and pipeline cache the
+/// first one had (`GpuSlot::reopener`). It may block while the device is created; the error says why none opened.
+#[derive(Clone)]
+pub struct GpuReopener(pub Arc<dyn Fn() -> Result<Arc<Gpu>, String> + Send + Sync>);
+
+impl std::fmt::Debug for GpuReopener {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("GpuReopener")
+    }
+}
+
+/// Losses of the device within [`REOPEN_WINDOW`] after which the renderer stops reopening it and stays on the CPU.
+pub const REOPEN_MAX_LOSSES: usize = 3;
+/// The window in which [`REOPEN_MAX_LOSSES`] losses end the reopening; the CPU keeps the photo until it has passed.
+pub const REOPEN_WINDOW: Duration = Duration::from_secs(60);
+/// How long after a reopen that failed the next one is not tried.
+const REOPEN_RETRY_AFTER: Duration = Duration::from_secs(5);
+
+/// The renderer's account of lost devices (the back-off of [`Renderer::reopen_gpu_if_lost`]).
+#[derive(Default)]
+struct ReopenState {
+    /// When devices were lost, within the window.
+    losses: VecDeque<Instant>,
+    /// The lost device that was counted already (a lost device is counted once, however many requests meet it).
+    counted: Option<Weak<Gpu>>,
+    /// A reopen failed at this moment.
+    failed_at: Option<Instant>,
+    /// The back-off has been logged for the current run of losses.
+    gave_up_logged: bool,
 }
 
 /// What a [`Renderer`] needs to know about the machine and the preferences.
@@ -102,6 +203,37 @@ pub struct RenderOptions {
     pub budget: MemoryBudget,
     /// Whether the learned demosaic can run.
     pub neural: NeuralStatus,
+    /// The lens library (`data/lenses`, `docs/21`), loaded once by [`crate::app::Core::open`]. `None`
+    /// when the lens data are missing or damaged (and for a renderer made without a core): a lens
+    /// setting then renders as no lens, and the render's notes say so.
+    pub lens: Option<Arc<LensLibrary>>,
+    /// The bokeh map network (`data/models/bokeh`, `docs/21` section 7), loaded once by
+    /// [`crate::app::Core::open`] next to the lens library. With it the lens reads the blur already in the photo
+    /// from the network's map; without it (`None`: the model is missing or damaged, or the renderer was made
+    /// without a core) the classical detector's edge measure does, and the pictures differ only where the two
+    /// disagree about the map.
+    pub bokeh_model: Option<Arc<BokehNet>>,
+    /// SAM 2.1 small (`data/models/sam2`, `docs/23` section 4.4), found by [`crate::app::Core::open`] (it reads nothing until
+    /// an Object mask needs it). With it Object is a kind this machine can make and an Object row gets its mask; without it
+    /// (`None`: the weights are missing, or the renderer was made without a core) an Object row selects nothing in a view
+    /// and fails an export with the `mask` error.
+    pub object_model: Option<Arc<crate::pipeline::object::ObjectModel>>,
+    /// Depth Anything V2-Small (`data/models/depth`, `docs/23` section 4.8), found by [`crate::app::Core::open`] (it reads
+    /// nothing until a Depth mask needs it), or a fake in the tests ([`crate::pipeline::DepthModel::fake`]). With it Depth is
+    /// a kind this machine can make and a Depth row gets its mask; without it (`None`: the weights are missing, or the
+    /// renderer was made without a core) a Depth row selects nothing in a view and fails an export with the `mask` error.
+    pub depth_model: Option<Arc<crate::pipeline::depth::DepthModel>>,
+    /// The computer's Vision framework for the Subject and People masks (`docs/23` section 4.5) and what its probe said
+    /// (`ym-apple`'s `system_vision()`, handed over by the app and `ym`). With it Subject and People are kinds this
+    /// computer can make where the probe says yes; without it (`None`: a caller that has none, as the tests, the golden
+    /// tool and Linux builds) they are not, and a Subject or People row selects nothing in a view and fails an export
+    /// with the `mask` error.
+    pub vision: Option<Arc<crate::vision::VisionMasks>>,
+    /// The shipped data folder (`data/`), for what a render reads from it at run time: the camera's
+    /// spectral curves (`cameras/…`), which the lens projects its colours on (`docs/21` section 6,
+    /// "Colour"). [`crate::app::Core::open`] fills it from its data root. `None` (a renderer made
+    /// without a core) gives the lens a neutral camera, and the render's notes say so.
+    pub data_root: Option<PathBuf>,
     /// The GPU, when there is one: the colour pass of viewport frames and thumbnails runs on it.
     /// It is opened by [`crate::app::gpu::open_gpu`] and nothing else, and it can be given to a
     /// renderer that exists already ([`Renderer::set_gpu`]: `ym` opens the device while photos
@@ -116,14 +248,21 @@ pub struct RenderOptions {
     /// Whether a device error is a failure of the photo (`GpuPolicy::Require`, `--require-gpu`)
     /// instead of a fall-back to the CPU. Off by default.
     pub gpu_strict: bool,
-    /// The largest storage binding, in bytes, that one device pass of a view may need: a four-plane
-    /// f32 frame takes `16 * width * rows` of it. A view whose frame needs more (the Metal limit is
-    /// 2 GiB, lavapipe's 128 MiB, and every kernel is designed for the lower, `docs/17-gpu.md`
-    /// section 4) is cut into horizontal bands that are rendered one after the other and put
-    /// together, which gives the same pixels bit for bit (every device stage of a view is
-    /// tile-exact). A constant of the renderer and not the device's limit, so that the cut does not
-    /// depend on the machine. [`VIEW_BAND_BYTES`] by default.
+    /// How to open a new device after the current one is lost ([`GpuReopener`]); `None`: the renderer never reopens
+    /// (a test's device, a renderer with no policy behind it). [`crate::app::gpu::GpuSlot::apply_to`] and
+    /// [`crate::app::Core::attach_gpu`] set it.
+    pub gpu_reopener: Option<GpuReopener>,
+    /// A cap, in bytes, on the storage binding one device pass of a view may need: a four-plane f32 frame
+    /// takes `16 * width * rows` of it. A view whose frame needs more is cut into pieces that are rendered
+    /// one after the other and put together, which gives the same pixels bit for bit (every device stage of
+    /// a view is tile-exact). **The limit a view is cut to is the device's** (`min(max_storage_buffer_binding_size,
+    /// max_buffer_size)` of the opened device) and a share of its memory budget ([`ViewLimits`]); this field
+    /// only lowers it (tests, and a person who wants smaller pieces). [`u64::MAX`] by default: no cap.
+    /// [`VIEW_BAND_BYTES`] is the binding every kernel is designed for, the one Mesa lavapipe has.
     pub view_band_bytes: u64,
+    /// The device limits a view is cut to instead of the opened device's (tests that cut as a bigger device
+    /// would; `None`, the device's own, everywhere else). [`ViewLimits::of_device`].
+    pub view_limits: Option<ViewLimits>,
     /// Whether the caches of the raw group (the reduced groups and the tiles of the 100 % view) keep
     /// what the device made where it is, on the device, for the sampler to read (`docs/17-gpu.md`
     /// section 3, `Backing`): no readback after the raw chain and no upload before the sampler. Has an
@@ -131,6 +270,12 @@ pub struct RenderOptions {
     /// images; the frames are the same either way, bit for bit (the sampler reads the
     /// same samples), and the tests compare the two. On by default.
     pub resident_caches: bool,
+    /// Whether the viewer keeps whole-image levels: after a settings change settles, the photo is
+    /// rendered once at the zoom on screen, in the background, and kept on the device, so that a pan
+    /// at that zoom copies a rectangle out of it and renders nothing ([`frame::level`](super::frame)).
+    /// Needs a device that runs the view stages. Off by default (a test that counts the stages of a
+    /// request must not see a fill run beside it); [`crate::app::CoreOptions`] turns it on.
+    pub levels: bool,
     /// The colour of the letterbox around the photo (the paper colour).
     pub background: [u8; 3],
     /// Longest edge of a thumbnail in pixels (`docs/01`: 240).
@@ -146,6 +291,12 @@ pub struct RenderOptions {
     /// initial value from the environment variable `YM_FORCE_DEMOSAIC`
     /// ([`forced_demosaic`]); other builds always start at [`DEFAULT_METHOD`].
     pub demosaic: Method,
+    /// The R6 denoise of the full-resolution render: [`DEFAULT_DENOISE`], method A of
+    /// `docs/algorithms/05` (the owner's decision of 2026-10-20, `docs/05` R6), unless a test or an
+    /// evaluation tool sets another. An internal switch like [`demosaic`](Self::demosaic): no settings
+    /// field, no UI, not part of the cache keys. The reduced renders keep the bilateral denoise of the
+    /// binned image whatever it is.
+    pub denoise: DenoiseMethod,
 }
 
 /// The method the test-only switch asks for: the value of `YM_FORCE_DEMOSAIC` (a
@@ -191,12 +342,17 @@ impl std::fmt::Debug for RenderOptions {
             .field("full_tile_px", &self.full_tile_px)
             .field("budget", &self.budget)
             .field("neural", &self.neural)
+            .field("lens", &self.lens.is_some())
+            .field("data_root", &self.data_root)
             .field("demosaic", &self.demosaic)
+            .field("denoise", &self.denoise)
             .field("gpu", &self.gpu.as_ref().map(|g| g.info().name.clone()))
             .field("gpu_stages", &self.gpu_stages)
             .field("gpu_strict", &self.gpu_strict)
             .field("view_band_bytes", &self.view_band_bytes)
+            .field("view_limits", &self.view_limits)
             .field("resident_caches", &self.resident_caches)
+            .field("levels", &self.levels)
             .finish_non_exhaustive()
     }
 }
@@ -209,14 +365,24 @@ impl Default for RenderOptions {
             full_tile_px: 1024,
             budget: MemoryBudget::detect(),
             neural: NeuralStatus::unavailable(),
+            lens: None,
+            bokeh_model: None,
+            object_model: None,
+            depth_model: None,
+            vision: None,
+            data_root: None,
             gpu: None,
             gpu_stages: GpuStages::ALL,
             gpu_strict: false,
-            view_band_bytes: VIEW_BAND_BYTES,
+            gpu_reopener: None,
+            view_band_bytes: u64::MAX,
+            view_limits: None,
             resident_caches: true,
+            levels: false,
             background: [255, 255, 255],
             thumbnail_px: 240,
             demosaic: forced_demosaic().unwrap_or(DEFAULT_METHOD),
+            denoise: DEFAULT_DENOISE,
         }
     }
 }
@@ -275,6 +441,32 @@ pub struct StageRuns {
     pub display_hits: u64,
     /// Finished frames served from the frame cache.
     pub frame_hits: u64,
+    /// Viewport frames served as a rectangle copied out of a whole-image level: nothing was
+    /// sampled, coloured or sharpened for them ([`frame::level`](super::frame)).
+    pub level_hits: u64,
+    /// Bands of a whole-image level made (the background fill; each is a view of its own, so its
+    /// stages are counted as well).
+    pub level_bands: u64,
+    /// Viewport frames that were a draft: the picture of a whole-image level of a nearby zoom resampled to this view, shown
+    /// at once while the exact frame is rendered (`frame::level`).
+    pub level_drafts: u64,
+    /// Times the lens's planes and lists were made (`docs/21` section 3): once per photo and
+    /// [`RawParams`], lens, camera and focus point, never for a move of an amount.
+    pub lens_planes: u64,
+    /// Times the photo's blur map was made (`docs/23` section 4.6): the learned model or the classical detector run
+    /// on the lens plane, once per photo and [`RawParams`], for the lens's bokeh and the Background mask together.
+    pub blur_maps: u64,
+    /// Raw-group images at a reduced scale that went through the lens (L1 to L3).
+    pub lens_groups: u64,
+    /// Times the lens's field stage (`Z = L2(L1(X))`, which Flares does not touch) was made for a
+    /// group or a tile: a Flares move reuses the cached one and makes none (`docs/21` section 3).
+    pub lens_fields: u64,
+    /// Times the lens's flare terms (L3's light, which Edges does not touch) were made for a group or a
+    /// tile: an Edges move reuses the cached ones and makes none.
+    pub lens_flares: u64,
+    /// Full-resolution regions that went through the lens: the 512 px tiles of the 100 % view and
+    /// the tiles of an export.
+    pub lens_tiles: u64,
 }
 
 impl StageRuns {
@@ -298,6 +490,21 @@ impl StageRuns {
         self.output_passes += other.output_passes;
         self.display_hits += other.display_hits;
         self.frame_hits += other.frame_hits;
+        self.level_hits += other.level_hits;
+        self.level_bands += other.level_bands;
+        self.level_drafts += other.level_drafts;
+        self.lens_planes += other.lens_planes;
+        self.blur_maps += other.blur_maps;
+        self.lens_groups += other.lens_groups;
+        self.lens_fields += other.lens_fields;
+        self.lens_flares += other.lens_flares;
+        self.lens_tiles += other.lens_tiles;
+    }
+
+    /// The number of times the lens (L1 to L3) did work: planes, groups, field stages and tiles.
+    #[must_use]
+    pub fn lens_work(&self) -> u64 {
+        self.lens_planes + self.lens_groups + self.lens_fields + self.lens_flares + self.lens_tiles
     }
 }
 
@@ -318,6 +525,9 @@ pub struct StageTimings {
     pub pass_ms: f64,
     /// The output-sharpening stage and the final encode (zero when the frame has none).
     pub output_ms: f64,
+    /// The lens (L1 to L3): the planes, and the passes over a group, a tile or an export region.
+    /// The raw stages under it are in `raw_ms`. Zero without a lens.
+    pub lens_ms: f64,
 }
 
 /// Running totals of a graph's [`StageRuns`].
@@ -361,9 +571,21 @@ pub struct RenderReport {
     /// Plain-words notes: why the classical path ran, a look that was replaced by Neutral, lens
     /// tables that were ignored.
     pub notes: Vec<String>,
+    /// True when this request asked the device and a device error (a true fault, or a per-frame one: one of our input
+    /// checks refused, a buffer did not fit) made the CPU do the work. False for a request that never asked the device
+    /// (a frame served from the cache, a frame of paper only, no device, a route that had already ended). The viewport
+    /// says "Rendering on the CPU" from it at once, so a state that refuses every frame is seen at the first.
+    pub device_refused: bool,
+    /// Why the CPU made (part of) this request when the device was asked: the device's own words (an input check, a
+    /// buffer that does not fit one binding, an error). `None` when the device made it, or never was asked. Logged in
+    /// the `ym::perf` line as `route=cpu(reason)`.
+    pub cpu_reason: Option<String>,
     /// The zoom of the frame, for a viewport frame ([`Renderer::viewport_frame`] sets it, also on a
     /// frame served from the cache); `None` for every other request.
     pub zoom: Option<FrameZoom>,
+    /// What the lens's bokeh reshaping did for this photo (`docs/21` section 10), once the photo's
+    /// planes exist (a frame served from the cache says it too). `None` without a lens.
+    pub lens: Option<ReshapeReport>,
 }
 
 impl RenderReport {
@@ -376,6 +598,7 @@ impl RenderReport {
             space: self.space,
             zoom_percent: self.zoom.map(|z| z.zoom * 100.0),
             fit_percent: self.zoom.map(|z| z.fit_zoom * 100.0),
+            lens: self.lens.map(super::LensStats::from),
         }
     }
 }
@@ -390,7 +613,8 @@ struct GraphState {
     /// The raw plan, with R3 (index 0, the final picture's) and without it (index 1, the Before view's:
     /// [`RawPlan::without_vignetting`]), each with the lens switches it was made for.
     plan: [Option<PlanSlot>; 2],
-    sigma: Option<(Vec<u64>, Arc<SigmaPlane>)>,
+    /// The noise sigma plane, with its bytes in the ledger while it is cached.
+    sigma: Option<(Vec<u64>, Arc<SigmaPlane>, Option<Reservation>)>,
     groups: Option<ByteLru<(RawParamsKey, usize), Backing>>,
     /// The prepared full-resolution chain, with R3 (index 0) and without it (index 1, the Before view's):
     /// one of each, so that flipping to Before and back prepares neither again, and a settings edit
@@ -403,17 +627,62 @@ struct GraphState {
     color: Option<Arc<ColorPlan>>,
     grade: Option<ByteLru<GradeKey, Arc<GradePlan>>>,
     frames: Option<ByteLru<String, Arc<super::frame::RenderedFrame>>>,
+    /// The node thumbnails of the photo, by node (`docs/23` section 5.7): each with the key of the
+    /// picture it holds, which names everything the picture depends on up to that node.
+    node_thumbnails: BTreeMap<u32, super::thumbs::NodeThumbnailEntry>,
     /// Display-linear frames of views, before output sharpening (`frame::DisplayFrame`).
     display: Option<ByteLru<String, Arc<super::frame::DisplayFrame>>>,
+    /// The whole-image levels of the viewer (`frame::level`).
+    levels: super::frame::level::LevelStore,
     stats: Option<RenderStats>,
+    /// The photo's lens plan, with the text of the inputs it was made from (`lens::LensCtx`).
+    lens_ctx: Option<(String, Arc<lens::LensCtx>)>,
+    /// The lens's planes and lists. Outside the evictable caches on purpose: every tile and every
+    /// scale of the photo shares them, and a cache that tiles can push them out of would make them
+    /// again in the middle of a pan (`docs/21` section 3).
+    lens_planes: Option<lens::PlanesEntry>,
+    /// The photo's blur map, made once for the lens's bokeh and the Background mask (`background::BlurEntry`).
+    blur: Option<Arc<background::BlurEntry>>,
+    /// Raw groups after the lens, at 1/k: on the host, or on the device when the lens ran there
+    /// (`docs/21` section 3, "As built").
+    lens_groups: Option<ByteLru<lens::GroupKey, Backing>>,
+    /// 512 px tiles of the full-resolution raw group after the lens.
+    lens_tiles: Option<ByteLru<lens::TileKey, Backing>>,
+    /// The raw groups at 1/k after the field stage only (`Z = L2(L1(X))`, no flares), by the amounts
+    /// the stage reads: a Flares move finds its `Z` here and runs L3 alone.
+    lens_field_groups: Option<ByteLru<lens::GroupKey, Backing>>,
+    /// The 512 px tiles after the field stage only.
+    lens_field_tiles: Option<ByteLru<lens::TileKey, Backing>>,
+    /// What the device holds of the photo's lens: the spread functions, the flare planes and the scale
+    /// data, uploaded once (`lens::LensDevice`).
+    lens_device: Option<lens::LensDevice>,
+    /// The flare terms of the groups at 1/k (`f64` planes, `F (glow + veil + ghosts + ...)`), by the
+    /// amounts they read: an Edges move finds them here.
+    lens_flare_groups: Option<ByteLru<lens::GroupKey, Arc<Vec<f64>>>>,
+    /// The flare terms of the 512 px tiles.
+    lens_flare_tiles: Option<ByteLru<lens::TileKey, Arc<Vec<f64>>>>,
+}
+
+impl Drop for PhotoGraph {
+    /// The photo left the renderer's kept photos (closed, or the least recently used beyond
+    /// `MemoryBudget::max_photos`): the raster planes its views kept on the device go with it.
+    fn drop(&mut self) {
+        ym_gpu::kernels::mask_raster::forget_planes_of(self.uid);
+    }
 }
 
 /// The stage caches of one photo.
 pub struct PhotoGraph {
     id: PhotoId,
+    /// A number no other graph of the process has (an id alone repeats across renderers): what the raster planes
+    /// this photo's views keep on the device are kept under (`ym_gpu::kernels::mask_raster::PlaneKey::owner`).
+    uid: u64,
     state: Mutex<GraphState>,
     counters: StageCounters,
     budget: MemoryBudget,
+    /// The renderer's memory ledger: the raw groups this photo keeps on the host are reserved in it
+    /// while they are cached (`docs/26` H-13).
+    ledger: Arc<MemoryLedger>,
     /// A device error ended the GPU route of this photo's raw chain: from then on it renders on the
     /// CPU (`docs/17-gpu.md` section 9). The caches may hold tiles of both devices, which differ within
     /// the tolerances of the kernels; an export restarts the photo wholly on the CPU.
@@ -422,11 +691,30 @@ pub struct PhotoGraph {
     /// output sharpening and C13 of frames, thumbnails and look tiles): from then on the CPU makes
     /// its frames, quietly (`docs/17-gpu.md` section 9).
     view_gpu_failed: AtomicBool,
+    /// One of our own input checks refused a view on the device and the warning for it is logged (once per photo;
+    /// such a refusal makes that frame the CPU's and leaves the route open, `Job::view_gpu_failed`).
+    view_input_warned: AtomicBool,
+    /// The last viewport frame of this photo was made by the CPU because the device refused or failed it, and no frame since
+    /// came from the device ([`Renderer::views_on_cpu`]): the route is open, so [`Renderer::raw_on_cpu`] says no, but the
+    /// next frame is expected to be the CPU's too, and the viewport says so from the start of its round.
+    view_refused_last: AtomicBool,
+    /// A device error ended the GPU route of this photo's lens (L1 to L3 of the groups and tiles):
+    /// from then on the CPU runs the lens, with a note (`docs/17-gpu.md` section 9).
+    lens_gpu_failed: AtomicBool,
     /// When the photo's raw words were last used on the device, in ticks of the renderer's clock
     /// (the order of the two-photo LRU).
     resident_tick: AtomicU64,
     /// Held while the raw words are uploaded, so that two requests for one photo upload once.
     upload_gate: Mutex<()>,
+    /// Held while a viewer makes the photo's blur map, so that a frame and the thumbnails of a photo that ask for it
+    /// together run the network once (`background::BlurEntry`).
+    blur_gate: Mutex<()>,
+    /// The photo's Object features, the planes made from them and the encoder's state (`object::ObjectSlot`).
+    object: object::ObjectSlot,
+    /// The photo's Subject and People masks and the worker's state (`vision::VisionSlot`).
+    vision: vision::VisionSlot,
+    /// The photo's depth map and the worker's state (`depth::DepthSlot`).
+    depth: depth::DepthSlot,
     /// Exports that are rendering the photo: while there is one, the raw words stay on the device
     /// whatever else the renderer uploads (an export asks for them at every tile).
     pins: AtomicU32,
@@ -442,18 +730,51 @@ impl std::fmt::Debug for PhotoGraph {
 }
 
 impl PhotoGraph {
-    fn new(id: PhotoId, budget: MemoryBudget) -> Self {
+    /// A viewport frame of the photo was made: `refused` when the CPU made it because the device refused or failed it,
+    /// `on_device` when the device made it. A frame from the cache (neither) says nothing new.
+    pub(crate) fn note_view_frame(&self, refused: bool, on_device: bool) {
+        if refused {
+            self.view_refused_last.store(true, Ordering::SeqCst);
+        } else if on_device {
+            self.view_refused_last.store(false, Ordering::SeqCst);
+        }
+    }
+
+    fn new(id: PhotoId, budget: MemoryBudget, ledger: Arc<MemoryLedger>) -> Self {
+        static NEXT_UID: AtomicU64 = AtomicU64::new(1);
         Self {
             id,
+            uid: NEXT_UID.fetch_add(1, Ordering::Relaxed),
             state: Mutex::new(GraphState::default()),
             counters: StageCounters::default(),
             budget,
+            ledger,
             raw_gpu_failed: AtomicBool::new(false),
             view_gpu_failed: AtomicBool::new(false),
+            view_input_warned: AtomicBool::new(false),
+            view_refused_last: AtomicBool::new(false),
+            lens_gpu_failed: AtomicBool::new(false),
             resident_tick: AtomicU64::new(0),
             upload_gate: Mutex::new(()),
+            blur_gate: Mutex::new(()),
+            object: object::ObjectSlot::default(),
+            vision: vision::VisionSlot::default(),
+            depth: depth::DepthSlot::default(),
             pins: AtomicU32::new(0),
         }
+    }
+
+    /// Lets go of the caches that are counted in the ledger: the raw groups and the sigma plane. They
+    /// are made again when a request needs them; a request that holds one keeps its own reference.
+    fn release_counted(&self) {
+        let mut st = lock(&self.state);
+        st.groups = None;
+        st.sigma = None;
+    }
+
+    /// The number the photo's kept raster planes are named by.
+    pub(crate) fn uid(&self) -> u64 {
+        self.uid
     }
 
     /// The photo's raw words on the device, when they are there.
@@ -483,7 +804,7 @@ impl PhotoGraph {
     #[must_use]
     pub fn bytes(&self) -> usize {
         let st = lock(&self.state);
-        st.sigma.as_ref().map_or(0, |(_, s)| s.bytes())
+        st.sigma.as_ref().map_or(0, |(_, s, _)| s.bytes())
             + st.groups.as_ref().map_or(0, ByteLru::used)
             + st.full
                 .iter()
@@ -492,15 +813,47 @@ impl PhotoGraph {
                 .sum::<usize>()
             + st.tiles.as_ref().map_or(0, ByteLru::used)
             + st.frames.as_ref().map_or(0, ByteLru::used)
+            + st.node_thumbnails
+                .values()
+                .map(|t| t.png.len() + t.key.len())
+                .sum::<usize>()
             + st.display.as_ref().map_or(0, ByteLru::used)
+            + st.levels.bytes()
+            + st.lens_planes.as_ref().map_or(0, |e| e.planes.bytes())
+            + st.blur.as_ref().map_or(0, |e| e.bytes())
+            + self.object.bytes()
+            + self.vision.bytes()
+            + self.depth.bytes()
+            + st.lens_groups.as_ref().map_or(0, ByteLru::used)
+            + st.lens_tiles.as_ref().map_or(0, ByteLru::used)
+            + st.lens_field_groups.as_ref().map_or(0, ByteLru::used)
+            + st.lens_field_tiles.as_ref().map_or(0, ByteLru::used)
+            + st.lens_flare_groups.as_ref().map_or(0, ByteLru::used)
+            + st.lens_flare_tiles.as_ref().map_or(0, ByteLru::used)
     }
 
-    /// Drops the full-resolution intermediates (tiles and the prepared chain), keeping the small
-    /// reduced images: called when the photo is no longer the one being looked at.
+    /// Lets go of every finished frame the graph keeps, and the full-resolution intermediates
+    /// ([`PhotoGraph::release_full_resolution`]): what a memory warning takes from a photo that is not on screen. The plans,
+    /// the node thumbnails, the lens planes and the masks' maps stay.
+    fn release_finished_frames(&self) {
+        self.release_full_resolution();
+        let mut st = lock(&self.state);
+        st.frames = None;
+        st.display = None;
+    }
+
+    /// Drops the full-resolution intermediates (tiles and the prepared chain, and the lens tiles),
+    /// keeping the small reduced images and the lens's planes: called when the photo is no longer the
+    /// one being looked at.
     pub fn release_full_resolution(&self) {
         let mut st = lock(&self.state);
+        // The photo is no longer looked at: its levels (a photo's worth of device memory each) go.
+        st.levels.clear();
         st.full = [None, None];
         st.tiles = None;
+        st.lens_tiles = None;
+        st.lens_field_tiles = None;
+        st.lens_flare_tiles = None;
     }
 
     /// Drops every cache unless it was made for the image with this fingerprint.
@@ -512,6 +865,14 @@ impl PhotoGraph {
                 ..GraphState::default()
             };
         }
+    }
+
+    /// Runs `f` on the photo's whole-image levels (`frame::level`), under the graph's lock: keep it short.
+    pub(crate) fn with_levels<R>(
+        &self,
+        f: impl FnOnce(&mut super::frame::level::LevelStore) -> R,
+    ) -> R {
+        f(&mut lock(&self.state).levels)
     }
 
     /// A finished frame with this key, if one is cached.
@@ -528,6 +889,31 @@ impl PhotoGraph {
             .frames
             .get_or_insert_with(|| ByteLru::new(budget))
             .insert(key, frame, bytes);
+    }
+
+    /// The thumbnail kept for a node, when it was made for this key.
+    pub(crate) fn cached_node_thumbnail(
+        &self,
+        node: u32,
+        key: &str,
+    ) -> Option<super::thumbs::NodeThumbnailEntry> {
+        lock(&self.state)
+            .node_thumbnails
+            .get(&node)
+            .filter(|t| t.key == key)
+            .cloned()
+    }
+
+    /// Keeps a node's thumbnail, in place of the one it had.
+    pub(crate) fn store_node_thumbnail(&self, node: u32, entry: super::thumbs::NodeThumbnailEntry) {
+        lock(&self.state).node_thumbnails.insert(node, entry);
+    }
+
+    /// Forgets the thumbnails of the nodes that are not in `nodes` (they were deleted).
+    pub(crate) fn retain_node_thumbnails(&self, nodes: &[u32]) {
+        lock(&self.state)
+            .node_thumbnails
+            .retain(|node, _| nodes.contains(node));
     }
 
     /// A display-linear frame (a view before output sharpening) with this key, if one is cached.
@@ -559,6 +945,80 @@ impl PhotoGraph {
         self.cache_budget(on_device)
     }
 
+    /// The bytes the lens's reduced groups may take. They are host images, one for each amount a
+    /// slider has passed through, so the budget is that of the finished frames.
+    fn lens_group_budget(&self) -> usize {
+        (self.budget.cpu_bytes / 32) as usize
+    }
+
+    /// The bytes the lens's 512 px tiles may take: a viewport's worth of them for a few settings.
+    fn lens_tile_budget(&self) -> usize {
+        (self.budget.cpu_bytes / 12) as usize
+    }
+
+    /// The bytes the lens's reduced groups may take for an entry that is `backing`: the host's budget
+    /// for a host image, a share of the device's (as the raw groups') for an image on the device.
+    fn lens_group_budget_for(&self, backing: &Backing) -> usize {
+        match backing {
+            Backing::Cpu(_) => self.lens_group_budget(),
+            Backing::Gpu(_) => self
+                .lens_group_budget()
+                .min((self.budget.gpu_bytes / 16) as usize),
+        }
+    }
+
+    /// As [`PhotoGraph::lens_group_budget_for`], for the lens's 512 px tiles.
+    fn lens_tile_budget_for(&self, backing: &Backing) -> usize {
+        match backing {
+            Backing::Cpu(_) => self.lens_tile_budget(),
+            Backing::Gpu(_) => self
+                .lens_tile_budget()
+                .min((self.budget.gpu_bytes / 8) as usize),
+        }
+    }
+
+    /// As [`PhotoGraph::lens_group_budget_for`], for the field stage's groups.
+    fn lens_field_group_budget_for(&self, backing: &Backing) -> usize {
+        match backing {
+            Backing::Cpu(_) => self.lens_field_group_budget(),
+            Backing::Gpu(_) => self
+                .lens_field_group_budget()
+                .min((self.budget.gpu_bytes / 16) as usize),
+        }
+    }
+
+    /// As [`PhotoGraph::lens_group_budget_for`], for the field stage's tiles.
+    fn lens_field_tile_budget_for(&self, backing: &Backing) -> usize {
+        match backing {
+            Backing::Cpu(_) => self.lens_field_tile_budget(),
+            Backing::Gpu(_) => self
+                .lens_field_tile_budget()
+                .min((self.budget.gpu_bytes / 8) as usize),
+        }
+    }
+
+    /// The bytes the field stage's reduced groups may take (as the lens's groups: one for each
+    /// Edges and Anamorphic value a slider has passed through).
+    fn lens_field_group_budget(&self) -> usize {
+        (self.budget.cpu_bytes / 32) as usize
+    }
+
+    /// The bytes the field stage's 512 px tiles may take.
+    fn lens_field_tile_budget(&self) -> usize {
+        (self.budget.cpu_bytes / 12) as usize
+    }
+
+    /// The bytes the flare terms of the reduced groups may take (twice the bytes of a group's image:
+    /// the terms are `f64`).
+    fn lens_flare_group_budget(&self) -> usize {
+        (self.budget.cpu_bytes / 16) as usize
+    }
+
+    /// The bytes the flare terms of the 512 px tiles may take.
+    fn lens_flare_tile_budget(&self) -> usize {
+        (self.budget.cpu_bytes / 6) as usize
+    }
+
     fn cache_budget(&self, on_device: bool) -> usize {
         let host = self.budget.cpu_bytes / 6;
         if on_device {
@@ -573,7 +1033,6 @@ struct Inner {
     /// The photo the user is looking at (for [`Renderer::navigate`]).
     current: Mutex<Option<PhotoId>>,
     looks: Arc<dyn LookProvider>,
-    display: RwLock<DisplayChoice>,
     /// The options, replaced as a whole when the GPU or the memory budget is attached later
     /// ([`Renderer::set_gpu`], [`Renderer::set_budget`]); readers take the `Arc`.
     options: RwLock<Arc<RenderOptions>>,
@@ -592,6 +1051,12 @@ struct Inner {
     /// chain for the rest of the process (`docs/17-gpu.md` section 9, "Shader: that kernel family
     /// is off for the process").
     raw_gpu_disabled: AtomicBool,
+    /// The losses of devices so far ([`Renderer::reopen_gpu_if_lost`]); held while a device is reopened, so that
+    /// requests that meet the loss together open one device.
+    reopen: Mutex<ReopenState>,
+    /// How many devices the renderer has been given by a reopen; the native viewport compares it to know that the
+    /// device it draws with has been replaced ([`Renderer::gpu_generation`]).
+    gpu_generation: AtomicU64,
     /// The clock of the two-photo LRU of resident raw words ([`PhotoGraph::resident_tick`]).
     resident_clock: AtomicU64,
     /// The photo the person looked at before the current one: its raw words are the second to go.
@@ -599,6 +1064,9 @@ struct Inner {
     /// A shader of the view stages failed to compile on this machine: the device does not run them
     /// for the rest of the process.
     view_gpu_disabled: AtomicBool,
+    /// A shader of the lens kernels failed to compile on this machine: the device does not run the lens
+    /// for the rest of the process.
+    lens_gpu_disabled: AtomicBool,
     /// Held while a prefetch of raw words counts the photos that are resident and uploads, so that
     /// two prefetches do not both find room for the last place ([`Renderer::prefetch_raw`]).
     prefetch_gate: Mutex<()>,
@@ -609,6 +1077,82 @@ struct Inner {
     /// again on the CPU; without the flag every later export would try the same shader and fail the
     /// same way before it fell back.
     tail_gpu_disabled: AtomicBool,
+    /// The cameras' spectral curves projected on the lens data (`CameraResponse`), by the profile's
+    /// curves file; a camera whose curves cannot be read keeps the reason. Read once per camera.
+    lens_cameras: Mutex<HashMap<String, Result<CameraResponse, String>>>,
+    /// Who hears when the Object encoder starts or stops working for a photo (`Renderer::set_object_listener`).
+    object_listener: Mutex<Option<ObjectListener>>,
+    /// The renderer that makes SAM's pictures: no graphics device, so the pictures are the CPU reference path's
+    /// (`Renderer::object_reference`).
+    object_reference: std::sync::OnceLock<Result<Renderer, RenderError>>,
+    /// The latest picture SAM and Vision read, with the hash of its key (`Renderer::object_key`): the Object worker and the
+    /// Subject and People worker of a photo with rows of both kinds read the same 1024 px picture, made once
+    /// (`Renderer::object_picture`). The lock is held while the picture is made, so the second worker waits for the first
+    /// and takes its picture.
+    object_picture: Mutex<Option<(u64, Arc<crate::apple_auto::AdvisorPicture>)>>,
+    /// How many of those pictures were made (not taken from the slot).
+    object_pictures_made: AtomicU64,
+    /// Who hears when the Subject and People worker starts or ends its work for a photo
+    /// (`Renderer::set_vision_listener`).
+    vision_listener: Mutex<Option<vision::VisionListener>>,
+    /// Who hears when the depth worker starts or ends its work for a photo (`Renderer::set_depth_listener`).
+    depth_listener: Mutex<Option<depth::DepthListener>>,
+}
+
+/// Who hears when the Object encoder starts or stops working for a photo ([`Renderer::set_object_listener`]).
+pub(crate) type ObjectListener = Arc<dyn Fn(PhotoId, super::object::ObjectPhase) + Send + Sync>;
+
+/// Whether the device runs the raw stages that a stage of [`GpuStages`] lets it run, for one photo:
+/// the checks [`Job::raw_device`] makes and [`Renderer::raw_on_cpu`] reports, in one place so that
+/// the two cannot drift.
+enum RawDevice {
+    /// The device runs them.
+    On(Arc<Gpu>),
+    /// There is no device, or the stage is not on.
+    Off,
+    /// A device error ended the route, for the photo or for the process.
+    Ended,
+    /// The device is lost.
+    Lost(Arc<Gpu>),
+}
+
+impl RawDevice {
+    /// The checks, in this order, for the options `opts` and the photo's graph (`None` when the photo
+    /// has none yet: no device error can have ended its route then).
+    fn of(
+        opts: &RenderOptions,
+        inner: &Inner,
+        graph: Option<&PhotoGraph>,
+        stage: GpuStages,
+    ) -> Self {
+        let Some(gpu) = opts.gpu.clone() else {
+            return Self::Off;
+        };
+        if !opts.gpu_stages.contains(stage) {
+            return Self::Off;
+        }
+        if graph.is_some_and(|g| g.raw_gpu_failed.load(Ordering::SeqCst))
+            || inner.raw_gpu_disabled.load(Ordering::SeqCst)
+        {
+            return Self::Ended;
+        }
+        if gpu.is_lost() {
+            return Self::Lost(gpu);
+        }
+        Self::On(gpu)
+    }
+}
+
+/// Whether the device runs the demosaic method of `opts`: it runs the adaptive ratio demosaic only
+/// (any other is the test switch of [`RenderOptions::demosaic`]), and the CPU runs the raw chain of a
+/// render with another.
+fn device_runs_demosaic(opts: &RenderOptions) -> bool {
+    opts.demosaic == Method::AdaptiveRatio
+}
+
+/// Whether the device chain has a kernel for the R6 denoise of `opts` ([`DenoiseMethod::runs_on_device`]).
+fn device_runs_denoise(opts: &RenderOptions) -> bool {
+    opts.denoise.runs_on_device()
 }
 
 /// The render engine (see the module documentation of [`crate::pipeline`]). Cheap to clone.
@@ -637,11 +1181,10 @@ impl Renderer {
             RenderError::Thread(e.to_string())
         })?;
         let ledger = MemoryLedger::new(options.budget.cpu_bytes);
-        Ok(Self {
+        let renderer = Self {
             inner: Arc::new(Inner {
                 current: Mutex::new(None),
                 looks,
-                display: RwLock::new(DisplayChoice::Aces2),
                 options: RwLock::new(Arc::new(options)),
                 graphs: Mutex::new(Vec::new()),
                 thumbnail_details: Mutex::new(HashMap::new()),
@@ -650,13 +1193,104 @@ impl Renderer {
                 scheduler,
                 ledger,
                 raw_gpu_disabled: AtomicBool::new(false),
+                reopen: Mutex::new(ReopenState::default()),
+                gpu_generation: AtomicU64::new(0),
                 resident_clock: AtomicU64::new(0),
                 previous: Mutex::new(None),
                 view_gpu_disabled: AtomicBool::new(false),
+                lens_gpu_disabled: AtomicBool::new(false),
                 prefetch_gate: Mutex::new(()),
                 tail_gpu_disabled: AtomicBool::new(false),
+                lens_cameras: Mutex::new(HashMap::new()),
+                object_listener: Mutex::new(None),
+                object_reference: std::sync::OnceLock::new(),
+                object_picture: Mutex::new(None),
+                object_pictures_made: AtomicU64::new(0),
+                vision_listener: Mutex::new(None),
+                depth_listener: Mutex::new(None),
             }),
-        })
+        };
+        // The graphs' counted caches are given up when a reservation would otherwise be refused.
+        let weak = Arc::downgrade(&renderer.inner);
+        renderer
+            .inner
+            .ledger
+            .add_reclaimer(Arc::new(move |what| match weak.upgrade() {
+                Some(inner) => {
+                    Self::reclaim_caches(&inner, what);
+                    true
+                }
+                None => false,
+            }));
+        Ok(renderer)
+    }
+
+    /// Lets go of the caches the ledger counts (raw groups and sigma planes), of the photos other
+    /// than `keep` first when `all` is false: what [`MemoryLedger::reserve_reclaiming`] asks for.
+    fn reclaim_caches(inner: &Inner, what: crate::scheduler::Reclaim) {
+        let graphs: Vec<(PhotoId, Arc<PhotoGraph>)> = lock(&inner.graphs).clone();
+        for (id, g) in graphs {
+            if what.all || Some(id) != what.keep {
+                g.release_counted();
+            }
+        }
+    }
+
+    /// Lets go of every cache the ledger counts, in every photo's graph (a test's way to check that
+    /// what is left in the ledger is only what the caches held, and a trim for the shell).
+    pub fn release_caches(&self) {
+        Self::reclaim_caches(
+            &self.inner,
+            crate::scheduler::Reclaim {
+                all: true,
+                keep: None,
+            },
+        );
+    }
+
+    /// Lets go of the finished-frame caches of every photo but `keep` (the photo on screen), the ones a memory warning drops
+    /// (`docs/26` P4-5): the rendered frames and the display-linear frames, the prepared full-resolution chain with its tiles,
+    /// the whole-image levels and the lens tiles. What the person is looking at keeps all of its caches. The raw groups and
+    /// the sigma plane, which the ledger counts, are the reclaimers' ([`MemoryLedger::reclaim`](crate::scheduler::MemoryLedger::reclaim)),
+    /// so no cache has two ways of being freed. Returns how many photos were trimmed.
+    pub fn release_off_screen_frames(&self, keep: Option<PhotoId>) -> usize {
+        let graphs: Vec<Arc<PhotoGraph>> = lock(&self.inner.graphs)
+            .iter()
+            .filter(|(id, _)| Some(*id) != keep)
+            .map(|(_, g)| Arc::clone(g))
+            .collect();
+        for g in &graphs {
+            g.release_finished_frames();
+        }
+        graphs.len()
+    }
+
+    /// What a critical memory level adds on the device: the raw words and the kept raster planes of every photo but `keep`,
+    /// then the pool's free buffers. A request that is using a photo's words keeps its own reference. Returns the bytes the
+    /// pool gave back (0 without a device).
+    pub fn trim_gpu(&self, keep: Option<PhotoId>) -> u64 {
+        let graphs: Vec<Arc<PhotoGraph>> = lock(&self.inner.graphs)
+            .iter()
+            .filter(|(id, _)| Some(*id) != keep)
+            .map(|(_, g)| Arc::clone(g))
+            .collect();
+        for g in graphs.iter().filter(|g| g.pins.load(Ordering::SeqCst) == 0) {
+            g.drop_resident();
+            ym_gpu::kernels::mask_raster::forget_planes_of(g.uid());
+        }
+        // The pool lives on the device's thread: the trim is a job of its own, at the lowest priority of the viewer's work, and
+        // is waited for for a moment at most (a device busy with an export must not hold the caller).
+        let Some(gpu) = self.options().gpu.clone() else {
+            return 0;
+        };
+        let job = gpu.scheduler().submit(
+            ym_gpu::queue::JobSpec::new(Priority::Thumbnail),
+            |ctx, _| ctx.pool().trim(),
+        );
+        match job.wait_timeout(Duration::from_secs(2)) {
+            Some(Ok(bytes)) => bytes,
+            _ => 0,
+        }
     }
 
     /// A renderer with only the Neutral look and default options (tests and tools).
@@ -710,6 +1344,100 @@ impl Renderer {
         });
     }
 
+    /// How many times a lost device has been replaced ([`Renderer::reopen_gpu_if_lost`]). A consumer that holds the
+    /// device (the native viewport draws with it) reads the current one from [`Renderer::options`] when this changes.
+    #[must_use]
+    pub fn gpu_generation(&self) -> u64 {
+        self.inner.gpu_generation.load(Ordering::SeqCst)
+    }
+
+    /// Sets how a lost device is replaced (`None`: never). For the start of a run, like [`Renderer::set_gpu`].
+    pub fn set_gpu_reopener(&self, reopener: Option<GpuReopener>) {
+        self.update_options(|o| o.gpu_reopener = reopener);
+    }
+
+    /// Replaces the renderer's device when it is lost (or tainted: results of such a device are void) and a
+    /// [`GpuReopener`] is set; called when a request starts, so a request never begins on a device it can see is
+    /// gone. A new device is opened, and what belonged to the old one is dropped: the photo graphs with their caches of
+    /// device images, their resident raw words and their per-photo "the device failed" marks (the old device's
+    /// kernels, tables, raster planes and pool go with its last reference). The process-wide marks of a shader that
+    /// would not compile stay: a new device compiles the same source. Requests already running keep the options they
+    /// began with and finish on the old device or fall back, as before.
+    ///
+    /// Back-off: a device counts as lost once; after [`REOPEN_MAX_LOSSES`] losses within [`REOPEN_WINDOW`] the
+    /// renderer stays on the CPU (the pill and the notes say so as for any lost device) until the window has passed,
+    /// and a reopen that failed is not tried again for a few seconds. Logs once per reopen.
+    pub fn reopen_gpu_if_lost(&self) {
+        let opts = self.options();
+        let (Some(old), Some(reopen)) = (opts.gpu.clone(), opts.gpu_reopener.clone()) else {
+            return;
+        };
+        if !old.is_lost() {
+            return;
+        }
+        let mut st = lock(&self.inner.reopen);
+        // Another request may have replaced the device while this one waited for the lock.
+        if !self
+            .options()
+            .gpu
+            .as_ref()
+            .is_some_and(|g| Arc::ptr_eq(g, &old))
+        {
+            return;
+        }
+        let now = Instant::now();
+        if !st
+            .counted
+            .as_ref()
+            .is_some_and(|w| Weak::ptr_eq(w, &Arc::downgrade(&old)))
+        {
+            st.losses.push_back(now);
+            st.counted = Some(Arc::downgrade(&old));
+            tracing::warn!(
+                reason = old.lost_reason().unwrap_or_default(),
+                "the graphics device was lost"
+            );
+        }
+        while st
+            .losses
+            .front()
+            .is_some_and(|t| now.duration_since(*t) > REOPEN_WINDOW)
+        {
+            st.losses.pop_front();
+        }
+        if st.losses.len() >= REOPEN_MAX_LOSSES {
+            if !st.gave_up_logged {
+                st.gave_up_logged = true;
+                tracing::warn!(
+                    losses = st.losses.len(),
+                    "the graphics device was lost {REOPEN_MAX_LOSSES} times within a minute; the CPU renders until it has been quiet for a minute"
+                );
+            }
+            return;
+        }
+        if st
+            .failed_at
+            .is_some_and(|t| now.duration_since(t) < REOPEN_RETRY_AFTER)
+        {
+            return;
+        }
+        match (reopen.0)() {
+            Ok(new) => {
+                st.failed_at = None;
+                st.gave_up_logged = false;
+                self.update_options(|o| o.gpu = Some(new.clone()));
+                // Graphs hold images and kernels' tables on the old device and marks that the old device failed.
+                lock(&self.inner.graphs).clear();
+                self.inner.gpu_generation.fetch_add(1, Ordering::SeqCst);
+                tracing::info!(adapter = %new.info().name, "the graphics device was reopened");
+            }
+            Err(reason) => {
+                st.failed_at = Some(now);
+                tracing::warn!(%reason, "the graphics device could not be reopened; the CPU renders");
+            }
+        }
+    }
+
     /// Makes a device error a failure of the photo (`GpuPolicy::Require`) or a fall-back to the CPU
     /// (every other policy). Like [`set_gpu`](Self::set_gpu) it is for the start of a run.
     pub fn set_gpu_strict(&self, strict: bool) {
@@ -753,30 +1481,62 @@ impl Renderer {
         &self.inner.looks
     }
 
-    /// Chooses the display rendering (Preferences). Cached grade plans of the other choice stop
-    /// matching and are rebuilt on the next request.
-    pub fn set_display(&self, choice: DisplayChoice) {
-        *self
-            .inner
-            .display
-            .write()
-            .unwrap_or_else(PoisonError::into_inner) = choice;
-    }
-
-    /// The display rendering in effect.
-    #[must_use]
-    pub fn display(&self) -> DisplayChoice {
-        self.inner
-            .display
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone()
-    }
-
     /// The GPU in use, if any.
     #[must_use]
     pub fn gpu_info(&self) -> Option<GpuInfo> {
         self.options().gpu.as_ref().map(|g| g.info().clone())
+    }
+
+    /// Whether a render of the photo runs its raw chain on the CPU: no device, `GpuStages::RAW_CHAIN`
+    /// off, a device error ended the route for the photo or for the process, the device is lost, or
+    /// the demosaic method is not the one the device runs. The same checks as the route of a render
+    /// that starts now (a render already running keeps the options it began with); asking makes no
+    /// graph for the photo and changes nothing. The app's viewport says "Rendering on the CPU" from it,
+    /// since such a frame, or the full-resolution tiles a zoom needs, can take seconds.
+    #[must_use]
+    pub fn raw_on_cpu(&self, id: PhotoId) -> bool {
+        let opts = self.options();
+        let graph = self.existing_graph(id);
+        let on_device = matches!(
+            RawDevice::of(&opts, &self.inner, graph.as_deref(), GpuStages::RAW_CHAIN),
+            RawDevice::On(_)
+        );
+        // The view stages too: a device error on a view ends the device route of the photo's views
+        // (`Job::view_gpu_failed`), and a shader that fails ends it for the process. Those frames are the CPU's.
+        let views_on_cpu = graph
+            .as_deref()
+            .is_some_and(|g| g.view_gpu_failed.load(Ordering::SeqCst))
+            || self.inner.view_gpu_disabled.load(Ordering::SeqCst);
+        !on_device || !device_runs_demosaic(&opts) || !device_runs_denoise(&opts) || views_on_cpu
+    }
+
+    /// Whether the viewport's next frame of the photo is expected to be the CPU's: [`Renderer::raw_on_cpu`], or the last
+    /// viewport frame was made by the CPU after the device refused it (a check of ours, a buffer that did not fit: the route
+    /// stays open and the device is tried again, but until a frame comes from the device the viewport says "Rendering on
+    /// the CPU" from the start of each round, not only after the CPU frame is back). Asking makes no graph and changes
+    /// nothing.
+    #[must_use]
+    pub fn views_on_cpu(&self, id: PhotoId) -> bool {
+        self.raw_on_cpu(id)
+            || self
+                .existing_graph(id)
+                .is_some_and(|g| g.view_refused_last.load(Ordering::SeqCst))
+    }
+
+    /// Whether the core is making a raster mask of these settings for the first time (`docs/23` section 7.6): the
+    /// photo's first blur map for a Background row with the eye on (made by the round that starts now), or the Subject
+    /// and People masks or the depth map that the background workers are making for a row with the eye on
+    /// (`viewport_busy.finding`).
+    /// The app says "Finding…" under the rows meanwhile. Asking makes no graph and changes nothing.
+    #[must_use]
+    pub fn finding_masks(&self, id: PhotoId, settings: &crate::settings::DevelopSettings) -> bool {
+        (has_background_row(settings)
+            && self
+                .existing_graph(id)
+                .is_none_or(|g| lock(&g.state).blur.is_none()))
+            || (!crate::pipeline::color::vision_kinds(settings).is_empty()
+                && self.vision_working(id))
+            || (crate::pipeline::color::has_depth_row(settings) && self.depth_working(id))
     }
 
     /// The graph of a photo, made on first use. The least recently used graphs beyond
@@ -791,7 +1551,11 @@ impl Renderer {
             let e = graphs.remove(i);
             graphs.push(e);
         } else {
-            let g = Arc::new(PhotoGraph::new(id, self.options().budget));
+            let g = Arc::new(PhotoGraph::new(
+                id,
+                self.options().budget,
+                Arc::clone(&self.inner.ledger),
+            ));
             graphs.push((id, g));
         }
         let max = self.options().budget.max_photos.max(1);
@@ -972,12 +1736,34 @@ impl Renderer {
     pub fn forget(&self, id: PhotoId) {
         lock(&self.inner.graphs).retain(|(p, _)| *p != id);
         lock(&self.inner.thumbnail_details).remove(&id);
+        *lock(&self.inner.object_picture) = None;
+    }
+
+    /// The slot that keeps the latest picture SAM and Vision read (`Renderer::object_picture`), locked.
+    pub(super) fn object_picture_slot(
+        &self,
+    ) -> std::sync::MutexGuard<'_, Option<(u64, Arc<crate::apple_auto::AdvisorPicture>)>> {
+        lock(&self.inner.object_picture)
+    }
+
+    pub(super) fn count_object_picture(&self) {
+        self.inner
+            .object_pictures_made
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// How many pictures for SAM and Vision this renderer has made, not counting the ones taken from the latest (a test's
+    /// check that a photo with Object and Subject rows makes its picture once).
+    #[must_use]
+    pub fn object_pictures_made(&self) -> u64 {
+        self.inner.object_pictures_made.load(Ordering::Relaxed)
     }
 
     /// Forgets everything (the session closed).
     pub fn forget_all(&self) {
         lock(&self.inner.graphs).clear();
         lock(&self.inner.thumbnail_details).clear();
+        *lock(&self.inner.object_picture) = None;
     }
 
     /// The detail statistic of the latest thumbnail rendered for a photo
@@ -1181,6 +1967,16 @@ impl ResidentImage {
         }
     }
 
+    /// An image made of `pieces` (they do not overlap and cover `width x height`) on `gpu`.
+    fn of_pieces(pieces: Vec<Piece>, width: usize, height: usize, gpu: &Arc<Gpu>) -> Self {
+        Self {
+            pieces,
+            width,
+            height,
+            gpu: Arc::downgrade(gpu),
+        }
+    }
+
     /// A tile made on `gpu`.
     fn of_tile(image: Arc<GpuImage>, gpu: &Arc<Gpu>) -> Self {
         Self {
@@ -1235,6 +2031,10 @@ pub(crate) enum PartSource {
     Group(usize),
     /// The tile `(tx, ty)` of the full-resolution group.
     Tile(usize, usize),
+    /// The raw group at 1/k after the lens (`lens_groups`).
+    LensGroup(usize),
+    /// The tile `(tx, ty)` of the full-resolution group after the lens (`lens_tiles`).
+    LensTile(usize, usize),
 }
 
 /// A cached image on the device and its place in the buffer a view samples from.
@@ -1288,6 +2088,10 @@ pub(crate) struct Job<'a> {
     pub runs: StageRuns,
     pub timings: StageTimings,
     pub notes: Vec<String>,
+    /// A device error made the CPU do work of this request ([`RenderReport::device_refused`]).
+    device_refused: bool,
+    /// The first reason the CPU took over ([`RenderReport::cpu_reason`]).
+    cpu_reason: Option<String>,
     started: Instant,
     params: Option<RawParams>,
     /// The decoded area of this request (see [`Job::frame`]).
@@ -1321,6 +2125,27 @@ pub(crate) struct Job<'a> {
     front_failed: bool,
     /// This request pins the photo's raw words on the device while it lives ([`Job::for_export`]).
     pinned: bool,
+    /// The photo's lens for this request ([`Job::lens_ctx`]); `Some(None)` is known to be none.
+    lens: Option<Option<Arc<lens::LensCtx>>>,
+    /// What the lens's planes say about the bokeh, once this request has used or made them.
+    lens_report: Option<ReshapeReport>,
+    /// The planes an export made for itself from the CPU reference group (`lens::planes`): the
+    /// graph's cache is the viewer's, and an export must not depend on what the viewer's device made.
+    lens_job_planes: Option<Arc<LensPlanes>>,
+    /// The blur map an export made for itself from the CPU reference group (as `lens_job_planes`).
+    blur_job: Option<Arc<background::BlurEntry>>,
+    /// What the device holds of the lens for an export's request (an export keeps its own, as it keeps its
+    /// own planes): `lens::LensDevice`.
+    lens_job_device: Option<lens::LensDevice>,
+    /// The mask view of a viewport frame ([`Job::with_mask_view`]) and the grade plan that ends at the node's
+    /// mask, once the frame has asked for it ([`Job::mask_grade`]).
+    mask: Option<(MaskView, Option<Arc<GradePlan>>)>,
+    /// What this request found out about the photo's Object rows (`object::JobObjects`).
+    object: object::JobObjects,
+    /// What this request found out about the photo's Subject and People rows (`vision::JobVision`).
+    vision: vision::JobVision,
+    /// What this request found out about the photo's Depth rows (`depth::JobDepth`).
+    depth: depth::JobDepth,
 }
 
 impl Drop for Job<'_> {
@@ -1366,6 +2191,7 @@ impl<'a> Job<'a> {
     /// A request that is not refused for a photo of a closed session: an export, which goes on
     /// with its snapshot.
     pub fn for_export(r: &'a Renderer, src: &'a PhotoSource, cancel: &'a CancelToken) -> Self {
+        r.reopen_gpu_if_lost();
         let g = r.graph(src.id);
         g.adopt(src.fingerprint);
         g.pins.fetch_add(1, Ordering::SeqCst);
@@ -1377,6 +2203,8 @@ impl<'a> Job<'a> {
             runs: StageRuns::default(),
             timings: StageTimings::default(),
             notes: Vec::new(),
+            device_refused: false,
+            cpu_reason: None,
             started: Instant::now(),
             params: None,
             frame: None,
@@ -1390,7 +2218,170 @@ impl<'a> Job<'a> {
             capture_sharpening: true,
             front_failed: false,
             pinned: true,
+            lens: None,
+            lens_report: None,
+            lens_job_planes: None,
+            blur_job: None,
+            lens_job_device: None,
+            mask: None,
+            object: object::JobObjects::default(),
+            vision: vision::JobVision::default(),
+            depth: depth::JobDepth::default(),
         }
+    }
+
+    /// This request is a viewport frame that shows a node's mask (`docs/23` section 5.8). Nothing else sets
+    /// it: an export, the Before view, a thumbnail, a look tile and a pixel readout are never a mask view.
+    #[must_use]
+    pub fn with_mask_view(mut self, view: Option<MaskView>) -> Self {
+        self.mask = view.map(|v| (v, None));
+        self
+    }
+
+    /// The mask view of this request, when it has one.
+    pub fn mask_view(&self) -> Option<MaskView> {
+        self.mask.as_ref().map(|(v, _)| *v)
+    }
+
+    /// The grade plan that ends at the mask view's node (the plan compiled to its mask, which holds the node
+    /// and what it needs, live or dead), once [`Job::prepare_mask_view`] has made it.
+    pub fn mask_grade(&self) -> Option<Arc<GradePlan>> {
+        self.mask.as_ref().and_then(|(_, g)| g.clone())
+    }
+
+    /// The grade plan of the mask view's overlay: the plan that ends at the node's mask, when the view is an
+    /// Overlay (a Mask only view makes it the frame's own plan instead).
+    pub fn overlay_grade(&self) -> Option<Arc<GradePlan>> {
+        match self.mask {
+            Some((v, Some(ref g))) if v.style == MaskStyle::Overlay => Some(Arc::clone(g)),
+            _ => None,
+        }
+    }
+
+    /// What the mask view adds to the key of a finished frame: the node, the style and the key of the plan that
+    /// ends at the node's mask.
+    pub fn mask_key(&self) -> Option<String> {
+        let (v, g) = self.mask.as_ref()?;
+        Some(format!(
+            "mask:{}:{:?}:{:?}:{}:{}",
+            v.node,
+            v.style,
+            v.row,
+            v.depth,
+            g.as_ref()
+                .map(|g| format!("{:?}", g.key))
+                .unwrap_or_default()
+        ))
+    }
+
+    /// Whether the mask view's plan has a shape that reads the pixels' places in the photo, so that the sampled
+    /// picture has to carry them.
+    pub fn mask_uses_photo_position(&self) -> bool {
+        self.mask
+            .as_ref()
+            .and_then(|(_, g)| g.as_ref())
+            .is_some_and(|g| g.chain.uses_photo_position())
+    }
+
+    /// Whether the mask view's plan has a raster row, so that the mask chain makes planes too.
+    pub fn mask_uses_rasters(&self) -> bool {
+        self.mask
+            .as_ref()
+            .and_then(|(_, g)| g.as_ref())
+            .is_some_and(|g| g.chain.uses_rasters())
+    }
+
+    /// Makes the grade plan of the mask view, if the request has one. Cached with the photo's other grade
+    /// plans.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Job::grade_to`]; [`RenderError::Color`] when the photo has no such node.
+    pub fn prepare_mask_view(&mut self, target: OutputTarget) -> Result<(), RenderError> {
+        let Some((view, _)) = self.mask else {
+            return Ok(());
+        };
+        // The page names the node it has selected; one the photo no longer has (it was deleted a moment ago, an
+        // undo took it away) leaves the frame as the photo, not an error.
+        if self.src.settings.nodes.corrector(view.node).is_none() {
+            self.mask = None;
+            return Ok(());
+        }
+        // A row view reads the photo as if the node had that row alone (`color::only_row`); a row the node does not have
+        // is the node's own view.
+        let only = view
+            .row
+            .and_then(|r| only_row(&self.src.settings, view.node, r as usize));
+        // Show depth (`MaskView::depth`) is the Mask only view of a Depth row whose steps are left out: the settings carry the row
+        // alone, plain (the plane of the whole map has no Grow, Feather, Refine edges, Invert or Opacity), and the style is Mask
+        // only. On any other row or kind the flag means nothing.
+        let depth_row = view.depth
+            && view.row.is_some_and(|r| {
+                matches!(
+                    self.src
+                        .settings
+                        .nodes
+                        .masks_of(view.node)
+                        .and_then(|m| m.items.get(r as usize))
+                        .map(|row| &row.shape),
+                    Some(MaskShape::Depth(_))
+                )
+            });
+        let (view, only) = if depth_row {
+            let plain = only.map(|mut settings| {
+                if let Some(row) = settings
+                    .nodes
+                    .masks_of_mut(view.node)
+                    .and_then(|m| m.items.first_mut())
+                {
+                    row.invert = false;
+                    row.opacity = 1.0;
+                }
+                settings
+            });
+            (
+                MaskView {
+                    style: MaskStyle::MaskOnly,
+                    ..view
+                },
+                plain,
+            )
+        } else {
+            (
+                MaskView {
+                    depth: false,
+                    ..view
+                },
+                only,
+            )
+        };
+        // The plans below are made for this view (Show depth asks the planes for the map as grey, for this node only).
+        self.mask = Some((view, None));
+        let (view, plan) = match only {
+            Some(settings) => {
+                let src = PhotoSource {
+                    settings,
+                    ..self.src.clone()
+                };
+                (
+                    view,
+                    self.grade_to_in(&src, target, true, PlanStop::Mask(view.node))?,
+                )
+            }
+            None => {
+                let view = MaskView {
+                    row: None,
+                    depth: false,
+                    ..view
+                };
+                (
+                    view,
+                    self.grade_to(target, true, PlanStop::Mask(view.node))?,
+                )
+            }
+        };
+        self.mask = Some((view, Some(plan)));
+        Ok(())
     }
 
     /// The raw group of this request runs without R8 capture sharpening (neither Richardson-Lucy nor
@@ -1401,6 +2392,7 @@ impl<'a> Job<'a> {
     pub fn without_capture_sharpening(mut self) -> Self {
         self.capture_sharpening = false;
         self.params = None;
+        self.lens = None;
         self
     }
 
@@ -1419,6 +2411,7 @@ impl<'a> Job<'a> {
     #[must_use]
     pub fn with_options(mut self, opts: Arc<RenderOptions>) -> Self {
         self.opts = opts;
+        self.lens = None;
         self
     }
 
@@ -1455,13 +2448,17 @@ impl<'a> Job<'a> {
     ) -> RenderReport {
         self.g.counters.add(&self.runs);
         let neural = &self.opts.neural;
-        if self.src.settings.decode.neural_demosaic
+        if self.src.settings.input().decode.neural_demosaic
             && !neural.available
             && let Some(reason) = &neural.reason
         {
             let reason = reason.clone();
             self.note(&reason);
         }
+        if !self.src.settings.input().lens.is_identity() && self.opts.lens.is_none() {
+            self.note(LENS_UNAVAILABLE_NOTE);
+        }
+        let lens = self.lens_report_for_finish();
         let report = RenderReport {
             ms: self.started.elapsed().as_secs_f64() * 1000.0,
             path: RenderPath::Classical,
@@ -1472,7 +2469,10 @@ impl<'a> Job<'a> {
             runs: self.runs,
             timings: self.timings,
             notes: std::mem::take(&mut self.notes),
+            device_refused: self.device_refused,
+            cpu_reason: self.cpu_reason.take(),
             zoom: None,
+            lens,
         };
         tracing::debug!(
             photo = %self.src.id,
@@ -1513,11 +2513,11 @@ impl<'a> Job<'a> {
         let g0 = e
             .initial_gains()
             .map_err(|err| RenderError::Color(err.to_string()))?;
-        let nr = match s.noise_reduction.manual() {
+        let nr = match s.input().noise_reduction.manual() {
             Some(m) => *m,
             None => e.noise_reduction,
         };
-        let sh = match s.sharpen.manual() {
+        let sh = match s.input().sharpen.manual() {
             Some(m) => *m,
             None => e.sharpen,
         };
@@ -1539,17 +2539,17 @@ impl<'a> Job<'a> {
         }
         let p = RawParams {
             g0: [g0[0] as f32, g0[1] as f32, g0[2] as f32],
-            neural_demosaic: s.decode.neural_demosaic,
-            highlight_recovery: s.decode.highlight_recovery,
-            lens_corrections: s.decode.lens_corrections,
-            chromatic_aberration: s.decode.chromatic_aberration,
+            neural_demosaic: s.input().decode.neural_demosaic,
+            highlight_recovery: s.input().decode.highlight_recovery,
+            lens_corrections: s.input().decode.lens_corrections,
+            chromatic_aberration: s.input().decode.chromatic_aberration,
             // The Before view shows the photo without the lens vignetting correction, as the camera's own
             // picture does (`PhotoSource::for_before_view`); every other render has R3. A photo with no
             // vignetting table to apply (none in the file, the lens switch off, a camera-processed file)
             // is the same with and without R3, so its Before view shares the final picture's raw front
             // and its caches: flipping to Before costs no raw work there.
             vignetting: !(self.src.before_view
-                && has_vignetting_profile(&self.src.raw, s.decode.lens_corrections)),
+                && has_vignetting_profile(&self.src.raw, s.input().decode.lens_corrections)),
             noise_reduction: NoiseReduction {
                 luminance: nr.luminance as f32,
                 color: nr.color as f32,
@@ -1630,7 +2630,7 @@ impl<'a> Job<'a> {
     pub fn sigma(&mut self) -> Result<Arc<SigmaPlane>, RenderError> {
         let params = self.params()?;
         let key = params.sigma_key();
-        if let Some((k, s)) = &lock(&self.g.state).sigma
+        if let Some((k, s, _)) = &lock(&self.g.state).sigma
             && *k == key
         {
             return Ok(Arc::clone(s));
@@ -1641,7 +2641,8 @@ impl<'a> Job<'a> {
         let sigma = Arc::new(sigma_plane(&frame, &plan, &params, self.cancel)?);
         self.runs.sigma_planes += 1;
         self.timings.sigma_ms += t.elapsed().as_secs_f64() * 1000.0;
-        lock(&self.g.state).sigma = Some((key, Arc::clone(&sigma)));
+        let held = self.g.ledger.try_reserve(sigma.bytes() as u64).ok();
+        lock(&self.g.state).sigma = Some((key, Arc::clone(&sigma), held));
         Ok(sigma)
     }
 
@@ -1671,7 +2672,9 @@ impl<'a> Job<'a> {
         {
             let budget = self.g.group_budget(self.keeps_on_device());
             let mut st = lock(&self.g.state);
-            let groups = st.groups.get_or_insert_with(|| ByteLru::new(budget));
+            let groups = st
+                .groups
+                .get_or_insert_with(|| ByteLru::with_ledger(budget, Arc::clone(&self.g.ledger)));
             if let Some(entry) = groups.get(&key) {
                 return Ok(entry.clone());
             }
@@ -1695,10 +2698,15 @@ impl<'a> Job<'a> {
         };
         self.runs.raw_groups += 1;
         let (bytes, budget) = (made.bytes(), self.g.group_budget(self.keeps_on_device()));
+        // Only the host's part is counted in the ledger: an image on the device is the pool's.
+        let host_bytes = match &made {
+            Backing::Cpu(_) => bytes,
+            Backing::Gpu(_) => 0,
+        };
         lock(&self.g.state)
             .groups
-            .get_or_insert_with(|| ByteLru::new(budget))
-            .insert(key, made.clone(), bytes);
+            .get_or_insert_with(|| ByteLru::with_ledger(budget, Arc::clone(&self.g.ledger)))
+            .insert_counted(key, made.clone(), bytes, host_bytes);
         Ok(made)
     }
 
@@ -1890,6 +2898,8 @@ impl<'a> Job<'a> {
                 let (full, frame, rect) = self.tile_inputs(tx, ty, true)?;
                 self.run_full_tile(&full, &frame, rect)
             }
+            PartSource::LensGroup(k) => self.lens_make_group_on_host(k),
+            PartSource::LensTile(tx, ty) => self.lens_make_tile_on_host(tx, ty),
         }
     }
 
@@ -1910,6 +2920,10 @@ impl<'a> Job<'a> {
                     tiles.insert((key, tx, ty), Backing::Cpu(Arc::clone(image)), bytes);
                 }
             }
+            PartSource::LensGroup(_) | PartSource::LensTile(_, _) => {
+                drop(st);
+                self.lens_keep_host(source, image);
+            }
         }
     }
 
@@ -1921,6 +2935,7 @@ impl<'a> Job<'a> {
     /// device again.
     fn group_gpu_failed(&mut self, error: &GpuError) -> Result<(), RenderError> {
         let reason = error.to_string();
+        self.device_refused = true;
         tracing::warn!(error = %reason, "the device failed on a reduced group; the CPU takes over");
         if matches!(error, GpuError::Shader(_)) {
             self.r.inner.raw_gpu_disabled.store(true, Ordering::SeqCst);
@@ -1967,6 +2982,7 @@ impl<'a> Job<'a> {
             &params,
             &sigma,
             self.opts.demosaic,
+            self.opts.denoise,
             self.cancel,
         )?);
         self.runs.full_chains += 1;
@@ -2140,6 +3156,13 @@ impl<'a> Job<'a> {
         }
         let t = self.opts.tile_px.max(64);
         let mut out = RgbImage::new(rect.w, rect.h);
+        // The region keeps its place in the frame (an image made of tiles is not the whole frame).
+        out.place = Placement {
+            x0: rect.x,
+            y0: rect.y,
+            frame_width: plan.out_w,
+            frame_height: plan.out_h,
+        };
         for ty in rect.y / t..=(rect.y1() - 1) / t {
             for tx in rect.x / t..=(rect.x1() - 1) / t {
                 self.check()?;
@@ -2192,38 +3215,33 @@ impl<'a> Job<'a> {
     /// [`RenderError::Gpu`] when the device is lost, or an earlier device error ended the route, and
     /// the policy is strict.
     fn raw_device(&mut self, stage: GpuStages) -> Result<Option<Arc<Gpu>>, RenderError> {
-        let Some(gpu) = self.opts.gpu.clone() else {
-            return Ok(None);
-        };
-        if !self.opts.gpu_stages.contains(stage) {
-            return Ok(None);
-        }
-        if self.g.raw_gpu_failed.load(Ordering::SeqCst)
-            || self.r.inner.raw_gpu_disabled.load(Ordering::SeqCst)
-        {
-            // An earlier device error ended the route. A strict policy (`Require`) must not turn
-            // that into a quiet CPU render of the next photo: it fails that photo too.
-            if self.opts.gpu_strict {
-                return Err(RenderError::Gpu(
-                    "an earlier error ended the use of the graphics card, and the strict setting does not let the CPU take over"
-                        .to_owned(),
+        match RawDevice::of(&self.opts, &self.r.inner, Some(&self.g), stage) {
+            RawDevice::On(gpu) => Ok(Some(gpu)),
+            RawDevice::Off => Ok(None),
+            RawDevice::Ended => {
+                // An earlier device error ended the route. A strict policy (`Require`) must not turn
+                // that into a quiet CPU render of the next photo: it fails that photo too.
+                if self.opts.gpu_strict {
+                    return Err(RenderError::Gpu(
+                        "an earlier error ended the use of the graphics card, and the strict setting does not let the CPU take over"
+                            .to_owned(),
+                    ));
+                }
+                Ok(None)
+            }
+            RawDevice::Lost(gpu) => {
+                let why = gpu
+                    .lost_reason()
+                    .unwrap_or_else(|| "the device was lost".to_owned());
+                if self.opts.gpu_strict {
+                    return Err(RenderError::Gpu(why));
+                }
+                self.note(&format!(
+                    "The graphics card stopped working, so the CPU did: {why}."
                 ));
+                Ok(None)
             }
-            return Ok(None);
         }
-        if gpu.is_lost() {
-            let why = gpu
-                .lost_reason()
-                .unwrap_or_else(|| "the device was lost".to_owned());
-            if self.opts.gpu_strict {
-                return Err(RenderError::Gpu(why));
-            }
-            self.note(&format!(
-                "The graphics card stopped working, so the CPU did: {why}."
-            ));
-            return Ok(None);
-        }
-        Ok(Some(gpu))
     }
 
     /// The route to the device for the raw chain of this request, or `None` when the CPU runs it:
@@ -2244,8 +3262,12 @@ impl<'a> Job<'a> {
         let Some(gpu) = self.raw_device(GpuStages::RAW_CHAIN)? else {
             return Ok(None);
         };
-        if self.opts.demosaic != Method::AdaptiveRatio {
+        if !device_runs_demosaic(&self.opts) {
             self.note(METHOD_NOT_ON_DEVICE_NOTE);
+            return Ok(None);
+        }
+        if !device_runs_denoise(&self.opts) {
+            self.note(DENOISE_NOT_ON_DEVICE_NOTE);
             return Ok(None);
         }
         let mut route = GpuRoute {
@@ -2414,25 +3436,47 @@ impl<'a> Job<'a> {
     /// view stages off for the process. A strict policy fails the request; any other policy notes
     /// why the CPU makes this frame, and ends the route for the photo (view caches may then hold
     /// frames of both devices, which differ within the tolerances of the kernels; viewing only,
-    /// `docs/17-gpu.md` section 9). A buffer that does not fit (out of budget, too large) is a property
-    /// of the request and not of the photo: the CPU makes this frame, and the next one tries the
-    /// device again.
+    /// `docs/17-gpu.md` section 9). An error about the request and not about the device leaves the
+    /// route open: a buffer that does not fit (out of budget, too large), and a refusal by one of our
+    /// own input checks ([`GpuError::InvalidInput`], raised before any device work, so trying again
+    /// costs nothing). The CPU makes this frame and the next one tries the device again; the refusal
+    /// is logged as a warning once per photo (later ones at debug level), and every one is noted in
+    /// the frame's report.
     ///
     /// # Errors
     ///
     /// [`RenderError::Gpu`] under a strict policy.
     pub(crate) fn view_gpu_failed(&mut self, error: &GpuError) -> Result<(), RenderError> {
         let reason = error.to_string();
-        tracing::warn!(error = %reason, "the device failed on a view; the CPU takes over");
+        self.device_refused = true;
+        self.cpu_reason.get_or_insert_with(|| reason.clone());
+        if matches!(error, GpuError::InvalidInput(_)) {
+            if self.g.view_input_warned.swap(true, Ordering::SeqCst) {
+                tracing::debug!(error = %reason, "a view was refused by an input check; the CPU makes this frame");
+            } else {
+                tracing::warn!(error = %reason, "a view was refused by an input check; the CPU makes this frame and the device is tried again on the next");
+            }
+        } else {
+            tracing::warn!(error = %reason, "the device failed on a view; the CPU takes over");
+        }
         if matches!(error, GpuError::Shader(_)) {
             self.r.inner.view_gpu_disabled.store(true, Ordering::SeqCst);
+        }
+        // The levels of the photo are what is cheapest to make again: a device that has no room gives them up first.
+        if matches!(
+            error,
+            GpuError::OutOfBudget { .. } | GpuError::BufferTooLarge { .. }
+        ) {
+            self.g.with_levels(|s| s.clear());
         }
         if self.opts.gpu_strict {
             return Err(RenderError::Gpu(reason));
         }
         if !matches!(
             error,
-            GpuError::OutOfBudget { .. } | GpuError::BufferTooLarge { .. }
+            GpuError::OutOfBudget { .. }
+                | GpuError::BufferTooLarge { .. }
+                | GpuError::InvalidInput(_)
         ) {
             self.g.view_gpu_failed.store(true, Ordering::SeqCst);
         }
@@ -2606,23 +3650,71 @@ impl<'a> Job<'a> {
         Ok(plan)
     }
 
+    /// The key [`Job::grade`] gives the plan of an output, without building the chain.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Job::color`].
+    pub fn grade_key(
+        &mut self,
+        target: OutputTarget,
+        dither: bool,
+    ) -> Result<GradeKey, RenderError> {
+        let color = self.color()?;
+        let settings = &self.src.settings;
+        let background = self.background_for(settings, PlanStop::Output)?;
+        let objects = self.objects_for(settings, PlanStop::Output)?;
+        let req = GradeRequest {
+            target,
+            dither,
+            looks: self.r.inner.looks.as_ref(),
+            background: background.as_ref(),
+            objects: objects.as_ref(),
+        };
+        Ok(super::color::grade_key(self.src, &color, &req))
+    }
+
     /// The grade plan (C9 to C13) for an output.
     pub fn grade(
         &mut self,
         target: OutputTarget,
         dither: bool,
     ) -> Result<Arc<GradePlan>, RenderError> {
+        self.grade_to(target, dither, PlanStop::Output)
+    }
+
+    /// [`Job::grade`] for the plan that ends at `stop`: the Output, or a node's mask (the mask view).
+    pub fn grade_to(
+        &mut self,
+        target: OutputTarget,
+        dither: bool,
+        stop: PlanStop,
+    ) -> Result<Arc<GradePlan>, RenderError> {
+        self.grade_to_in(self.src, target, dither, stop)
+    }
+
+    /// [`Job::grade_to`] for the settings of `src`, which is the request's photo or the photo as the mask view of one
+    /// row reads it ([`Job::prepare_mask_view`]).
+    fn grade_to_in(
+        &mut self,
+        src: &PhotoSource,
+        target: OutputTarget,
+        dither: bool,
+        stop: PlanStop,
+    ) -> Result<Arc<GradePlan>, RenderError> {
         let color = self.color()?;
-        let display = self.r.display();
+        let background = self.background_for(&src.settings, stop)?;
+        let objects = self.objects_for(&src.settings, stop)?;
         let req = GradeRequest {
             target,
             dither,
-            display: &display,
             looks: self.r.inner.looks.as_ref(),
+            background: background.as_ref(),
+            objects: objects.as_ref(),
         };
         // Build the plan's key without building the chain: the key is part of the plan, so the
         // cheap way to know whether a cached plan matches is to build the key text first.
-        let wanted = super::color::grade_key(self.src, &color, &req);
+        let wanted = grade_key_to(src, &color, &req, stop);
         let cached = {
             let mut st = lock(&self.g.state);
             let cache = st.grade.get_or_insert_with(|| ByteLru::new(8));
@@ -2636,7 +3728,7 @@ impl<'a> Job<'a> {
             return Ok(plan);
         }
         let t = Instant::now();
-        let plan = Arc::new(grade_plan(self.src, &color, &req)?);
+        let plan = Arc::new(grade_plan_to(src, &color, &req, stop)?);
         self.runs.grade_plans += 1;
         self.timings.plans_ms += t.elapsed().as_secs_f64() * 1000.0;
         for w in &plan.warnings {
@@ -2649,16 +3741,35 @@ impl<'a> Job<'a> {
         Ok(plan)
     }
 
-    /// The geometry of the settings on this file.
-    pub fn geometry(&self) -> Geometry {
+    /// The geometry of the settings on this file, without the lens's bend: orientation, turns,
+    /// straightening and crop. Enough for the sides of the canvas and the size of the output, and
+    /// what the lens's own plan is made from.
+    pub fn base_geometry(&self) -> Geometry {
         Geometry::new(self.src.exif_orientation(), &self.src.settings)
+    }
+
+    /// The geometry of the settings on this file, through the lens's bend (L4, `docs/21` section 4)
+    /// when the photo has one: Anamorphic above 0, or Edges above 0 on a lens with distortion.
+    ///
+    /// The bend and its zoom are made once per photo from the lens plan, on the full-resolution
+    /// canvas, so every scale and every tile of the photo shares one map. Without a bend this is
+    /// [`Job::base_geometry`], and its `Debug` text (which the frame and display keys carry) names
+    /// the bend, so a slider move is a new key.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Job::lens_ctx`].
+    pub fn geometry(&mut self) -> Result<Geometry, RenderError> {
+        let base = self.base_geometry();
+        let warp = self.lens_ctx()?.and_then(|ctx| ctx.warp);
+        Ok(base.with_warp(warp))
     }
 
     /// The size of the final image at full resolution: the lens-cropped image, turned, straightened
     /// and cropped.
     pub fn final_size(&mut self) -> Result<(usize, usize), RenderError> {
         let plan = self.plan()?;
-        Ok(self.geometry().output_size(plan.out_w, plan.out_h))
+        Ok(self.base_geometry().output_size(plan.out_w, plan.out_h))
     }
 }
 
@@ -2674,6 +3785,36 @@ pub(crate) fn color_space_of(target: OutputTarget) -> ColorSpace {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A renderer with no device renders every photo's raw chain on the CPU, whether or not the photo
+    /// has a graph or a device error ended its route, and asking makes no graph. (The cases with a
+    /// device are in `tests/render_gpu.rs`, which opens one.)
+    #[test]
+    fn without_a_device_the_raw_chain_is_on_the_cpu_and_asking_changes_nothing() {
+        let r = Renderer::neutral_only().expect("the render thread");
+        let photo = PhotoId(7);
+        assert!(r.raw_on_cpu(photo));
+        assert!(r.existing_graph(photo).is_none(), "asking made a graph");
+        // The photo has a graph whose route a device error ended, and the process's route is off too.
+        r.graph(photo).raw_gpu_failed.store(true, Ordering::SeqCst);
+        r.inner.raw_gpu_disabled.store(true, Ordering::SeqCst);
+        assert!(r.raw_on_cpu(photo));
+        assert!(r.raw_on_cpu(PhotoId(8)));
+        // The checks the route makes say the same: no device, the CPU.
+        let opts = r.options();
+        assert!(matches!(
+            RawDevice::of(&opts, &r.inner, None, GpuStages::RAW_CHAIN),
+            RawDevice::Off
+        ));
+        assert!(device_runs_demosaic(&RenderOptions {
+            demosaic: Method::AdaptiveRatio,
+            ..RenderOptions::default()
+        }));
+        assert!(!device_runs_demosaic(&RenderOptions {
+            demosaic: Method::Menon,
+            ..RenderOptions::default()
+        }));
+    }
 
     /// A build without the `force-demosaic` feature has no switch: nothing reads the environment
     /// and a renderer made from the default options demosaics with the default method.

@@ -25,7 +25,12 @@ const DOM_DIR = resolve(OUT, "screenshot-dom");
  * 24 on a channel. The 0.35 % is room for another machine (a CI runner's GPU and Chromium build); if a state needs more there, it gets a
  * line here with the number measured and the date, as the states of the pre-glass comparison did.
  */
-const BUDGETS: Readonly<Record<string, number>> = {};
+const BUDGETS: Readonly<Record<string, number>> = {
+  // The consent dialog over Preferences (2026-10-26): the Preferences text under the overlay is drawn one CSS pixel to the left in about
+  // half of the runs (the boxes measure the same in both; 1.595 % of the pixels differ at Playwright's count, 0.000 % in the other runs),
+  // so the state may differ by 2 %. The dialog itself and everything outside the overlay's rim are identical in both.
+  "photos-preferences-consent": 0.02,
+};
 
 /** The reference PNG of a state. */
 export const reference = (name: string): Buffer => readFileSync(resolve(REFERENCES, `${name}.png`));
@@ -35,9 +40,13 @@ export const reference = (name: string): Buffer => readFileSync(resolve(REFERENC
  * of pixels that differ by more than 24 on a channel, the measure of the M3-01 report, is printed and kept in
  * `node_modules/.cache/yellowmoon-e2e/screenshot-diffs/<state>.json`. Returns that share, 0–1.
  */
-export async function compareScreen(page: Page, name: string, options: { maxDiffPixelRatio?: number } = {}): Promise<number> {
+export async function compareScreen(
+  page: Page,
+  name: string,
+  options: { maxDiffPixelRatio?: number; /** Where the pointer rests for the picture, in CSS pixels of the page. Default (1000, 400). */ pointer?: { x: number; y: number } } = {},
+): Promise<number> {
   await settle(page);
-  await page.mouse.move(1000, 400);
+  await page.mouse.move(options.pointer?.x ?? 1000, options.pointer?.y ?? 400);
   await page.waitForTimeout(100);
   const png = await page.screenshot({ animations: "disabled" });
   mkdirSync(ACTUAL_DIR, { recursive: true });

@@ -15,7 +15,7 @@
 //!   --out '/Users/me/Pictures/Lisbon export'
 //! ```
 //!
-//! Options that are the CLI's defaults are left out (`--compression lzw`, the name template
+//! Options that are the CLI's defaults are left out (`--compression zip`, the name template
 //! `{name}_{look}`, "Keep both"). Per-photo adjustments beyond the look do not fit on a command
 //! line (the CLI takes them through `--settings`, `docs/10`): [`CliPreview::adjusted_photos`] counts
 //! the photos whose settings the command does not reproduce, for the panel's "N photos have
@@ -84,10 +84,10 @@ pub fn command_look(settings: &[&DevelopSettings]) -> (LookId, f64) {
     for s in settings {
         match counts
             .iter_mut()
-            .find(|(l, i, _)| *l == s.look && *i == s.look_intensity)
+            .find(|(l, i, _)| *l == s.output().look && *i == s.output().look_intensity)
         {
             Some(entry) => entry.2 += 1,
-            None => counts.push((s.look.clone(), s.look_intensity, 1)),
+            None => counts.push((s.output().look.clone(), s.output().look_intensity, 1)),
         }
     }
     let mut best: Option<&(LookId, f64, usize)> = None;
@@ -108,9 +108,12 @@ pub fn command_look(settings: &[&DevelopSettings]) -> (LookId, f64) {
 pub fn command_output_sharpening(settings: &[&DevelopSettings]) -> f64 {
     let mut counts: Vec<(f64, usize)> = Vec::new();
     for s in settings {
-        match counts.iter_mut().find(|(v, _)| *v == s.output_sharpening) {
+        match counts
+            .iter_mut()
+            .find(|(v, _)| *v == s.output().output_sharpening)
+        {
             Some(entry) => entry.1 += 1,
-            None => counts.push((s.output_sharpening, 1)),
+            None => counts.push((s.output().output_sharpening, 1)),
         }
     }
     let mut best: Option<&(f64, usize)> = None;
@@ -138,8 +141,8 @@ pub fn adjusted_photos_with(
     output_sharpening: f64,
 ) -> usize {
     let mut plain = DevelopSettings::with_look(look.clone());
-    plain.look_intensity = intensity;
-    plain.output_sharpening = output_sharpening;
+    plain.output_mut().look_intensity = intensity;
+    plain.output_mut().output_sharpening = output_sharpening;
     settings.iter().filter(|s| ***s != plain).count()
 }
 
@@ -273,7 +276,7 @@ pub fn build(
         FormatKind::Tiff | FormatKind::Png => flags.push(format!("--bits {}", o.bit_depth.bits())),
         FormatKind::Dng => {}
     }
-    if o.format == FormatKind::Tiff && o.tiff_compression != TiffCompression::Lzw {
+    if o.format == FormatKind::Tiff && o.tiff_compression != TiffCompression::Zip {
         let word = match o.tiff_compression {
             TiffCompression::None => "none",
             TiffCompression::Lzw => "lzw",
@@ -352,7 +355,7 @@ mod tests {
 
     fn with_look(slug: &str, intensity: f64) -> DevelopSettings {
         let mut s = DevelopSettings::with_look(LookId::builtin(slug));
-        s.look_intensity = intensity;
+        s.output_mut().look_intensity = intensity;
         s
     }
 
@@ -386,7 +389,7 @@ mod tests {
     fn adjusted_photos_are_those_the_command_does_not_reproduce() {
         let plain = with_look("neutral", 100.0);
         let mut warm = plain.clone();
-        warm.saturation = crate::settings::PercentSetting::manual_value(20.0);
+        warm.main_grade_mut().saturation = crate::settings::PercentSetting::manual_value(20.0);
         let other_look = with_look("signature", 100.0);
         let all = [&plain, &warm, &other_look];
         let look = LookId::builtin("neutral");
@@ -436,14 +439,14 @@ mod tests {
         );
         assert_eq!(jpeg.adjusted_photos, 0);
 
-        // Only one of the two files: each is listed, and a zip tiff names its compression.
+        // Only one of the two files: each is listed, and an lzw tiff names its compression (zip is the default and is left out).
         let tiff = build(
             &paths[..1],
             &settings[..1],
             &job(ExportOptions {
                 format: FormatKind::Tiff,
                 bit_depth: BitDepth::Eight,
-                tiff_compression: TiffCompression::Zip,
+                tiff_compression: TiffCompression::Lzw,
                 color_space: ColorSpace::DisplayP3,
                 size: Size::LongEdge { px: 3000 },
                 if_exists: IfExists::Skip,
@@ -462,7 +465,7 @@ mod tests {
         for flag in [
             "--format tiff",
             "--bits 8",
-            "--compression zip",
+            "--compression lzw",
             "--colour-space p3",
             "--long-edge 3000",
             "--name '{name}-{seq}'",
@@ -472,6 +475,19 @@ mod tests {
             assert!(c.contains(flag), "{flag} in {c}");
         }
         assert!(!c.contains("--quality"), "{c}");
+
+        // The default compression is left out of the command.
+        let zip = build(
+            &paths[..1],
+            &settings[..1],
+            &job(ExportOptions {
+                format: FormatKind::Tiff,
+                ..ExportOptions::default()
+            }),
+            None,
+            None,
+        );
+        assert!(!zip.command.contains("--compression"), "{}", zip.command);
 
         let dng = build(
             &paths,
@@ -566,9 +582,9 @@ mod tests {
         ];
         let plain = with_look("neutral", 100.0);
         let mut soft = plain.clone();
-        soft.output_sharpening = 35.0;
+        soft.output_mut().output_sharpening = 35.0;
         let mut off = plain.clone();
-        off.output_sharpening = 0.0;
+        off.output_mut().output_sharpening = 0.0;
         // The default says nothing, and nothing is adjusted.
         let p = build(
             &paths,

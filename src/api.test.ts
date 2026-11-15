@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ExportJob, ViewportRect } from "./api/types";
+import { mainGradePatch } from "./state/settingsGraph";
 
 /** A manual contrast or saturation (`docs/19` section 5: Auto or a value). */
 const manual = (value: number) => ({ kind: "manual", value }) as const;
@@ -21,7 +22,7 @@ const job: ExportJob = {
     format: "jpeg",
     jpeg_quality: 92,
     bit_depth: 16,
-    tiff_compression: "lzw",
+    tiff_compression: "zip",
     color_space: "srgb",
     size: { kind: "full" },
     destination: null,
@@ -36,6 +37,7 @@ type Row = [name: string, call: () => Promise<unknown>, command: string, args: R
 const calls: Row[] = [
   ["openPaths", () => tauriApi.openPaths(["/a.ARW"]), "open_paths", { paths: ["/a.ARW"] }],
   ["openDialog", () => tauriApi.openDialog("folder"), "open_dialog", { kind: "folder" }],
+  ["cancelOpen", () => tauriApi.cancelOpen(), "cancel_open", undefined, true],
   ["sessionState", () => tauriApi.sessionState(), "session_state", undefined],
   ["closeSession", () => tauriApi.closeSession(), "close_session", undefined, true],
   ["setCurrent", () => tauriApi.setCurrent(3), "set_current", { photoId: 3 }, true],
@@ -43,28 +45,64 @@ const calls: Row[] = [
   ["removePhotos", () => tauriApi.removePhotos([3, 5]), "remove_photos", { photoIds: [3, 5] }],
   ["restorePhotos", () => tauriApi.restorePhotos(), "restore_photos", undefined],
   ["getSettings", () => tauriApi.getSettings(3), "get_settings", { photoId: 3 }],
-  ["updateSettings", () => tauriApi.updateSettings(3, { contrast: manual(4) }), "update_settings", { photoId: 3, patch: { contrast: manual(4) } }],
+  ["updateSettings", () => tauriApi.updateSettings(3, mainGradePatch({ contrast: manual(4) })), "update_settings", { photoId: 3, patch: mainGradePatch({ contrast: manual(4) }) }],
   ["applyLook", () => tauriApi.applyLook("all", "builtin:neutral", 80), "apply_look", { scope: "all", lookId: "builtin:neutral", intensity: 80 }, true],
   ["rerunAuto", () => tauriApi.rerunAuto(3), "rerun_auto", { photoId: 3 }],
   ["copySettings", () => tauriApi.copySettings(3), "copy_settings", { photoId: 3 }],
-  ["pasteSettings", () => tauriApi.pasteSettings([4, 5], { contrast: manual(4) }), "paste_settings", { photoIds: [4, 5], patch: { contrast: manual(4) } }],
+  ["pasteSettings", () => tauriApi.pasteSettings([4, 5], mainGradePatch({ contrast: manual(4) })), "paste_settings", { photoIds: [4, 5], patch: mainGradePatch({ contrast: manual(4) }) }],
   ["setMenuState", () => tauriApi.setMenuState({ copy_settings: true, paste_settings: false, paste_settings_to_picked: false }), "set_menu_state", { state: { copy_settings: true, paste_settings: false, paste_settings_to_picked: false } }, true],
-  ["histogram", () => tauriApi.histogram(3), "histogram", { photoId: 3 }],
-  ["chromaScatter", () => tauriApi.chromaScatter(3), "chroma_scatter", { photoId: 3 }],
+  ["perfReport", () => tauriApi.perfReport('{"page":"x"}'), "perf_report", { report: '{"page":"x"}' }, true],
+  // `at` is the node the signal is read at (`docs/01`); left out it goes as null, which the core reads as Main.
+  ["histogram", () => tauriApi.histogram(3), "histogram", { photoId: 3, at: null }],
+  ["histogram (at a corrector)", () => tauriApi.histogram(3, 2), "histogram", { photoId: 3, at: 2 }],
+  ["histogram (at the input)", () => tauriApi.histogram(3, "input"), "histogram", { photoId: 3, at: "input" }],
+  ["chromaScatter", () => tauriApi.chromaScatter(3), "chroma_scatter", { photoId: 3, at: null }],
+  ["chromaScatter (at a corrector)", () => tauriApi.chromaScatter(3, 4), "chroma_scatter", { photoId: 3, at: 4 }],
+  ["suggestCrop", () => tauriApi.suggestCrop(3, "square", 90), "suggest_crop", { photoId: 3, aspect: "square", orientation: 90 }],
   ["viewportInfo", () => tauriApi.viewportInfo(), "viewport_info", undefined],
   ["viewportSetRect", () => tauriApi.viewportSetRect(rect), "viewport_set_rect", { rect }, true],
   ["viewportInput", () => tauriApi.viewportInput({ kind: "pan", dx: 1, dy: 2 }), "viewport_input", { event: { kind: "pan", dx: 1, dy: 2 } }, true],
   ["viewportInput (pick white)", () => tauriApi.viewportInput({ kind: "pick_white", x: 40, y: 20 }), "viewport_input", { event: { kind: "pick_white", x: 40, y: 20 } }, true],
-  ["viewportSetMode", () => tauriApi.viewportSetMode({ kind: "fit" }), "viewport_set_mode", { mode: { kind: "fit" } }, true],
+  ["viewportSetMode", () => tauriApi.viewportSetMode({ kind: "fit" }), "viewport_set_mode", { mode: { kind: "fit" }, maskView: null }, true],
+  [
+    "viewportSetMode (a mask view)",
+    () => tauriApi.viewportSetMode({ kind: "fit" }, { node: 2, style: "mask_only" }),
+    "viewport_set_mode",
+    { mode: { kind: "fit" }, maskView: { node: 2, style: "mask_only" } },
+    true,
+  ],
+  [
+    "viewportSetMode (Show depth)",
+    () => tauriApi.viewportSetMode({ kind: "fit" }, { node: 2, style: "mask_only", row: 0, depth: true }),
+    "viewport_set_mode",
+    { mode: { kind: "fit" }, maskView: { node: 2, style: "mask_only", row: 0, depth: true } },
+    true,
+  ],
   ["setBefore", () => tauriApi.setBefore(true), "set_before", { before: true }, true],
   ["samplePixel", () => tauriApi.samplePixel(10, 20), "sample_pixel", { x: 10, y: 20 }],
-  ["sampleChroma", () => tauriApi.sampleChroma(10, 20), "sample_chroma", { x: 10, y: 20 }],
+  ["sampleChroma", () => tauriApi.sampleChroma(10, 20), "sample_chroma", { x: 10, y: 20, at: null, tap: null }],
+  ["sampleChroma (at a corrector)", () => tauriApi.sampleChroma(10, 20, 2), "sample_chroma", { x: 10, y: 20, at: 2, tap: null }],
+  [
+    "sampleChroma (at a corrector's input)",
+    () => tauriApi.sampleChroma(10, 20, 2, "node_input"),
+    "sample_chroma",
+    { x: 10, y: 20, at: 2, tap: "node_input" },
+  ],
+  ["viewportMapPoints", () => tauriApi.viewportMapPoints([[0.5, 0.25]], "photo"), "viewport_map_points", { points: [[0.5, 0.25]], from: "photo" }],
+  ["viewportMapPoints (from the cell)", () => tauriApi.viewportMapPoints([[10, 20], [30, 40]], "cell"), "viewport_map_points", { points: [[10, 20], [30, 40]], from: "cell" }],
+  ["maskKinds", () => tauriApi.maskKinds(), "mask_kinds", undefined],
+  ["maskFind", () => tauriApi.maskFind(1, 2, 0, { kind: "point", x: 0.4, y: 0.5, positive: true }), "mask_find", { photoId: 1, node: 2, mask: 0, prompt: { kind: "point", x: 0.4, y: 0.5, positive: true } }],
+  ["sampleDepth", () => tauriApi.sampleDepth(1, 0.4, 0.5), "sample_depth", { photoId: 1, x: 0.4, y: 0.5 }],
+  ["focusPlane", () => tauriApi.focusPlane(1), "focus_plane", { photoId: 1 }],
+  ["retryDepth", () => tauriApi.retryDepth(1), "retry_depth", { photoId: 1 }, true],
+  ["lensList", () => tauriApi.lensList(), "lens_list", undefined],
   ["looksList", () => tauriApi.looksList(), "looks_list", undefined],
   ["lookThumbnail", () => tauriApi.lookThumbnail(3, "builtin:signature"), "look_thumbnail", { photoId: 3, lookId: "builtin:signature" }],
+  ["filmCatalogue", () => tauriApi.filmCatalogue(), "film_catalogue", undefined],
+  ["filmTile", () => tauriApi.filmTile(3, 2, "kodak_ektar_100"), "film_tile", { photoId: 3, node: 2, stock: "kodak_ektar_100" }],
   ["looksImport", () => tauriApi.looksImport("/x.zip"), "looks_import", { path: "/x.zip", input: null }],
   ["looksImport (answered)", () => tauriApi.looksImport("/x.cube", "logc3_ei800"), "looks_import", { path: "/x.cube", input: "logc3_ei800" }],
   ["looksRecognise", () => tauriApi.looksRecognise("/x.zip"), "looks_recognise", { path: "/x.zip" }],
-  ["looksDisplayLuts", () => tauriApi.looksDisplayLuts(), "looks_display_luts", undefined],
   ["looksWatchDownloads", () => tauriApi.looksWatchDownloads(true), "looks_watch_downloads", { enabled: true }],
   ["chooseFolder", () => tauriApi.chooseFolder("~/Pictures"), "choose_folder", { start: "~/Pictures" }],
   ["chooseLookFiles", () => tauriApi.chooseLookFiles(), "choose_look_files", undefined],
@@ -80,12 +118,16 @@ const calls: Row[] = [
   ["exportBusy", () => tauriApi.exportBusy(), "export_busy", undefined],
   ["restartApp", () => tauriApi.restartApp(), "restart_app", undefined, true],
   ["thumbnails", () => tauriApi.thumbnails(), "thumbnails", undefined],
+  ["thumbnailsInView", () => tauriApi.thumbnailsInView([4, 5]), "thumbnails_in_view", { photoIds: [4, 5] }],
+  ["nodeThumbnails", () => tauriApi.nodeThumbnails(4), "node_thumbnails", { photoId: 4 }, true],
   ["preferencesGet", () => tauriApi.preferencesGet(), "preferences_get", undefined],
   ["preferencesSet", () => tauriApi.preferencesSet({ remove_location_from_exports: true }), "preferences_set", { patch: { remove_location_from_exports: true } }],
   ["installCliLink", () => tauriApi.installCliLink(), "install_cli_link", undefined],
-  ["appleAutoStatus", () => tauriApi.appleAutoStatus(), "apple_auto_status", undefined],
+  ["autoStatus", () => tauriApi.autoStatus(), "auto_status", undefined],
+  ["autoStatusCached", () => tauriApi.autoStatusCached(), "auto_status_cached", undefined],
   ["cliLinkStatus", () => tauriApi.cliLinkStatus(), "cli_link_status", undefined],
   ["appInfo", () => tauriApi.appInfo(), "app_info", undefined],
+  ["displayOptions", () => tauriApi.displayOptions(), "display_options", undefined],
 ];
 
 beforeEach(() => {
@@ -103,7 +145,7 @@ describe("tauriApi commands", () => {
   });
 
   it("covers every method of the mock, so the two can't drift apart", () => {
-    const mockOnly = ["options", "configure", "reset", "flush", "failNext", "cancelNextDialog", "fixtureUrl", "viewport", "menuState", "system", "queueChoice", "addSource", "removeSource", "simulateDownload", "emitEvent", "setAppleAuto"];
+    const mockOnly = ["options", "configure", "reset", "flush", "failNext", "cancelNextDialog", "fixtureUrl", "viewport", "menuState", "system", "queueChoice", "addSource", "removeSource", "simulateDownload", "emitEvent", "setAppleAuto", "setProviders"];
     const mock = createMockApi();
     const contract = Object.keys(mock).filter((k) => !mockOnly.includes(k)).sort();
     expect(Object.keys(tauriApi).sort()).toEqual(contract);
@@ -139,6 +181,7 @@ describe("tauriApi commands", () => {
 describe("tauriApi.on", () => {
   const EVENTS = [
     "photo_progress",
+    "open_progress",
     "thumbnail_ready",
     "render_stats",
     "export_progress",
@@ -151,6 +194,8 @@ describe("tauriApi.on", () => {
     "viewport_frame",
     "settings_changed",
     "export_busy",
+    "memory_notice",
+    "display_options",
   ] as const;
 
   it.each(EVENTS)("listens to %s by its wire name, which the shell registers", (name) => {

@@ -18,20 +18,21 @@ use common::*;
 use serde_json::{Value, json};
 use ym_core::app::{Core, CoreOptions};
 use ym_core::apple_auto::{
-    AdvisorAnswer, AdvisorError, AdvisorInfo, AdvisorPicture, AppleAuto, AppleAutoMode,
-    AutoAdvisor, AutoSteps, Availability, FailureKind, FakeAdvisor, PICTURE_LONG_EDGE_PX,
-    UnavailableReason,
+    AdvisorAnswer, AdvisorError, AdvisorInfo, AdvisorPicture, AppleAuto, AutoAdvisor, AutoSteps,
+    Availability, FailureKind, FakeAdvisor, PICTURE_LONG_EDGE_PX, UnavailableReason,
 };
 use ym_core::auto::{AutoSource, tables_of};
+use ym_core::auto_provider::{AutoChoice, AutoProvider, ProviderAdvisors};
 use ym_core::export::ExportContext;
 use ym_core::export_queue::{ExportEvent, ExportJob, ExportQueue, ExportSink};
 use ym_core::pipeline::{AdvisorPictures, PhotoSource, RenderOptions, Renderer};
 use ym_core::preferences::PreferencesPatch;
 use ym_core::session::{
-    AppleAutoEnv, ApplyScope, EventSink, OpenOptions, PhotoId, PictureInput, PictureRenderer,
-    Session, SessionEvent, ThumbnailInput, ThumbnailRenderer,
+    AppleAutoEnv, ApplyScope, EventSink, OpenOptions, PhotoId, PhotoStage, PictureInput,
+    PictureRenderer, Session, SessionEvent, ThumbnailInput, ThumbnailRenderer,
 };
 use ym_core::settings::{AutoOr, DevelopSettings, PercentSetting, SettingsPatch};
+use ym_core::settings::{GradePatch, NodeId, NodePatch};
 use ym_export::ExportOptions;
 use ym_gpu::queue::CancelToken;
 
@@ -40,6 +41,11 @@ const PROFILE: &str = "sony-ilce-7rm4";
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// The advisors of a session that has only Apple Intelligence's (the tests of `docs/19`).
+fn apple_only(advisor: Arc<dyn AutoAdvisor>) -> ProviderAdvisors {
+    ProviderAdvisors::default().with(AutoProvider::Apple, advisor)
 }
 
 /// Steps with the four steps of prompt version 1 set and every other step keep (no colours).
@@ -228,6 +234,7 @@ impl AutoAdvisor for Scripted {
                 steps,
                 scene: format!("Photo {photo}"),
                 plan: format!("Plan {photo}"),
+                served_model: None,
             })
             .map_err(|kind| AdvisorError::new(kind, "scripted"))
     }
@@ -285,7 +292,7 @@ impl Rig {
         let (sink, events) = EventSink::channel();
         let mut env = base_env().with_events(sink).with_apple_auto(AppleAutoEnv {
             retry_pause: Duration::from_millis(5),
-            ..AppleAutoEnv::new(advisor, pictures.clone())
+            ..AppleAutoEnv::new(apple_only(advisor), pictures.clone())
         });
         if thumbnails {
             env = env.with_thumbnails(Arc::new(CountingThumbnails::default()));
@@ -346,20 +353,24 @@ fn contrast_and_saturation_are_auto_or_manual_and_read_old_numbers() {
     let neutral = ym_looks::library::LookId::neutral();
     // The default is Auto, written as the tagged form.
     let d = DevelopSettings::default();
-    assert_eq!((d.contrast, d.saturation), (AutoOr::Auto, AutoOr::Auto));
+    assert_eq!(
+        (d.main_grade().contrast, d.main_grade().saturation),
+        (AutoOr::Auto, AutoOr::Auto)
+    );
     let v = serde_json::to_value(&d).unwrap();
-    assert_eq!(v["contrast"], json!({ "kind": "auto" }));
-    assert_eq!(v["saturation"], json!({ "kind": "auto" }));
+    let grade = &v["nodes"]["items"][1]["grade"];
+    assert_eq!(grade["contrast"], json!({ "kind": "auto" }));
+    assert_eq!(grade["saturation"], json!({ "kind": "auto" }));
     // The new forms.
     let (s, _) = DevelopSettings::from_json(
-        r#"{ "contrast": { "kind": "manual", "value": 12 }, "saturation": { "kind": "auto" } }"#,
+        r#"{"nodes": {"items": [{"id": 1, "grade": {"contrast": {"kind": "manual", "value": 12}, "saturation": {"kind": "auto"}}}]}}"#,
         &neutral,
     )
     .unwrap();
-    assert_eq!(s.contrast, PercentSetting::manual_value(12.0));
-    assert_eq!(s.saturation, AutoOr::Auto);
+    assert_eq!(s.main_grade().contrast, PercentSetting::manual_value(12.0));
+    assert_eq!(s.main_grade().saturation, AutoOr::Auto);
     assert_eq!(
-        serde_json::to_value(s.contrast).unwrap(),
+        serde_json::to_value(s.main_grade().contrast).unwrap(),
         json!({ "kind": "manual", "value": 12.0 })
     );
     // Old documents: a number is Manual, 0 (the old default, also -0) is Auto, and the range clamps.
@@ -380,8 +391,16 @@ fn contrast_and_saturation_are_auto_or_manual_and_read_old_numbers() {
             PercentSetting::manual_value(-100.0),
         ),
     ] {
-        let (s, _) = DevelopSettings::from_json(text, &neutral).unwrap();
-        assert_eq!((s.contrast, s.saturation), (contrast, saturation), "{text}");
+        let (s, _) = DevelopSettings::from_value(
+            common::field_doc(serde_json::from_str(text).unwrap()),
+            &neutral,
+        )
+        .unwrap();
+        assert_eq!(
+            (s.main_grade().contrast, s.main_grade().saturation),
+            (contrast, saturation),
+            "{text}"
+        );
     }
     // Wrong shapes are refused.
     for bad in [
@@ -390,12 +409,20 @@ fn contrast_and_saturation_are_auto_or_manual_and_read_old_numbers() {
         r#"{ "saturation": { "kind": "manual", "value": 1, "ev": 1 } }"#,
         r#"{ "contrast": null }"#,
     ] {
-        assert!(DevelopSettings::from_json(bad, &neutral).is_err(), "{bad}");
+        assert!(
+            DevelopSettings::from_value(
+                common::field_doc(serde_json::from_str(bad).unwrap()),
+                &neutral
+            )
+            .is_err(),
+            "{bad}"
+        );
     }
     // A manual value that is not a number is an error, not a clamp.
-    let s = DevelopSettings {
-        contrast: PercentSetting::manual_value(f64::NAN),
-        ..DevelopSettings::default()
+    let s = {
+        let mut s = DevelopSettings::default();
+        s.main_grade_mut().contrast = PercentSetting::manual_value(f64::NAN);
+        s
     };
     assert!(s.validated().is_err());
 }
@@ -421,35 +448,48 @@ fn patches_take_either_form_and_reset_is_auto() {
             (PercentSetting::manual_value(100.0), AutoOr::Auto),
         ),
     ] {
-        let patch: SettingsPatch = serde_json::from_str(text).unwrap();
+        let patch: SettingsPatch =
+            serde_json::from_value(common::field_patch(serde_json::from_str(text).unwrap()))
+                .unwrap();
         s.apply_patch(&patch, None).unwrap();
-        assert_eq!((s.contrast, s.saturation), want, "{text}");
+        assert_eq!(
+            (s.main_grade().contrast, s.main_grade().saturation),
+            want,
+            "{text}"
+        );
     }
     // A patch writes the tagged form and an absent field is no change.
-    let patch: SettingsPatch = serde_json::from_str(r#"{ "contrast": 5 }"#).unwrap();
+    let patch: SettingsPatch =
+        serde_json::from_value(common::field_patch(json!({ "contrast": 5 }))).unwrap();
     assert_eq!(
         serde_json::to_value(&patch).unwrap(),
-        json!({ "contrast": { "kind": "manual", "value": 5.0 } })
+        json!({ "nodes": { "1": { "grade": { "contrast": { "kind": "manual", "value": 5.0 } } } } })
     );
-    let none: SettingsPatch = serde_json::from_str(r#"{ "contrast": null }"#).unwrap();
+    let none: SettingsPatch =
+        serde_json::from_value(common::field_patch(json!({ "contrast": null }))).unwrap();
     assert!(none.is_empty());
     // Re-run resets both with exposure and white while Apple Auto acts on the photo, and leaves
     // them alone otherwise.
-    let edited = DevelopSettings {
-        contrast: PercentSetting::manual_value(10.0),
-        saturation: PercentSetting::manual_value(-10.0),
-        exposure: ym_core::settings::ExposureSetting::manual_ev(1.0),
-        ..DevelopSettings::default()
+    let edited = {
+        let mut s = DevelopSettings::default();
+        s.main_grade_mut().contrast = PercentSetting::manual_value(10.0);
+        s.main_grade_mut().saturation = PercentSetting::manual_value(-10.0);
+        s.input_mut().exposure = ym_core::settings::ExposureSetting::manual_ev(1.0);
+        s
     };
     let mut s = edited.clone();
     s.reset_automatic(true);
-    assert!(s.contrast.is_auto() && s.saturation.is_auto() && s.exposure.is_auto());
+    assert!(
+        s.main_grade().contrast.is_auto()
+            && s.main_grade().saturation.is_auto()
+            && s.input().exposure.is_auto()
+    );
     let mut s = edited.clone();
     s.reset_automatic(false);
-    assert!(s.exposure.is_auto());
+    assert!(s.input().exposure.is_auto());
     assert_eq!(
-        (s.contrast, s.saturation),
-        (edited.contrast, edited.saturation)
+        (s.main_grade().contrast, s.main_grade().saturation),
+        (edited.main_grade().contrast, edited.main_grade().saturation)
     );
 }
 
@@ -466,11 +506,20 @@ fn auto_contrast_and_saturation_resolve_and_pin_to_the_estimates_values() {
         None,
     )
     .unwrap();
-    assert_eq!((r.values.contrast, r.values.saturation), (0.0, 0.0));
-    assert!(r.auto.contrast && r.auto.saturation);
+    assert_eq!(
+        (r.values.main.grade.contrast, r.values.main.grade.saturation),
+        (0.0, 0.0)
+    );
+    assert!(r.auto.main.contrast && r.auto.main.saturation);
     let pinned = r.pinned_settings();
-    assert_eq!(pinned.contrast, PercentSetting::manual_value(0.0));
-    assert_eq!(pinned.saturation, PercentSetting::manual_value(0.0));
+    assert_eq!(
+        pinned.main_grade().contrast,
+        PercentSetting::manual_value(0.0)
+    );
+    assert_eq!(
+        pinned.main_grade().saturation,
+        PercentSetting::manual_value(0.0)
+    );
     // With an answer they resolve to the table's values; a manual value wins.
     let answered = est.with_apple(
         Some(steps(0, 0, 2, -1)),
@@ -479,25 +528,31 @@ fn auto_contrast_and_saturation_resolve_and_pin_to_the_estimates_values() {
                 steps: steps(0, 0, 2, -1),
                 scene: String::new(),
                 plan: String::new(),
+                served_model: None,
             },
             info: Scripted::info(),
         },
+        AutoProvider::Apple,
         tables_of(&profile),
     );
-    let s = DevelopSettings {
-        saturation: PercentSetting::manual_value(7.0),
-        ..DevelopSettings::default()
+    let s = {
+        let mut s = DevelopSettings::default();
+        s.main_grade_mut().saturation = PercentSetting::manual_value(7.0);
+        s
     };
     let r = ym_core::settings::ResolvedSettings::resolve(PhotoId(1), &s, &answered, &profile, None)
         .unwrap();
-    assert_eq!((r.values.contrast, r.values.saturation), (30.0, 7.0));
-    assert!(r.auto.contrast && !r.auto.saturation);
     assert_eq!(
-        r.pinned_settings().contrast,
+        (r.values.main.grade.contrast, r.values.main.grade.saturation),
+        (30.0, 7.0)
+    );
+    assert!(r.auto.main.contrast && !r.auto.main.saturation);
+    assert_eq!(
+        r.pinned_settings().main_grade().contrast,
         PercentSetting::manual_value(30.0)
     );
     assert_eq!(
-        r.pinned_settings().saturation,
+        r.pinned_settings().main_grade().saturation,
         PercentSetting::manual_value(7.0)
     );
     // The grade gets the resolved values.
@@ -506,7 +561,7 @@ fn auto_contrast_and_saturation_resolve_and_pin_to_the_estimates_values() {
     // And the summary says so.
     assert_eq!(r.estimates.source, AutoSource::Apple);
     assert_eq!(
-        (r.estimates.contrast, r.estimates.saturation),
+        (r.estimates.main.contrast, r.estimates.main.saturation),
         (30.0, -15.0)
     );
 }
@@ -535,14 +590,24 @@ fn estimates_without_an_answer_are_the_rule_bit_for_bit() {
             info: Scripted::info(),
         },
     ] {
-        let e = est.with_apple(None, state.clone(), tables_of(&profile));
+        let e = est.with_apple(
+            None,
+            state.clone(),
+            AutoProvider::Apple,
+            tables_of(&profile),
+        );
         assert_eq!(e.apple, state);
         assert_eq!(format!("{:?}", e.color), format!("{:?}", est.color));
         assert_eq!(e.exposure, est.exposure);
         assert_eq!(e.readout, est.readout);
         assert_eq!(e.source(), AutoSource::Rule);
         // Keep on every step is Apple's source and the rule's numbers.
-        let keep = est.with_apple(Some(AutoSteps::default()), state, tables_of(&profile));
+        let keep = est.with_apple(
+            Some(AutoSteps::default()),
+            state,
+            AutoProvider::Apple,
+            tables_of(&profile),
+        );
         assert_eq!(keep.source(), AutoSource::Apple);
         assert_eq!(keep.exposure, est.exposure);
         assert_eq!(keep.readout, est.readout);
@@ -557,6 +622,7 @@ fn an_answer_moves_exposure_white_contrast_and_saturation() {
     let warmer = est.with_apple(
         Some(steps(2, 1, 1, -2)),
         AppleAuto::Pending,
+        AutoProvider::Apple,
         tables_of(&profile),
     );
     assert!((warmer.exposure.ev - (est.exposure.ev + 0.6)).abs() < 1e-12);
@@ -574,20 +640,23 @@ fn an_answer_moves_exposure_white_contrast_and_saturation() {
     let cooler = est.with_apple(
         Some(steps(0, -2, 0, 0)),
         AppleAuto::Pending,
+        AutoProvider::Apple,
         tables_of(&profile),
     );
     assert!(cooler.readout.kelvin_k < est.readout.kelvin_k);
-    // The white lift is not sized again.
-    assert_eq!(warmer.white, est.white);
     // The summary.
     let s = warmer.summary();
-    assert_eq!(s.kelvin, warmer.readout.kelvin_k);
-    assert_eq!(s.exposure_ev, warmer.exposure.ev);
+    assert_eq!(s.input.kelvin, warmer.readout.kelvin_k);
+    assert_eq!(s.input.exposure_ev, warmer.exposure.ev);
     let v = serde_json::to_value(&s).unwrap();
     assert_eq!(v["source"], json!("apple"));
+    assert_eq!(v["provider"], json!("apple"));
     assert_eq!(v["apple"], json!({ "state": "pending" }));
     assert_eq!(
-        (v["contrast"].clone(), v["saturation"].clone()),
+        (
+            v["main"]["contrast"].clone(),
+            v["main"]["saturation"].clone()
+        ),
         (json!(15.0), json!(-30.0))
     );
 }
@@ -608,7 +677,12 @@ fn an_answer_moves_highlights_shadows_black_the_tint_and_the_wheels() {
         highlight_color_strength: Some(1),
         ..AutoSteps::default()
     };
-    let e = est.with_apple(Some(graded), AppleAuto::Pending, tables_of(&profile));
+    let e = est.with_apple(
+        Some(graded),
+        AppleAuto::Pending,
+        AutoProvider::Apple,
+        tables_of(&profile),
+    );
     assert_eq!((e.highlights, e.shadows, e.black), (-40.0, 15.0, -15.0));
     assert_eq!(e.balance_shadows, [-0.866 * 0.55, -0.5 * 0.55]);
     assert_eq!(e.balance_highlights, [0.866 * 0.3, 0.5 * 0.3]);
@@ -630,13 +704,22 @@ fn an_answer_moves_highlights_shadows_black_the_tint_and_the_wheels() {
     let r = ym_core::settings::ResolvedSettings::resolve(PhotoId(1), &settings, &e, &profile, None)
         .unwrap();
     assert_eq!(
-        (r.values.highlights, r.values.shadows, r.values.black),
+        (
+            r.values.main.grade.highlights,
+            r.values.main.grade.shadows,
+            r.values.main.grade.black
+        ),
         (-40.0, 15.0, -15.0)
     );
-    assert_eq!(r.values.color_balance.shadows, e.balance_shadows);
-    assert_eq!(r.values.color_balance.highlights, e.balance_highlights);
-    assert_eq!(r.values.color_balance.midtones, [0.0, 0.0]);
-    assert!(r.auto.highlights && r.auto.balance_shadows && r.auto.balance_highlights);
+    assert_eq!(r.values.main.grade.color_balance.shadows, e.balance_shadows);
+    assert_eq!(
+        r.values.main.grade.color_balance.highlights,
+        e.balance_highlights
+    );
+    assert_eq!(r.values.main.grade.color_balance.midtones, [0.0, 0.0]);
+    assert!(
+        r.auto.main.highlights && r.auto.main.balance_shadows && r.auto.main.balance_highlights
+    );
     let g = ym_core::pipeline::color::grade_params(&settings, &e);
     assert_eq!((g.highlights, g.shadows, g.black), (-40.0, 15.0, -15.0));
     assert_eq!(
@@ -644,25 +727,29 @@ fn an_answer_moves_highlights_shadows_black_the_tint_and_the_wheels() {
         e.balance_shadows
     );
     let mut manual = settings.clone();
-    manual.highlights = PercentSetting::manual_value(5.0);
-    manual.color_balance.shadows = ym_core::settings::BalanceSetting::manual_point([0.1, 0.2]);
+    manual.main_grade_mut().highlights = PercentSetting::manual_value(5.0);
+    manual.main_grade_mut().color_balance.shadows =
+        ym_core::settings::BalanceSetting::manual_point([0.1, 0.2]);
     let g = ym_core::pipeline::color::grade_params(&manual, &e);
     assert_eq!(g.highlights, 5.0);
     assert_eq!([g.balance_shadows.a, g.balance_shadows.b], [0.1, 0.2]);
     // Pinned settings record the numbers and points they resolved to.
     let pinned = r.pinned_settings();
-    assert_eq!(pinned.highlights, PercentSetting::manual_value(-40.0));
     assert_eq!(
-        pinned.color_balance.shadows,
+        pinned.main_grade().highlights,
+        PercentSetting::manual_value(-40.0)
+    );
+    assert_eq!(
+        pinned.main_grade().color_balance.shadows,
         ym_core::settings::BalanceSetting::manual_point(e.balance_shadows)
     );
     // The summary carries the Auto values and the steps in effect.
     let v = serde_json::to_value(e.summary()).unwrap();
     assert_eq!(
         (
-            v["highlights"].clone(),
-            v["shadows"].clone(),
-            v["black"].clone()
+            v["main"]["highlights"].clone(),
+            v["main"]["shadows"].clone(),
+            v["main"]["black"].clone()
         ),
         (json!(-40.0), json!(15.0), json!(-15.0))
     );
@@ -680,7 +767,12 @@ fn steps_the_model_left_empty_set_nothing() {
         contrast: Some(-1),
         ..AutoSteps::default()
     };
-    let e = est.with_apple(Some(only), AppleAuto::Pending, tables_of(&profile));
+    let e = est.with_apple(
+        Some(only),
+        AppleAuto::Pending,
+        AutoProvider::Apple,
+        tables_of(&profile),
+    );
     assert_eq!(e.contrast, -15.0);
     assert_eq!(e.exposure, est.exposure);
     assert_eq!(format!("{:?}", e.color), format!("{:?}", est.color));
@@ -782,7 +874,7 @@ fn the_viewer_never_waits_and_the_answer_arrives_with_estimates_changed() {
     assert!(started.elapsed() < Duration::from_secs(2));
     assert_eq!(before.estimates.apple, AppleAuto::Pending);
     assert_eq!(before.estimates.source(), AutoSource::Rule);
-    assert_eq!(resolved.values.contrast, 0.0);
+    assert_eq!(resolved.values.main.grade.contrast, 0.0);
     assert!(!rig.session.estimates_final(id).unwrap(), "an export waits");
     assert!(
         !rig.session.wait_idle(Duration::from_millis(200)),
@@ -801,9 +893,12 @@ fn the_viewer_never_waits_and_the_answer_arrives_with_estimates_changed() {
     assert!(after.estimates_version > before.estimates_version);
     assert!(rig.session.estimates_final(id).unwrap());
     let r = rig.session.settings(id).unwrap();
-    assert_eq!((r.values.contrast, r.values.saturation), (15.0, -15.0));
-    assert_eq!(r.values.exposure_ev, after.estimates.exposure.ev);
-    assert!(r.auto.exposure && r.auto.contrast && r.auto.saturation);
+    assert_eq!(
+        (r.values.main.grade.contrast, r.values.main.grade.saturation),
+        (15.0, -15.0)
+    );
+    assert_eq!(r.values.input.exposure_ev, after.estimates.exposure.ev);
+    assert!(r.auto.input.exposure && r.auto.main.contrast && r.auto.main.saturation);
     assert_eq!(changed_ids(&rig.drain()), vec![id]);
     // One request, one picture (the development job's).
     assert_eq!(advisor.calls(), vec![id.0 as u8]);
@@ -913,7 +1008,10 @@ fn failures_use_the_rule_and_say_why_and_only_waiting_is_retried() {
     let five = rig.session.estimates(id(5)).unwrap();
     assert!((five.exposure.ev - (five.exposure.own_ev + 0.3)).abs() < 1e-12);
     // The documented pause between tries.
-    let default = AppleAutoEnv::new(advisor.clone(), Arc::new(StubPictures::default()));
+    let default = AppleAutoEnv::new(
+        apple_only(advisor.clone()),
+        Arc::new(StubPictures::default()),
+    );
     assert_eq!(default.retry_pause, Duration::from_secs(2));
 }
 
@@ -936,7 +1034,7 @@ fn a_burst_shares_the_median_of_its_answered_steps_and_waits_for_every_frame() {
     let pictures = Arc::new(StubPictures::default());
     let session = Session::new(base_env().with_apple_auto(AppleAutoEnv {
         retry_pause: Duration::from_millis(5),
-        ..AppleAutoEnv::new(advisor.clone(), pictures)
+        ..AppleAutoEnv::new(apple_only(advisor.clone()), pictures)
     }));
     let ids = session
         .open(&[dir.path().to_path_buf()], OpenOptions::default())
@@ -997,14 +1095,14 @@ fn the_preference_switches_both_ways_without_asking_again() {
     assert_eq!(answered.source(), AutoSource::Apple);
     rig.drain();
     // Off: back to the rule at once, the viewers told, nothing asked.
-    rig.session.set_apple_auto_preference(false);
+    rig.session.set_auto_preference(AutoProvider::Yellowmoon);
     let off = rig.session.estimates(id).unwrap();
     assert_eq!(off.apple, AppleAuto::Off);
     assert_eq!(off.source(), AutoSource::Rule);
     assert_eq!(off.exposure.ev, off.exposure.own_ev);
     assert_eq!(off.contrast, 0.0);
     assert_eq!(changed_ids(&rig.drain()), vec![id]);
-    assert!(!rig.session.apple_auto_status().active);
+    assert!(!rig.session.auto_status().active);
     assert!(rig.session.estimates_final(id).unwrap());
     // A photo opened while it is off is not asked.
     let extra = tempfile::tempdir().unwrap();
@@ -1017,7 +1115,7 @@ fn the_preference_switches_both_ways_without_asking_again() {
     assert_eq!(rig.state(e), AppleAuto::Off);
     assert_eq!(advisor.calls().len(), 1);
     // On: the answer kept is used again, and only the photo without one is asked.
-    rig.session.set_apple_auto_preference(true);
+    rig.session.set_auto_preference(AutoProvider::Apple);
     rig.settle();
     assert_eq!(
         rig.session.estimates(id).unwrap().exposure,
@@ -1026,14 +1124,16 @@ fn the_preference_switches_both_ways_without_asking_again() {
     assert!(matches!(rig.state(e), AppleAuto::Answered { .. }));
     assert_eq!(advisor.calls(), vec![id.0 as u8, e.0 as u8]);
     // The run's mode overrides the preference.
-    rig.session.set_apple_auto_preference(false);
-    rig.session.set_apple_auto_mode(AppleAutoMode::On);
+    rig.session.set_auto_preference(AutoProvider::Yellowmoon);
+    rig.session
+        .set_auto_choice(AutoChoice::Provider(AutoProvider::Apple));
     assert!(rig.session.apple_auto_active());
     assert_eq!(
         rig.session.estimates(id).unwrap().source(),
         AutoSource::Apple
     );
-    rig.session.set_apple_auto_mode(AppleAutoMode::Off);
+    rig.session
+        .set_auto_choice(AutoChoice::Provider(AutoProvider::Yellowmoon));
     assert_eq!(rig.state(id), AppleAuto::Off);
 }
 
@@ -1046,41 +1146,74 @@ fn rerun_asks_again_and_resets_contrast_and_saturation() {
     rig.session
         .update_settings(
             id,
-            &SettingsPatch {
-                contrast: Some(PercentSetting::manual_value(40.0)),
-                saturation: Some(PercentSetting::manual_value(-5.0)),
-                ..SettingsPatch::default()
-            },
+            &SettingsPatch::default().and(
+                NodeId::MAIN,
+                NodePatch {
+                    grade: Some(GradePatch {
+                        contrast: Some(PercentSetting::manual_value(40.0)),
+                        saturation: Some(PercentSetting::manual_value(-5.0)),
+                        ..GradePatch::default()
+                    }),
+                    ..NodePatch::default()
+                },
+            ),
         )
         .unwrap();
     advisor.answer(id, [Ok(steps(0, 0, -1, 0))]);
     let r = rig.session.rerun_auto(id).unwrap();
-    assert!(r.settings.contrast.is_auto() && r.settings.saturation.is_auto());
+    assert!(
+        r.settings.main_grade().contrast.is_auto() && r.settings.main_grade().saturation.is_auto()
+    );
     rig.settle();
     assert_eq!(advisor.calls_about(id), 2);
     let r = rig.session.settings(id).unwrap();
-    assert_eq!((r.values.contrast, r.values.saturation), (-15.0, 0.0));
+    assert_eq!(
+        (r.values.main.grade.contrast, r.values.main.grade.saturation),
+        (-15.0, 0.0)
+    );
 
     // While Apple Auto does not act on the photo (the preference off, or not available), the
     // Automatic card has no Contrast and Saturation rows and Re-run leaves them as they are, as
     // before Apple Auto; exposure still goes back to Auto.
-    let edit = SettingsPatch {
-        exposure: Some(ym_core::settings::ExposureSetting::manual_ev(1.0)),
-        contrast: Some(PercentSetting::manual_value(40.0)),
-        saturation: Some(PercentSetting::manual_value(-5.0)),
-        ..SettingsPatch::default()
-    };
+    let edit = SettingsPatch::default()
+        .and(
+            NodeId::Input,
+            NodePatch {
+                exposure: Some(ym_core::settings::ExposureSetting::manual_ev(1.0)),
+                ..NodePatch::default()
+            },
+        )
+        .and(
+            NodeId::MAIN,
+            NodePatch {
+                grade: Some(GradePatch {
+                    contrast: Some(PercentSetting::manual_value(40.0)),
+                    saturation: Some(PercentSetting::manual_value(-5.0)),
+                    ..GradePatch::default()
+                }),
+                ..NodePatch::default()
+            },
+        );
     let kept = |r: &ym_core::settings::ResolvedSettings| {
-        assert!(r.auto.exposure);
-        assert_eq!(r.settings.contrast, PercentSetting::manual_value(40.0));
-        assert_eq!(r.settings.saturation, PercentSetting::manual_value(-5.0));
-        assert_eq!((r.values.contrast, r.values.saturation), (40.0, -5.0));
+        assert!(r.auto.input.exposure);
+        assert_eq!(
+            r.settings.main_grade().contrast,
+            PercentSetting::manual_value(40.0)
+        );
+        assert_eq!(
+            r.settings.main_grade().saturation,
+            PercentSetting::manual_value(-5.0)
+        );
+        assert_eq!(
+            (r.values.main.grade.contrast, r.values.main.grade.saturation),
+            (40.0, -5.0)
+        );
     };
-    rig.session.set_apple_auto_preference(false);
+    rig.session.set_auto_preference(AutoProvider::Yellowmoon);
     assert_eq!(rig.state(id), AppleAuto::Off);
     rig.session.update_settings(id, &edit).unwrap();
     kept(&rig.session.rerun_auto(id).unwrap());
-    rig.session.set_apple_auto_preference(true);
+    rig.session.set_auto_preference(AutoProvider::Apple);
     advisor.set_available(false);
     rig.session.refresh_apple_auto();
     assert!(matches!(rig.state(id), AppleAuto::Unavailable { .. }));
@@ -1095,7 +1228,9 @@ fn rerun_asks_again_and_resets_contrast_and_saturation() {
     assert_eq!(rig.state(id), AppleAuto::Pending);
     rig.session.update_settings(id, &edit).unwrap();
     let r = rig.session.rerun_auto(id).unwrap();
-    assert!(r.settings.contrast.is_auto() && r.settings.saturation.is_auto());
+    assert!(
+        r.settings.main_grade().contrast.is_auto() && r.settings.main_grade().saturation.is_auto()
+    );
     advisor.gate.open();
     rig.settle();
     assert!(advisor.calls().len() > asked);
@@ -1112,18 +1247,31 @@ fn copy_and_paste_keep_auto_so_each_photo_keeps_its_own_answer() {
     rig.session
         .update_settings(
             ids[0],
-            &SettingsPatch {
-                saturation: Some(PercentSetting::manual_value(12.0)),
-                ..SettingsPatch::default()
-            },
+            &SettingsPatch::default().and(
+                NodeId::MAIN,
+                NodePatch {
+                    grade: Some(GradePatch {
+                        saturation: Some(PercentSetting::manual_value(12.0)),
+                        ..GradePatch::default()
+                    }),
+                    ..NodePatch::default()
+                },
+            ),
         )
         .unwrap();
     let patch = rig.session.copy_settings(ids[0]).unwrap();
-    assert_eq!(patch.contrast, Some(AutoOr::Auto));
-    assert_eq!(patch.saturation, Some(PercentSetting::manual_value(12.0)));
+    let grade = patch
+        .main_patch()
+        .and_then(|p| p.grade.as_ref())
+        .expect("the copy has Main's grade");
+    assert_eq!(grade.contrast, Some(AutoOr::Auto));
+    assert_eq!(grade.saturation, Some(PercentSetting::manual_value(12.0)));
     rig.session.paste_settings(&[ids[1]], &patch).unwrap();
     let b = rig.session.settings(ids[1]).unwrap();
-    assert_eq!((b.values.contrast, b.values.saturation), (-15.0, 12.0));
+    assert_eq!(
+        (b.values.main.grade.contrast, b.values.main.grade.saturation),
+        (-15.0, 12.0)
+    );
 }
 
 #[test]
@@ -1179,8 +1327,16 @@ fn without_an_advisor_there_is_no_worker_and_nothing_changes() {
         assert_eq!(e.source(), AutoSource::Rule);
         assert!(session.estimates_final(id).unwrap());
     }
-    let status = session.apple_auto_status();
-    assert!(!status.available && !status.active && status.reason.is_none());
+    let status = session.auto_status();
+    assert!(!status.visible && !status.active);
+    assert_eq!(status.effective, AutoProvider::Yellowmoon);
+    assert!(
+        status
+            .providers
+            .iter()
+            .filter(|p| p.provider != AutoProvider::Yellowmoon)
+            .all(|p| p.reason == Some(UnavailableReason::NotInstalled) && !p.listed)
+    );
     assert_eq!(session.apple_auto_asks(), 0);
 }
 
@@ -1270,6 +1426,13 @@ struct CoreRig {
 }
 
 fn core_rig(advisor: Option<Arc<dyn AutoAdvisor>>, n: usize) -> CoreRig {
+    core_rig_with(
+        advisor.map_or_else(ProviderAdvisors::default, apple_only),
+        n,
+    )
+}
+
+fn core_rig_with(advisors: ProviderAdvisors, n: usize) -> CoreRig {
     let app = tempfile::tempdir().expect("app");
     let home = tempfile::tempdir().expect("home");
     let (sink, events) = ExportSink::channel();
@@ -1278,7 +1441,7 @@ fn core_rig(advisor: Option<Arc<dyn AutoAdvisor>>, n: usize) -> CoreRig {
     options.decode_threads = 2;
     options.thumbnails = false;
     options.home = Some(home.path().to_path_buf());
-    options.advisor = advisor;
+    options.advisors = advisors;
     let core = Core::open(options).expect("core");
     let photos = tempfile::tempdir().expect("photos");
     write_photos(photos.path(), n);
@@ -1352,28 +1515,46 @@ fn unescape(xml: &str) -> String {
 #[test]
 fn the_status_and_the_preference_reach_the_session() {
     let none = core_rig(None, 0);
-    let s = none.core.apple_auto_status();
-    assert!(!s.available && !s.active && s.reason.is_none() && s.info.is_none());
-    assert!(s.preference);
+    let s = none.core.auto_status();
+    assert!(!s.visible && !s.active && s.effective == AutoProvider::Yellowmoon);
+    assert_eq!(s.preference, AutoProvider::Apple);
+    assert_eq!(s.choice, AutoChoice::FromPreference);
     let fake = core_rig(Some(Arc::new(FakeAdvisor)), 1);
-    let s = fake.core.apple_auto_status();
-    assert!(s.available && s.active && s.preference);
-    assert_eq!(s.info, Some(FakeAdvisor::info()));
+    let s = fake.core.auto_status();
+    assert!(s.visible && s.active && s.preference == AutoProvider::Apple);
+    assert_eq!(s.effective, AutoProvider::Apple);
+    let apple = s.provider(AutoProvider::Apple).unwrap();
+    assert!(apple.listed && apple.selectable && apple.consent);
+    assert_eq!(apple.info, Some(FakeAdvisor::info()));
     let sha = ym_core::apple_auto::InstructionsId::default().instructions_sha256;
+    let mut json = serde_json::to_value(&s).unwrap();
+    // The providers are checked on their own; the rest is the status.
+    let providers = json["providers"].take();
+    assert_eq!(providers.as_array().unwrap().len(), 4);
     assert_eq!(
-        serde_json::to_value(&s).unwrap(),
+        json,
         json!({
-            "available": true, "reason": null,
-            "info": {
-                "model": "Test advisor", "os": "test",
-                "instructions": "default", "instructions_sha256": sha,
-            },
-            "preference": true, "mode": "from_preference", "active": true,
-            "prompt": 3, "table": 2,
+            "providers": null,
+            "preference": "apple", "choice": "from_preference", "chosen": "apple",
+            "effective": "apple", "active": true, "visible": true,
+            "consent": { "claude": false, "agy": false },
+            "table": 2,
             "instructions": "default", "instructions_sha256": sha,
             "own_instructions": "",
             "default_instructions": ym_core::apple_auto::DEFAULT_INSTRUCTIONS,
             "instructions_max_chars": 2000,
+        })
+    );
+    assert_eq!(
+        providers[1],
+        json!({
+            "provider": "apple", "state": "available", "reason": null,
+            "info": {
+                "provider": "apple", "model": "Test advisor", "os": "test", "prompt": 3,
+                "instructions": "default", "instructions_sha256": sha,
+            },
+            "tool_version": null, "consent": true, "experimental": false,
+            "listed": true, "selectable": true,
         })
     );
     let id = fake.open()[0];
@@ -1382,30 +1563,40 @@ fn the_status_and_the_preference_reach_the_session() {
         fake.core.session.estimates(id).unwrap().apple,
         AppleAuto::Answered { .. }
     ));
-    // The preference, saved and applied at once.
+    // The choice, saved and applied at once.
     let prefs = fake
         .core
         .preferences_set(&PreferencesPatch {
-            apple_auto: Some(false),
+            auto_provider: Some(AutoProvider::Yellowmoon),
             ..PreferencesPatch::default()
         })
         .unwrap();
-    assert!(!prefs.apple_auto);
-    assert!(!fake.core.apple_auto_status().active);
+    assert_eq!(prefs.auto_provider, AutoProvider::Yellowmoon);
+    assert!(!fake.core.auto_status().active);
     assert_eq!(
         fake.core.session.estimates(id).unwrap().apple,
         AppleAuto::Off
     );
-    // `ym --apple-auto on` for one run.
-    fake.core.set_apple_auto_mode(AppleAutoMode::On);
-    assert!(fake.core.apple_auto_status().active);
-    // A core opened later reads the preference from the file.
+    // `ym --auto-provider apple` for one run.
+    fake.core
+        .set_auto_choice(AutoChoice::Provider(AutoProvider::Apple));
+    let s = fake.core.auto_status();
+    assert!(s.active);
+    assert_eq!(
+        (s.preference, s.chosen, s.effective),
+        (
+            AutoProvider::Yellowmoon,
+            AutoProvider::Apple,
+            AutoProvider::Apple
+        )
+    );
+    // A core opened later reads the saved choice from the file.
     let app = fake._app.path().to_path_buf();
     let mut options = CoreOptions::new(data_root(), app);
-    options.advisor = Some(Arc::new(FakeAdvisor));
+    options.advisors = apple_only(Arc::new(FakeAdvisor));
     let again = Core::open(options).unwrap();
-    let s = again.apple_auto_status();
-    assert!(!s.preference && !s.active);
+    let s = again.auto_status();
+    assert!(s.preference == AutoProvider::Yellowmoon && !s.active);
 }
 
 #[test]
@@ -1439,8 +1630,13 @@ fn exports_with_the_fake_carry_its_answer_and_are_the_same_bytes_twice() {
             "{name}"
         );
         let apple: Value =
-            serde_json::from_str(&unescape(&xmp_property(&xmp, "ym:AppleAuto").unwrap())).unwrap();
+            serde_json::from_str(&unescape(&xmp_property(&xmp, "ym:AutoAdvisor").unwrap()))
+                .unwrap();
         assert_eq!(apple["result"], json!("answered"));
+        assert_eq!(apple["provider"], json!("apple"));
+        assert_eq!(apple["reproducible"], json!(true));
+        // `ym:AppleAuto` is no longer written (docs/22 section 14.2).
+        assert!(xmp_property(&xmp, "ym:AppleAuto").is_none());
         assert_eq!(apple["model"], json!("Test advisor"));
         assert_eq!(apple["os"], json!("test"));
         assert_eq!(apple["scene"], json!("Test picture"));
@@ -1456,20 +1652,23 @@ fn exports_with_the_fake_carry_its_answer_and_are_the_same_bytes_twice() {
         let contrast = [-30.0, -15.0, 0.0, 15.0, 30.0]
             [(apple["steps"]["contrast"].as_i64().unwrap() + 2) as usize];
         assert_eq!(
-            settings["contrast"],
+            settings["nodes"]["items"][1]["grade"]["contrast"],
             json!({ "kind": "manual", "value": contrast })
         );
-        assert_eq!(settings["white_balance"], json!({ "kind": "auto" }));
+        assert_eq!(
+            settings["nodes"]["items"][0]["white_balance"],
+            json!({ "kind": "auto" })
+        );
     }
 
-    // Without an advisor: `ym:Auto` is the rule and there is no `ym:AppleAuto`.
+    // Without an advisor: `ym:Auto` is the rule and there is no `ym:AutoAdvisor`.
     let none = core_rig(None, 1);
     none.open();
     assert!(none.core.session.wait_idle(Duration::from_secs(120)));
     let files = none.export(&dest.path().join("rule"));
     let xmp = xmp_of(&files[0].1).unwrap();
     assert_eq!(xmp_property(&xmp, "ym:Auto").as_deref(), Some("rule"));
-    assert!(xmp_property(&xmp, "ym:AppleAuto").is_none());
+    assert!(xmp_property(&xmp, "ym:AutoAdvisor").is_none());
     let models = xmp.find("<ym:DisplayTransform>").unwrap();
     assert!(models < xmp.find("<ym:Auto>").unwrap());
     assert!(xmp.find("<ym:Auto>").unwrap() < xmp.find("<ym:Settings>").unwrap());
@@ -1505,7 +1704,10 @@ fn an_export_waits_for_the_answer_and_uses_it() {
         serde_json::from_str(&unescape(&xmp_property(&xmp, "ym:Settings").unwrap())).unwrap();
     let e = rig.core.session.estimates(id).unwrap();
     assert!((e.exposure.ev - (e.exposure.own_ev + 0.6)).abs() < 1e-12);
-    assert_eq!(settings["exposure"]["ev"].as_f64(), Some(e.exposure.ev));
+    assert_eq!(
+        settings["nodes"]["items"][0]["exposure"]["ev"].as_f64(),
+        Some(e.exposure.ev)
+    );
     // The core rendered the picture (the real one, 384 x 288 here) on its own renderer.
     assert_eq!(advisor.calls().len(), 1);
 }
@@ -1521,9 +1723,9 @@ fn a_failed_photo_exports_with_the_rule_and_says_why() {
     let xmp = xmp_of(&files[0].1).unwrap();
     assert_eq!(xmp_property(&xmp, "ym:Auto").as_deref(), Some("rule"));
     assert_eq!(
-        unescape(&xmp_property(&xmp, "ym:AppleAuto").unwrap()),
+        unescape(&xmp_property(&xmp, "ym:AutoAdvisor").unwrap()),
         format!(
-            r#"{{"instructions":"default","instructions_sha256":"{}","model":"Scripted","os":"27.0 (27A1)","prompt":3,"reason":"guardrail","result":"failed","table":2}}"#,
+            r#"{{"instructions":"default","instructions_sha256":"{}","model":"Scripted","os":"27.0 (27A1)","prompt":3,"provider":"apple","reason":"guardrail","reproducible":true,"result":"failed","table":2}}"#,
             ym_core::apple_auto::InstructionsId::default().instructions_sha256
         )
     );
@@ -1566,7 +1768,7 @@ fn new_instructions_ask_every_photo_again_and_the_model_reads_them() {
             ("Test plan: Moody".to_owned(), InstructionsKind::Edited)
         );
     }
-    let status = fake.core.apple_auto_status();
+    let status = fake.core.auto_status();
     assert_eq!(status.instructions.instructions, InstructionsKind::Edited);
     assert_eq!(status.own_instructions, "Moody night grade, please.");
     // Back to the default (empty text, or the default text itself): saved as "", asked again.
@@ -1624,7 +1826,10 @@ fn an_exports_photo_moves_up_with_its_burst_so_the_export_waits_for_its_burst_al
     advisor.gate.close(None);
     let session = Arc::new(Session::new(base_env().with_apple_auto(AppleAutoEnv {
         retry_pause: Duration::from_millis(5),
-        ..AppleAutoEnv::new(advisor.clone(), Arc::new(StubPictures::default()))
+        ..AppleAutoEnv::new(
+            apple_only(advisor.clone()),
+            Arc::new(StubPictures::default()),
+        )
     })));
     let dir = tempfile::tempdir().unwrap();
     let frame = |name: &str, sec: &str| {
@@ -1698,14 +1903,16 @@ fn an_exports_photo_moves_up_with_its_burst_so_the_export_waits_for_its_burst_al
     advisor.gate.open();
 }
 
-/// A sink that panics the first time the Apple Auto worker sends `estimates_changed` from its own
+/// A sink that panics the first time an Auto worker sends `estimates_changed` from its own
 /// thread (when an answer arrives), and forwards every event.
 fn panicking_sink() -> (EventSink, Receiver<SessionEvent>) {
     let (tx, rx) = std::sync::mpsc::channel();
     let tx = Mutex::new(tx);
     let armed = std::sync::atomic::AtomicBool::new(true);
     let sink = EventSink::new(move |e| {
-        let worker = std::thread::current().name() == Some("ym-apple-auto");
+        let worker = std::thread::current()
+            .name()
+            .is_some_and(|n| n.starts_with("ym-auto-"));
         if worker
             && matches!(e, SessionEvent::EstimatesChanged { .. })
             && armed.swap(false, Ordering::SeqCst)
@@ -1727,7 +1934,7 @@ fn a_panic_after_the_answer_fails_that_photo_and_the_worker_goes_on() {
     let (sink, events) = panicking_sink();
     let session = Session::new(base_env().with_events(sink).with_apple_auto(AppleAutoEnv {
         retry_pause: Duration::from_millis(5),
-        ..AppleAutoEnv::new(advisor.clone(), pictures)
+        ..AppleAutoEnv::new(apple_only(advisor.clone()), pictures)
     }));
     let dir = tempfile::tempdir().unwrap();
     write_photos(dir.path(), 2);
@@ -2148,7 +2355,10 @@ fn an_export_waiting_for_a_removed_frame_or_photo_does_not_hang() {
     let advisor = Scripted::new(Ok(steps(1, 0, 0, 0)));
     let session = Arc::new(Session::new(base_env().with_apple_auto(AppleAutoEnv {
         retry_pause: Duration::from_millis(5),
-        ..AppleAutoEnv::new(advisor.clone(), Arc::new(StubPictures::default()))
+        ..AppleAutoEnv::new(
+            apple_only(advisor.clone()),
+            Arc::new(StubPictures::default()),
+        )
     })));
     let ids = session
         .open(&[dir.path().to_path_buf()], OpenOptions::default())
@@ -2250,5 +2460,102 @@ fn an_export_after_a_removal_and_its_undo_is_the_same_bytes_with_the_same_answer
     for (_, bytes) in &after {
         let xmp = xmp_of(bytes).unwrap();
         assert_eq!(xmp_property(&xmp, "ym:Auto").as_deref(), Some("apple"));
+    }
+}
+
+/// The `apple` stage of each photo's progress, in the order it was sent: `false` for started (the
+/// photo waits for Apple Auto's answer), `true` for done.
+fn apple_stages(events: &[SessionEvent], id: PhotoId) -> Vec<bool> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            SessionEvent::PhotoProgress(p) if p.id == id && p.stage == PhotoStage::Apple => {
+                Some(p.done)
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn pending(rig: &Rig, id: PhotoId) -> bool {
+    rig.session.summary(id).expect("summary").apple_pending
+}
+
+/// What the Start screen waits for (`docs/19` section 6, the owner's report of 2026-10-20): the
+/// summary's `apple_pending` and the `apple` stage of `photo_progress` say which photos still wait for
+/// Apple Auto's answer, and say it once per change: when Apple Auto starts acting every photo
+/// without an answer waits, each answer ends that photo's wait, new instructions make every photo
+/// wait again, and switching Apple Auto off ends the wait of the photos it had not answered.
+#[test]
+fn the_apple_stage_says_which_photos_wait_for_an_answer() {
+    let (advisor, rig, ids) = held_rig(Ok(steps(1, 0, 0, 0)), 3);
+    // Developed while unavailable: nothing was sent then. Made available with the first request
+    // held at the advisor: every photo waits.
+    let events = rig.drain();
+    for &id in &ids {
+        assert_eq!(apple_stages(&events, id), vec![false], "photo {}", id.0);
+        assert!(pending(&rig, id));
+    }
+    advisor.gate.open();
+    rig.settle();
+    let events = rig.drain();
+    for &id in &ids {
+        assert_eq!(apple_stages(&events, id), vec![true], "photo {}", id.0);
+        assert!(!pending(&rig, id));
+        assert!(matches!(rig.state(id), AppleAuto::Answered { .. }));
+    }
+
+    // New instructions: every answer is dropped and every photo waits again, then is answered.
+    advisor.gate.close(None);
+    rig.session.set_apple_auto_instructions("Make it moody.");
+    advisor.gate.wait_parked();
+    let events = rig.drain();
+    for &id in &ids {
+        assert_eq!(apple_stages(&events, id), vec![false], "photo {}", id.0);
+        assert!(pending(&rig, id));
+    }
+    advisor.gate.open();
+    rig.settle();
+    let events = rig.drain();
+    for &id in &ids {
+        assert_eq!(apple_stages(&events, id), vec![true], "photo {}", id.0);
+    }
+
+    // Switched off while the photos wait: their wait ends at once, and nothing more is said.
+    advisor.gate.close(None);
+    rig.session.set_apple_auto_instructions("");
+    advisor.gate.wait_parked();
+    let _ = rig.drain();
+    rig.session.set_auto_preference(AutoProvider::Yellowmoon);
+    let events = rig.drain();
+    for &id in &ids {
+        assert_eq!(apple_stages(&events, id), vec![true], "photo {}", id.0);
+        assert!(!pending(&rig, id));
+    }
+    advisor.gate.open();
+    rig.settle();
+    let events = rig.drain();
+    for &id in &ids {
+        assert!(apple_stages(&events, id).is_empty(), "photo {}", id.0);
+        assert!(!pending(&rig, id));
+    }
+}
+
+/// A session without an Apple Auto advisor (`ym --apple-auto off`, Linux) never sends the stage, and
+/// no photo waits.
+#[test]
+fn without_an_advisor_no_photo_waits_and_no_apple_stage_is_sent() {
+    let dir = tempfile::tempdir().expect("dir");
+    write_photos(dir.path(), 2);
+    let (sink, events) = EventSink::channel();
+    let session = Session::new(base_env().with_events(sink));
+    let ids = session
+        .open(&[dir.path().to_path_buf()], OpenOptions::default())
+        .added;
+    assert!(session.wait_idle(Duration::from_secs(120)));
+    let events: Vec<SessionEvent> = events.try_iter().collect();
+    for &id in &ids {
+        assert!(apple_stages(&events, id).is_empty());
+        assert!(!session.summary(id).unwrap().apple_pending);
     }
 }

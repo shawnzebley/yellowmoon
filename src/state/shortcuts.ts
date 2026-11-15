@@ -1,11 +1,17 @@
 /**
  * The keyboard shortcuts of `docs/11-ui.md` §Keyboard shortcuts, as one pure function from a
  * key event to an action name, so the table is tested without a screen. ⌘ is the Meta key; the
- * app is macOS only. Keys that type (P, Z, C, W, 1–9, the arrows) are ignored while a text box
+ * app is macOS only. Keys that type (P, Z, C, W, F, A, 1–9, the arrows) are ignored while a text box
  * has focus, and so are ⇧⌘C, ⇧⌘V and ⌥⇧⌘V (copy and paste settings; plain ⌘C and ⌘V never reach this
  * table: they stay the system's Copy and Paste). The arrows are left to the control that has focus when
  * it uses them (a slider, the filmstrip, the tabs). Delete and Backspace remove the photo on screen from the filmstrip, except where a
- * control uses them itself (a text box, a slider with its knob, a menu, a dialog) or a mode (crop, pick white) is on.
+ * control uses them itself (a text box, a slider with its knob, a menu, a dialog) or a mode (crop, pick white) is on. W (Pick white: it
+ * opens the Colour tab and starts picking, and a second W ends it), F (full screen) and N (the node view, `docs/23` §7.7) are not keys held
+ * down, and not letters typed into a menu or a list (their type-ahead); F and N are not pressed while cropping. A toggles Auto crop
+ * while the Crop panel is open, and is nothing otherwise (⌘A picks all). **In the node view** (`docs/23` §7.7) Delete and Backspace never
+ * remove a photo (the photos are out of sight there): they are `delete-node`, which removes the selected link if one is selected, else
+ * the selected node (but not from the Masks card's rows, where the key removes the selected mask row, nor from a mask's handle); B bypasses the selected node; ⌥← and ⌥→ move the focused node earlier or later; and the arrow keys belong to the
+ * graph while it has the focus (they move the selection from card to card), so they switch no photo there.
  */
 import type { TabId } from "../components/tabs";
 
@@ -28,7 +34,15 @@ export type ShortcutAction =
   | "zoom-in"
   | "zoom-out"
   | "crop"
+  | "auto-crop"
   | "pick-white"
+  | "nodes"
+  | "delete-node"
+  | "bypass-node"
+  | "mask-view"
+  | "move-node-earlier"
+  | "move-node-later"
+  | "full-screen"
   | "copy-settings"
   | "paste-settings"
   | "paste-settings-picked"
@@ -62,6 +76,14 @@ export interface ShortcutContext {
   tab?: TabId;
   /** A modal-like mode is on (crop, pick white, pick colour): the number keys that pick looks are ignored. */
   mode?: "crop" | "pick-white" | "pick-color" | null;
+  /** The node view is on: Delete and Backspace never mean "remove the photo on screen", and B, M and ⌥← ⌥→ are the graph's. */
+  nodeView?: boolean;
+  /**
+   * "Single-key shortcuts" (Preferences, `docs/28` A-P11; on unless it is `false`). Off, the keys that are one key on their own do
+   * nothing outside a text box: P, Z, C, W, N, F, B, M, A, `\`, 1–9, Delete and Backspace (21 keys). ⌘-keys, the arrows, Esc and
+   * the Return of Crop stay. This is the only place the flag is read; `useShortcuts` puts it in the context.
+   */
+  singleKeys?: boolean;
 }
 
 /** True when the target takes typed text. */
@@ -88,16 +110,32 @@ function pressesItself(target: EventTarget | null): boolean {
   return role !== null && ["button", "radio", "tab", "switch", "menuitem", "menuitemradio", "slider"].includes(role);
 }
 
+/** True when the target is in a menu, a list or a dialog, which take typed letters themselves (a menu's type-ahead). */
+function inMenuOrDialog(target: EventTarget | null): boolean {
+  const el = target as HTMLElement | null;
+  if (!el || typeof el.closest !== "function") return false;
+  return el.closest('[role="menu"], [role="listbox"], [role="dialog"], [role="alertdialog"]') !== null;
+}
+
+/** True when the target is in the node view's graph: its cards take the arrow keys, ⌥← and ⌥→ (`docs/23` §7.7). */
+function inGraph(target: EventTarget | null): boolean {
+  const el = target as HTMLElement | null;
+  return !!el && typeof el.closest === "function" && el.closest("[data-graph]") !== null;
+}
+
 /** True when the target uses the left and right arrows itself. */
 function usesHorizontalArrows(target: EventTarget | null): boolean {
   const el = target as HTMLElement | null;
   if (!el || typeof el.tagName !== "string") return false;
   if (isTextTarget(el)) return true;
+  if (inGraph(el)) return true; // a card of the graph: the arrows move the selection
   if (el.tagName.toLowerCase() === "input" && (el as HTMLInputElement).type === "range") return true;
   const role = el.getAttribute("role");
   if (role && ["slider", "radio", "tab", "menuitemradio", "menuitem", "application"].includes(role)) return true;
   if (el.closest("[data-photo-id]")) return true; // a filmstrip thumbnail
+  if (el.closest("[data-pan-view]")) return true; // the zoomed photo, while it has the focus: the arrows pan it (`docs/28` A-10)
   if (el.closest(".ym-crop")) return true;
+  if (el.closest("[data-mask-handles]")) return true; // a handle of a mask: the arrows nudge it
   return false;
 }
 
@@ -113,7 +151,8 @@ function usesDeleteKey(target: EventTarget | null): boolean {
   if (el.tagName.toLowerCase() === "input" && (el as HTMLInputElement).type === "range") return true;
   const role = el.getAttribute("role");
   if (role && ["slider", "spinbutton", "textbox", "combobox", "listbox", "option", "menuitem", "menuitemradio", "menuitemcheckbox", "tree", "treeitem", "grid", "gridcell"].includes(role)) return true;
-  return el.closest('.ym-crop, [role="menu"], [role="dialog"], [role="alertdialog"], [role="listbox"]') !== null;
+  // The Masks card takes Delete and Backspace itself (they remove the selected row, `docs/23` §7.7); a mask's handle does nothing with them.
+  return el.closest('.ym-crop, [data-mask-card], [data-mask-handles], [role="menu"], [role="dialog"], [role="alertdialog"], [role="listbox"]') !== null;
 }
 
 /** The shortcut a key event stands for, or null. */
@@ -157,12 +196,19 @@ export function shortcutFor(event: KeyLike, context: ShortcutContext = {}): Shor
         return null;
     }
   }
+  // ⌥← and ⌥→ with a card of the graph focused: the node goes earlier or later. (⌥ with an arrow moves by a word in a text box.)
+  if (context.nodeView && event.altKey && !event.metaKey && !event.ctrlKey && !event.shiftKey && (key === "ArrowLeft" || key === "ArrowRight")) {
+    if (event.repeat || isTextTarget(event.target) || !inGraph(event.target)) return null;
+    return { action: key === "ArrowLeft" ? "move-node-earlier" : "move-node-later" };
+  }
   if (event.metaKey || event.ctrlKey || event.altKey) return null;
 
   if (key === "Escape") return { action: "escape" };
   // Return finishes a crop, unless the focused control is a button or link that Return presses itself.
   if (key === "Enter" && context.mode === "crop" && !isTextTarget(event.target) && !pressesItself(event.target)) return { action: "confirm" };
   if (isTextTarget(event.target)) return null;
+  // The switch is off: only the arrows are left (they step photos, and a control that has the focus uses them first).
+  if (context.singleKeys === false && key !== "ArrowLeft" && key !== "ArrowRight") return null;
 
   switch (key) {
     case "ArrowLeft":
@@ -174,7 +220,18 @@ export function shortcutFor(event: KeyLike, context: ShortcutContext = {}): Shor
       // A mode (crop, Pick white) has its own use of the keys; with Shift the key is not this shortcut. A key held down removes one
       // photo, not the whole strip (only the last removal can be undone).
       if (event.shiftKey || event.repeat || context.mode || usesDeleteKey(event.target)) return null;
+      // The node view has no filmstrip, so a photo is never removed there; the key is the graph's: the selected link, else the selected node.
+      if (context.nodeView) return { action: "delete-node" };
       return { action: "remove-photo" };
+    case "b":
+      // Bypass the selected node (`docs/23` §7.7): one press, one change, and not a letter typed into a menu or a list.
+      if (!context.nodeView || event.repeat || context.mode === "crop" || inMenuOrDialog(event.target)) return null;
+      return { action: "bypass-node" };
+    case "m":
+      // Show or hide the selected node's mask (`docs/23` §7.7): one press, one change, in the node view only, and not a letter typed into a menu
+      // or a list. (⌘M is Minimise, so it is the bare key; the table's own modifier rule keeps it out of this one.)
+      if (!context.nodeView || event.repeat || context.mode === "crop" || inMenuOrDialog(event.target)) return null;
+      return { action: "mask-view" };
     case "p":
       return { action: "toggle-pick" };
     case "\\":
@@ -184,7 +241,22 @@ export function shortcutFor(event: KeyLike, context: ShortcutContext = {}): Shor
     case "c":
       return { action: "crop" };
     case "w":
+      // Pick white: opens the Colour tab and starts picking, and a second W ends it. One press, one change, as F (a key held down would
+      // switch it on and off), and not a letter typed into a menu or a list (their type-ahead).
+      if (event.repeat || inMenuOrDialog(event.target)) return null;
       return { action: "pick-white" };
+    case "n":
+      // The node view (docs/23 §7.7): one press, one change, as F and W, and not a letter typed into a menu or a list. Crop needs its panel.
+      if (event.repeat || context.mode === "crop" || inMenuOrDialog(event.target)) return null;
+      return { action: "nodes" };
+    case "a":
+      // Auto crop (`docs/20-auto-crop.md` §1): only in the Crop panel, one press one change, as F.
+      if (context.mode !== "crop" || event.repeat || inMenuOrDialog(event.target)) return null;
+      return { action: "auto-crop" };
+    case "f":
+      // Full screen: one press, one change (a key held down would flicker the window in and out of full screen). Crop needs its panel.
+      if (event.repeat || context.mode === "crop" || inMenuOrDialog(event.target)) return null;
+      return { action: "full-screen" };
     default:
       break;
   }

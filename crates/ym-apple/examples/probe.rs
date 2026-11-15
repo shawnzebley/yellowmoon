@@ -5,7 +5,11 @@
 //! cargo run -p ym-apple --release --example probe [-- INSTRUCTIONS_FILE]
 //! ```
 //!
-//! Prints whether Apple Auto is available here (and why not), the model and macOS version, then
+//! First prints what Vision says for the Subject and People masks (`docs/23` section 4.5): whether the
+//! bridge is built, the probe's answer for each request, and, for each that is supported, the mask it
+//! makes of the same synthetic picture (twice: the same bytes, the time, the share of the picture it
+//! covers, or "nothing found"). `YELLOWMOON_TEST_VISION=fake|none` selects a test provider; the example
+//! calls the system one. Then it prints whether Apple Auto is available here (and why not), the model and macOS version, then
 //! asks twice about the same 768 × 512 picture (a smooth gradient with a darker disc), with the
 //! default instructions or those of the file given, and prints every step (`-` for a field the model
 //! left empty), the scene, the plan, the time each request took and whether the second answer
@@ -24,7 +28,88 @@ use ym_core::apple_auto::{
 const WIDTH: usize = 768;
 const HEIGHT: usize = 512;
 
+/// What Vision says for Subject and People, and what it makes of the synthetic picture. Never fails the probe: a Mac that
+/// cannot run a request (a virtual Mac) is a result.
+fn vision_report() {
+    use ym_core::vision::{VisionKind, VisionMask, VisionStatus};
+    println!(
+        "Vision bridge built: {}",
+        if ym_apple::vision::VISION_BUILT {
+            "yes"
+        } else {
+            "no"
+        }
+    );
+    let provider = ym_apple::system_vision();
+    let support = provider.probe();
+    let picture = synthetic_picture();
+    for kind in VisionKind::ALL {
+        match support.of(kind) {
+            VisionStatus::Unsupported(why) => {
+                println!("Vision {}: not supported ({})", kind.label(), why.wire());
+            }
+            VisionStatus::Supported => {
+                let started = Instant::now();
+                let first = provider.mask(kind, &picture);
+                let ms = started.elapsed().as_secs_f64() * 1000.0;
+                let second = provider.mask(kind, &picture);
+                let same = first == second;
+                match first {
+                    Ok(VisionMask::NothingFound) => println!(
+                        "Vision {}: supported · nothing found in the picture · {ms:.0} ms · repeated: {}",
+                        kind.label(),
+                        if same { "yes" } else { "NO" }
+                    ),
+                    Ok(VisionMask::Plane(plane)) => {
+                        let covered = plane.data.iter().map(|&v| f64::from(v)).sum::<f64>()
+                            / plane.data.len().max(1) as f64;
+                        println!(
+                            "Vision {}: supported · a {}×{} mask covering {:.1} % · {ms:.0} ms · repeated: {}",
+                            kind.label(),
+                            plane.width,
+                            plane.height,
+                            100.0 * covered,
+                            if same { "yes" } else { "NO" }
+                        );
+                    }
+                    Err(error) => {
+                        println!(
+                            "Vision {}: supported, and the request failed: {error}",
+                            kind.label()
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The Metal devices and their working-set limits (`docs/26` H-17). A result, never a failure: a platform without Metal
+/// lists none.
+fn metal_report() {
+    println!(
+        "Metal bridge built: {}",
+        if ym_apple::metal::METAL_BUILT {
+            "yes"
+        } else {
+            "no"
+        }
+    );
+    for device in ym_apple::metal::devices() {
+        println!(
+            "Metal device: {} | working set {:.2} GiB | unified {} | low power {} | removable {}",
+            device.name,
+            device.recommended_max_working_set_bytes as f64 / f64::from(1u32 << 30),
+            device.has_unified_memory,
+            device.is_low_power,
+            device.is_removable
+        );
+    }
+}
+
 fn main() -> ExitCode {
+    metal_report();
+    vision_report();
     let advisor = ym_apple::system_advisor();
     println!(
         "bridge built: {}{}",

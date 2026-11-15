@@ -8,7 +8,7 @@
  * bindings` keeps it current); `contract.ts` makes `tsc` fail when the two disagree, and the
  * Rust tests compare the field names and variants of this file with the generated ones, so a
  * drift on either side is an error in CI rather than a surprise at run time. The generated file
- * is looser in places (`SettingsPatch` allows partial nested objects, `UpdateState.percent` may
+ * is looser in places (`NodePatch` allows `null` in every field, `UpdateState.percent` may
  * be null) and has one named enum per setting where this file has the generic `AutoOr`; the
  * JSON is the same.
  *
@@ -81,8 +81,13 @@ export type PhotoStatus =
   /** A file that can't be developed stays in the filmstrip with this plain-words reason. */
   | { kind: "skipped"; reason: string };
 
-/** Stages of the background job that develops a freshly opened photo (`docs/01` §Session). */
-export type PhotoStage = "probe" | "decode" | "estimate" | "thumbnail";
+/**
+ * Stages of the background job that develops a freshly opened photo (`docs/01` §Session), and `apple`: the answer of the provider that
+ * grades (Apple Intelligence, Claude Code or Antigravity; `docs/19` section 6, the name kept, `docs/22` D3), started while the photo
+ * waits for it and done when it arrived, failed or the provider stopped acting on the photo. The
+ * photo is ready (it can be edited) before `apple` is done; that stage changes `PhotoSummary.apple_pending`, never the status.
+ */
+export type PhotoStage = "probe" | "decode" | "estimate" | "thumbnail" | "apple";
 
 /** What the UI needs to know about one photo without asking for its settings. */
 export interface PhotoSummary {
@@ -105,6 +110,8 @@ export interface PhotoSummary {
   picked: boolean;
   /** Lossless M or S: the camera already processed it, so colour emulation is approximate. */
   reduced: boolean;
+  /** Apple Auto acts on the photo and has not answered for it yet: its Auto values are Yellowmoon's own until the answer. */
+  apple_pending: boolean;
 }
 
 /** The session as the webview mirrors it (`session_state`). */
@@ -144,6 +151,19 @@ export interface OpenSummary {
   added: number;
   /** ARW files that were already in the session and were not added again. */
   already_open: number;
+  /** True when `cancel_open` stopped the call: `added` files were read before that and kept (`docs/26` H-10). The core always says; absent means false. */
+  cancelled?: boolean;
+}
+
+/**
+ * `open_progress { done, total }` (`docs/26` H-10): how many of the files of an `open_paths` or `open_dialog` call have been read.
+ * Sent at the start (`done` is 0), after every 50 files and at the end. Start and Photos say "Reading {done} of {total} files…".
+ */
+export interface OpenProgress {
+  /** Files read so far. */
+  done: number;
+  /** Files to read. */
+  total: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -208,14 +228,14 @@ export type ChromaPoint = [a: number, b: number];
 
 /**
  * One pin of Colour › Colour warp (`docs/02` C9b, `docs/01` `color_warp`). A moving pin takes the colours near `source` to `target`; a
- * locked pin holds the colours within its range in place (its target is its source, its weights, pivot and exposure the defaults).
+ * locked pin holds the colours within its range in place (its target is its source, its weights, pivot, exposure and saturation the defaults).
  */
 export interface ColorWarpPin {
   source: ChromaPoint;
   /** Where the colour goes; equal to `source` for a pin that has not moved and for a locked pin. */
   target: ChromaPoint;
   locked: boolean;
-  /** How far the pin reaches across the plane, 0.01–0.25, default 0.04 (the card shows it ×100). */
+  /** How far the pin reaches across the plane, 0.01–0.25, default 0.02 (the card shows it ×100). */
   range: number;
   /** How much of the move the shadows take, 0–1, default 1. */
   shadows: number;
@@ -225,6 +245,8 @@ export interface ColorWarpPin {
   pivot_ev: number;
   /** A change of brightness for the pin's colours, in stops, −2…2, default 0. */
   exposure_ev: number;
+  /** A change of saturation for the pin's colours, −1…1 (shown as −100…+100 %), default 0: −1 turns them grey, +1 doubles their distance from neutral. */
+  saturation: number;
 }
 
 /** Colour › Colour warp: at most 16 pins; no pins is the identity. A patch replaces the whole list. */
@@ -240,15 +262,50 @@ export interface DecodeOptions {
   chromatic_aberration: boolean;
 }
 
-/** RAW › Range, each 0–1: Highlights 1 and Low light 0.5 by default (`docs/02` C7). */
+/** RAW › Range, each 0–1: Highlights 0.6 and Low light 0.5 by default (`docs/02` C7). */
 export interface Rolloff {
   /**
    * The highlight range: where the camera's clipping point lands, from where it was recorded (0) to white (1, the clip of an
-   * ALEXA at EI 800). Mid grey and everything up to a stop under the clip stay where they are.
+   * ALEXA at EI 800). Mid grey and everything up to two stops under the clip stay where they are.
    */
   highlights: number;
   /** The low-light toe: how much the noise near black is softened. */
   low_light: number;
+}
+
+/** The Lens tab: which lens (`docs/21` §2). The ids are those of `data/lenses/` and of `ym render --lens`. */
+export type LensKind = "default" | "classic" | "vintage" | "petzval" | "triplet" | "sonnar" | "detuned";
+
+/**
+ * The Lens tab (`docs/21` §2): a lens and three amounts, each 0–100, step 1. All three at 0 is no lens, whatever the lens is. Choosing a
+ * lens does not move the amounts by itself: the card sends `kind` with the lens's `start_flares` and `start_edges` (`LensInfo`) in one
+ * patch. A patch may carry only the parts it changes.
+ */
+export interface LensSettings {
+  kind: LensKind;
+  /** Glow, veiling glare, ghosts and starbursts. */
+  flares: number;
+  /** Edge softness and darkening, colour fringes and distortion. */
+  edges: number;
+  /** An anamorphic attachment: taller bokeh with the lens's own swirl and cat's-eye shapes, horizontal streaks, the anamorphic bend. */
+  anamorphic: number;
+}
+
+/** One lens of the Lens card's list: `lens_list()` answers the seven, in list order (`docs/21` §1 and §10). */
+export interface LensInfo {
+  kind: LensKind;
+  /** The name shown in the list. */
+  name: string;
+  /** The line under the name, and in the card's note. */
+  line: string;
+  /** Flares (0–100) the card moves to when this lens is chosen. */
+  start_flares: number;
+  /** Edges (0–100) the card moves to when this lens is chosen. */
+  start_edges: number;
+  /** The data version, raised whenever the lens's files change. */
+  version: number;
+  /** The design the lens was computed from: a patent number or a publication. */
+  design_source: string;
 }
 
 /** A rectangle in image coordinates normalised to [0, 1]². */
@@ -268,23 +325,108 @@ export interface Crop {
   /** Straighten angle, −45…45. */
   angle_deg: number;
   aspect: CropAspect;
+  /** The rect and angle came from Auto crop (`docs/20-auto-crop.md` §2); absent is false. */
+  auto?: boolean;
+}
+
+/** Auto crop's straightener: within 0.2° of level, levelled by `angle_deg`, or no answer (`docs/20-auto-crop.md` §3). */
+export type StraightenKind = "level" | "rotate" | "unsure";
+
+/** Where Auto crop's subject came from: the picture alone (the crop model), or the camera's focus point (no longer answered). */
+export type SubjectSource = "camera" | "picture";
+
+/** One frame Auto crop proposes: a rect of the canvas, as `Crop.rect`, and its score (its overlap with the crop model's crop, 0 to 1). */
+export interface CropFrame {
+  rect: NormRect;
+  score: number;
+}
+
+/** `suggest_crop(photo_id, aspect, orientation)`: Auto crop's proposal (`docs/20-auto-crop.md` §3). */
+export interface CropSuggestion {
+  straighten: StraightenKind;
+  /** The straighten angle the frames are made for: 0 unless `straighten` is `rotate`. */
+  angle_deg: number;
+  /** Best first, at most 3, never empty. */
+  frames: CropFrame[];
+  /** The first frame is the largest frame of the aspect at that angle: the whole photo is kept. */
+  keep: boolean;
+  subject: SubjectSource;
 }
 
 /** Orientation applied after the camera's EXIF orientation, in degrees. */
 export type Orientation = 0 | 90 | 180 | 270;
 
+// ---------------------------------------------------------------------------
+// The settings are a graph of nodes (docs/23 §3, §9)
+// ---------------------------------------------------------------------------
+
 /**
- * Every control in the UI and every CLI flag maps to one field. Defaults reproduce the
- * automatic development (`docs/01` §DevelopSettings). Field names, ranges and defaults follow
- * that table.
+ * A node's id: `"input"`, `"output"` or a whole number from 1 (Main is 1). Stable within a photo; links, selection, thumbnails and undo
+ * use it. (The generated bindings give every node struct the whole union for `id`, as `specta` cannot narrow it, so the interfaces
+ * below do too; `kind` is what tells the nodes apart.)
  */
-export interface DevelopSettings {
-  /** Look tab. Defaults to the user's default look (Neutral out of the box). */
-  look: LookId;
-  /** 0–100 %, default 100. */
-  look_intensity: number;
-  /** Light › Exposure: `Auto` or `Manual(ev)` in −4…+4, step 0.01. */
-  exposure: AutoOr<{ ev: number }>;
+export type NodeId = "input" | "output" | number;
+
+/** What a node is. */
+export type NodeKind =
+  | "input"
+  | "output"
+  | "corrector"
+  | "film"
+  | "parallel"
+  | "layer"
+  | "splitter"
+  | "combiner";
+
+/**
+ * A port of a node: a picture (the LogC4 picture) or a key (a mask). A mixer's inputs are `picture.1` to `picture.8`; a Splitter's
+ * outputs and a Combiner's inputs are `red`, `green` and `blue`. All of these but `key` carry pictures (`docs/25` section 2.2).
+ */
+export type Port =
+  | "picture"
+  | "key"
+  | "picture.1"
+  | "picture.2"
+  | "picture.3"
+  | "picture.4"
+  | "picture.5"
+  | "picture.6"
+  | "picture.7"
+  | "picture.8"
+  | "red"
+  | "green"
+  | "blue";
+
+/** A card's place on the canvas, in grid units (`docs/23` section 3.2). */
+export type NodePos = [x: number, y: number];
+
+/** One end of a link: a node and one of its ports. */
+export interface NodeRef {
+  node: NodeId;
+  port: Port;
+}
+
+/** A link from an output port to an input port (`docs/23` section 3.4). */
+export interface NodeLink {
+  from: NodeRef;
+  to: NodeRef;
+}
+
+/** A corrector's trims: an exposure trim in stops and a temperature and tint trim (`docs/23` section 1.3). */
+export interface NodeTrim {
+  /** Stops, −4…4. */
+  exposure_ev: number;
+  /** −100…100. */
+  temperature: number;
+  /** −100…100. */
+  tint: number;
+}
+
+/**
+ * A corrector's grade: the fields the settings had before they were nodes, with the same names and types (`docs/23` section 3.2). Auto
+ * belongs to Main: in any other corrector Auto reads as a manual 0.
+ */
+export interface NodeGrade {
   /** Light › Exposure › Contrast (and Look › Tone): `Auto` (the default) or `Manual(value)` in −100…100. */
   contrast: PercentSetting;
   /** −100…100, default 0. */
@@ -293,50 +435,376 @@ export interface DevelopSettings {
   highlights: PercentSetting;
   shadows: PercentSetting;
   white: number;
-  /**
-   * Light › White › Offset: stops added to the automatic white lift (`AutoEstimates.white_ev`), the
-   * per-photo gain on the tones above +1 stop over middle grey (`docs/02` C12 step 1b). −3…+3, step
-   * 0.05, default 0 = the automatic amount; a negative offset of the automatic amount or more gives no
-   * lift. A plain number, not Auto. Only the built-in ACES 2 display rendering has the lift.
-   */
-  white_offset_ev: number;
   /** Light › High dynamic range › Black: `Auto` (the default: 0, or Apple Auto's black level) or a value in −100…100. */
   black: PercentSetting;
-  /** Colour › White balance, segmented control. */
-  light_source: LightSource;
-  /** Colour › White balance: `Auto` or `Manual { kelvin 2000–11000 step 50, tint −50…50 }`. */
-  white_balance: AutoOr<{ kelvin: number; tint: number }>;
   color_balance: ColorBalance;
   /** Colour › Colour balance › Saturation (and Look › Tone): `Auto` (the default) or `Manual(value)` in −100…100. */
   saturation: PercentSetting;
   /** Colour › Colour warp: the pins of stage C9b, `{ pins: [] }` by default. */
   color_warp: ColorWarp;
-  /** Detail › Sharpening: `Auto` or `{ amount 0–300, radius_px 0.3–2.5 }`. */
-  sharpen: AutoOr<{ amount: number; radius_px: number }>;
-  /**
-   * Detail › Sharpening › Output: the strength in percent of the sharpening applied to the picture
-   * at the size it is shown or written (every viewport frame, thumbnail and JPEG, TIFF or PNG
-   * export; never a DNG). 0–200, step 5, default 100; a plain number, not Auto; 0 is off. The
-   * owner's decision of 2026-10-13 (`docs/algorithms/04-output-sharpening.md`).
-   */
-  output_sharpening: number;
+  curve: Curves;
+}
+
+/** Whether a mask row adds to the node's mask or takes away from it. */
+export type MaskMode = "add" | "subtract";
+
+/** One stroke of a Brush mask: its size (0.001…0.25 of the long edge), hardness (0…1), whether it erases, and its points in the photo frame. */
+export interface BrushStroke {
+  size: number;
+  hardness: number;
+  erase: boolean;
+  points: Array<[x: number, y: number]>;
+}
+
+/** What every mask row has (`docs/23` section 3.3); the kind's own fields follow. */
+type MaskBase = {
+  mode: MaskMode;
+  /** This mask alone is inverted. */
+  invert: boolean;
+  /** Off (the eye) counts as absent. */
+  enabled: boolean;
+  /** 0…1. */
+  opacity: number;
+};
+
+/** The fields Subject, People, Background, Depth, Object and Brush rows share. */
+type MaskEdge = {
+  /** 0…1. */
+  feather: number;
+  /** −1…1. */
+  grow: number;
+  /** Refine edges, 0…1. */
+  refine: number;
+};
+
+/** One row of a node's masks: `kind`, the fields every row has, then the kind's own (`docs/23` section 3.3). */
+export type MaskItem =
+  | ({ kind: "object" } & MaskBase & MaskEdge & { points: Array<[x: number, y: number, positive: boolean]>; box: [x0: number, y0: number, x1: number, y1: number] | null })
+  | ({ kind: "subject" } & MaskBase & MaskEdge)
+  | ({ kind: "people" } & MaskBase & MaskEdge)
+  | ({ kind: "background" } & MaskBase & MaskEdge & { level: number; softness: number })
+  | ({ kind: "depth" } & MaskBase & MaskEdge & { far: number })
+  | ({ kind: "linear" } & MaskBase & { center: [x: number, y: number]; angle_deg: number; feather: number })
+  | ({ kind: "radial" } & MaskBase & { center: [x: number, y: number]; radii: [rx: number, ry: number]; angle_deg: number; feather: number })
+  | ({ kind: "brush" } & MaskBase & MaskEdge & { strokes: BrushStroke[] })
+  | ({ kind: "color_range" } & MaskBase & { center: [a: number, b: number]; width: number; softness: number })
+  | ({ kind: "brightness_range" } & MaskBase & { low: number; high: number; softness: number });
+
+/** A node's masks: its Invert (`m = 1 − m`) and the rows, in the order they are drawn and combined, at most 64. */
+export interface MaskSettings {
+  invert: boolean;
+  items: MaskItem[];
+}
+
+/** The Input: the raw, light and framing settings (`docs/23` section 3.2), under the names and types the settings always had. */
+export interface InputNode {
+  /** `"input"`. */
+  id: NodeId;
+  pos: NodePos;
+  /** Light › Exposure: `Auto` or `Manual(ev)` in −4…+4, step 0.01. */
+  exposure: AutoOr<{ ev: number }>;
+  /** Colour › White balance, segmented control. */
+  light_source: LightSource;
+  /** Colour › White balance: `Auto` or `Manual { kelvin 2000–11000 step 50, tint −50…50 }`. */
+  white_balance: AutoOr<{ kelvin: number; tint: number }>;
+  /** Pick white (Colour › White balance): the sampled point as `[x, y]` in [0, 1]² image coordinates. */
+  white_pick: [x: number, y: number] | null;
+  rolloff: Rolloff;
+  decode: DecodeOptions;
   /** Detail › Noise reduction: `Auto` or `{ luminance, color, detail }`, each 0–100. */
   noise_reduction: AutoOr<{ luminance: number; color: number; detail: number }>;
-  curve: Curves;
-  decode: DecodeOptions;
-  rolloff: Rolloff;
+  /** Detail › Sharpening: `Auto` or `{ amount 0–300, radius_px 0.3–2.5 }`. */
+  sharpen: AutoOr<{ amount: number; radius_px: number }>;
+  /** The Lens tab: the lens and its Flares, Edges and Anamorphic, `{ kind: "default", flares: 0, edges: 0, anamorphic: 0 }` (no lens) by default. */
+  lens: LensSettings;
   /** Crop (header); `null` when the photo isn't cropped. */
   crop: Crop | null;
   orientation: Orientation;
-  /** Pick white (header): the sampled point as `[x, y]` in [0, 1]² image coordinates. */
-  white_pick: [x: number, y: number] | null;
 }
 
-/** A partial update: only the fields present change. `update_settings(photo_id, patch)`. */
-export type SettingsPatch = Partial<DevelopSettings>;
+/** The Output: the look and the output sharpening (`docs/23` section 3.2). */
+export interface OutputNode {
+  /** `"output"`. */
+  id: NodeId;
+  pos: NodePos;
+  /** Look tab. Defaults to the user's default look (Neutral out of the box). */
+  look: LookId;
+  /** 0–100 %, default 100. */
+  look_intensity: number;
+  /**
+   * Detail › Sharpening › Output: the strength in percent of the sharpening applied to the picture at the size it is shown or written
+   * (every viewport frame, thumbnail and JPEG, TIFF or PNG export; never a DNG). 0–200, step 5, default 100; a plain number, not Auto;
+   * 0 is off. The owner's decision of 2026-10-13 (`docs/algorithms/04-output-sharpening.md`).
+   */
+  output_sharpening: number;
+}
+
+/** A corrector node, Main (id 1) included (`docs/23` section 3.2). */
+export interface CorrectorNode {
+  /** 1 to 2³¹ − 1; Main is 1. */
+  id: NodeId;
+  /** The card's name, 1 to 32 characters. */
+  name: string;
+  /** A bypassed node passes its picture through. */
+  bypass: boolean;
+  pos: NodePos;
+  trim: NodeTrim;
+  grade: NodeGrade;
+  masks: MaskSettings;
+}
+
+/** A Film node's negative (`docs/24` section 4.5). */
+export interface FilmStockSettings {
+  /** The profile id of a camera film (`ym film list`). */
+  stock: string;
+  /** Stops, -4 to 4; 0 is the Input's exposure. */
+  exposure_ev: number;
+}
+
+/** The enlarger's filtration, shifts from neutral in Kodak CC units, -50 to 50. */
+export interface PrintLights {
+  c: number;
+  m: number;
+  y: number;
+}
+
+/** A Film node's enlarger and paper. */
+export interface PrintSettings {
+  /** The paper's profile id; null is the stock's matching paper (a slide takes none). */
+  paper: string | null;
+  /** Stops, -3 to 3; 0 keeps the app's brightness. */
+  exposure_ev: number;
+  lights: PrintLights;
+}
+
+/** A Film node's halation, in percent (100 is the stock's own). */
+export interface HalationSettings {
+  /** 0 to 300. */
+  amount: number;
+  /** 50 to 200. */
+  size: number;
+}
+
+/** A Film node's grain, in percent (100 is the stock's own). */
+export interface GrainSettings {
+  /** 0 to 200. */
+  amount: number;
+  /** 50 to 200. */
+  size: number;
+  /** Not in the interface; it keeps the grain a function of the settings. */
+  seed: number;
+}
+
+/** A Film node: a colour negative, an enlarger, a print and a scan (`docs/24` section 4.5). */
+export interface FilmNode {
+  /** 2 to 2³¹ − 1; correctors and Film nodes share the numbers. */
+  id: NodeId;
+  /** The card's name, 1 to 32 characters. */
+  name: string;
+  /** A bypassed node passes its picture through. */
+  bypass: boolean;
+  pos: NodePos;
+  film: FilmStockSettings;
+  print: PrintSettings;
+  halation: HalationSettings;
+  grain: GrainSettings;
+  /** How much of the film look is applied, 0 to 100 percent. */
+  strength: number;
+  masks: MaskSettings;
+}
+
+/** How a Layer blends an input over the ones below it (`docs/25` section 3.3), computed in linear light. */
+export type BlendMode =
+  | "normal"
+  | "add"
+  | "subtract"
+  | "multiply"
+  | "lighten"
+  | "darken"
+  | "difference";
+
+/** A Parallel mixer: adds the change each of its inputs makes to the picture they started from (`docs/25`). */
+export interface ParallelNode {
+  /** 2 to 2³¹ − 1; every numbered node shares the numbers. */
+  id: NodeId;
+  /** The card's name, 1 to 32 characters. */
+  name: string;
+  /** A bypassed Parallel outputs its base. */
+  bypass: boolean;
+  pos: NodePos;
+}
+
+/** A Layer mixer: stacks its inputs and blends each over the ones below it (`docs/25`). */
+export interface LayerNode {
+  id: NodeId;
+  name: string;
+  /** A bypassed Layer outputs its input 1. */
+  bypass: boolean;
+  pos: NodePos;
+  mode: BlendMode;
+  /** 0 to 1. */
+  opacity: number;
+}
+
+/** A Splitter: sends the red, green and blue of a picture to three outputs (`docs/25`). */
+export interface SplitterNode {
+  id: NodeId;
+  name: string;
+  pos: NodePos;
+}
+
+/** A Combiner: joins three pictures into one, a channel from each (`docs/25`). */
+export interface CombinerNode {
+  id: NodeId;
+  name: string;
+  pos: NodePos;
+}
+
+/** A node of the graph, told by its `kind`. */
+export type NodeItem =
+  | ({ kind: "input" } & InputNode)
+  | ({ kind: "output" } & OutputNode)
+  | ({ kind: "corrector" } & CorrectorNode)
+  | ({ kind: "film" } & FilmNode)
+  | ({ kind: "parallel" } & ParallelNode)
+  | ({ kind: "layer" } & LayerNode)
+  | ({ kind: "splitter" } & SplitterNode)
+  | ({ kind: "combiner" } & CombinerNode);
+
+/** The graph of a photo: its nodes, the Input first, the correctors by id, the Output last, and the links between them. */
+export interface NodesSettings {
+  items: NodeItem[];
+  links: NodeLink[];
+}
 
 /**
- * What `paste_settings` did to one photo: the fields it changed, as two patches that make one undo step. `before` is what Undo
+ * The settings of a photo are the graph of its nodes and nothing else (`docs/23` section 3.1, the owner, 2026-11-01). Every control in
+ * the UI and every CLI flag is a field of one node; the simple view reads the Input, Main and the Output of it through `inputOf`,
+ * `mainOf` and `outputOf` (`src/state/settingsGraph.ts`). Defaults reproduce the automatic development (`docs/01` §DevelopSettings).
+ */
+export interface DevelopSettings {
+  nodes: NodesSettings;
+}
+
+/** `trim` in a patch: the parts to change. */
+export interface TrimPatch {
+  exposure_ev?: number;
+  temperature?: number;
+  tint?: number;
+}
+
+/** `grade` in a patch: the fields to change (each one whole; `color_balance` and `curve` may carry only the wheels or curves to change). */
+export interface GradePatch {
+  contrast?: PercentSetting;
+  brightness?: number;
+  highlights?: PercentSetting;
+  shadows?: PercentSetting;
+  white?: number;
+  black?: PercentSetting;
+  color_balance?: Partial<ColorBalance>;
+  saturation?: PercentSetting;
+  color_warp?: ColorWarp;
+  curve?: Partial<Curves>;
+}
+
+/**
+ * A partial of one mask row's fields (`masks.edit`, `docs/23` section 3.7); it cannot change the row's kind. A Brush row also takes
+ * `strokes_append` (strokes added after the existing ones) and `strokes_keep` (keep only the first n strokes, the inverse of an append).
+ */
+export interface MaskPatch {
+  /** The row's own kind, or nothing: a row patch cannot change it. */
+  kind?: string;
+  mode?: MaskMode;
+  invert?: boolean;
+  enabled?: boolean;
+  opacity?: number;
+  feather?: number;
+  grow?: number;
+  refine?: number;
+  /** An Object row's clicks, replaced whole. */
+  points?: Array<[x: number, y: number, positive: boolean]>;
+  /** An Object row's box; `null` takes it away. */
+  box?: [x0: number, y0: number, x1: number, y1: number] | null;
+  level?: number;
+  /** A Depth row's `far`: where the mask fades out, a place in the photo's depth order (0.02 to 1; 1 is the whole depth). */
+  far?: number;
+  /** The softness of a Background, Colour range or Brightness range row. */
+  softness?: number;
+  center?: [x: number, y: number];
+  angle_deg?: number;
+  radii?: [rx: number, ry: number];
+  /** A Brush row's strokes, replaced whole. */
+  strokes?: BrushStroke[];
+  strokes_append?: BrushStroke[];
+  strokes_keep?: number;
+  width?: number;
+  low?: number;
+  high?: number;
+}
+
+/** `masks` in a patch: the node's Invert, the whole list of rows, and row patches by index (a string), applied after `items`. */
+export interface MasksPatch {
+  invert?: boolean;
+  items?: MaskItem[];
+  edit?: Record<string, MaskPatch>;
+}
+
+/**
+ * A partial of one node's fields (`docs/23` section 3.7), the fields of every kind in one flat object: a field the node's kind does not
+ * have is refused. Nested fields may carry only the parts to change (`decode`, `rolloff`, `lens`, `trim`, `grade`, `color_balance`,
+ * `curve`); `crop: null` clears the crop and `white_pick: null` the picked white. A node the photo does not have is added when `kind`
+ * is given.
+ */
+export interface NodePatch {
+  /** The node's kind: needed to add a node. */
+  kind?: NodeKind;
+  pos?: NodePos;
+  exposure?: AutoOr<{ ev: number }>;
+  light_source?: LightSource;
+  white_balance?: AutoOr<{ kelvin: number; tint: number }>;
+  white_pick?: [x: number, y: number] | null;
+  rolloff?: Partial<Rolloff>;
+  decode?: Partial<DecodeOptions>;
+  noise_reduction?: AutoOr<{ luminance: number; color: number; detail: number }>;
+  sharpen?: AutoOr<{ amount: number; radius_px: number }>;
+  lens?: Partial<LensSettings>;
+  crop?: Crop | null;
+  orientation?: Orientation;
+  look?: LookId;
+  look_intensity?: number;
+  output_sharpening?: number;
+  name?: string;
+  bypass?: boolean;
+  trim?: TrimPatch;
+  grade?: GradePatch;
+  masks?: MasksPatch;
+  /** A Film node's negative. */
+  film?: Partial<FilmStockSettings>;
+  /** A Film node's enlarger and paper; `paper: null` is the matching paper. */
+  print?: { paper?: string | null; exposure_ev?: number; lights?: Partial<PrintLights> };
+  halation?: Partial<HalationSettings>;
+  grain?: Partial<GrainSettings>;
+  /** A Film node's Strength, percent. */
+  strength?: number;
+  /** A Layer's blend mode. */
+  mode?: BlendMode;
+  /** A Layer's opacity, 0 to 1. */
+  opacity?: number;
+}
+
+/**
+ * A node-level partial update (`update_settings(photo_id, patch)`, `docs/23` section 3.7): `nodes` maps node ids as strings (`"input"`,
+ * `"output"`, `"1"`, `"2"`) to what changes in each, `remove` lists the corrector nodes to delete, and `links`, when present, replaces
+ * the links whole. A slider drag sends one node's partial, never the graph (`patchOf`, `src/state/settingsGraph.ts`).
+ */
+export interface SettingsPatch {
+  nodes?: Record<string, NodePatch>;
+  remove?: NodeId[];
+  links?: NodeLink[];
+}
+
+/**
+ * What `paste_settings` did to one photo: the nodes and fields it changed, as two patches that make one undo step. `before` is what Undo
  * sends and `after` what Redo sends; both are empty when the photo already had the pasted settings (addition, 2026-10-16).
  */
 export interface PastedPhoto {
@@ -353,9 +821,17 @@ export interface PasteReport {
   skipped: PhotoId[];
 }
 
-/** Which `Auto` fields are still automatic; the UI shows the AUTO tag for these. */
-export interface AutoFlags {
+/** Which of the Input's `Auto` fields are still automatic; the UI shows the AUTO tag for these. */
+export interface InputAutoFlags {
   exposure: boolean;
+  light_source: boolean;
+  white_balance: boolean;
+  sharpen: boolean;
+  noise_reduction: boolean;
+}
+
+/** Which of Main's `Auto` fields are still automatic. */
+export interface MainAutoFlags {
   contrast: boolean;
   highlights: boolean;
   shadows: boolean;
@@ -363,19 +839,28 @@ export interface AutoFlags {
   balance_shadows: boolean;
   balance_highlights: boolean;
   saturation: boolean;
-  light_source: boolean;
-  white_balance: boolean;
-  sharpen: boolean;
-  noise_reduction: boolean;
+}
+
+/** Which `Auto` fields are still automatic, by node: only the Input and Main can be Auto (`docs/23` section 3.2). */
+export interface AutoFlags {
+  input: InputAutoFlags;
+  main: MainAutoFlags;
 }
 
 /** Light classes of the illuminant estimate (`docs/02`). */
 export type LightClass = "daylight" | "tungsten" | "fluorescent" | "led";
 
-/** Which Auto made a photo's automatic values: Yellowmoon's own (`rule`) or Apple Auto's answer (`apple`, `docs/19`). */
-export type AutoSource = "rule" | "apple";
+/**
+ * Which Auto made a photo's automatic values: Yellowmoon's own (`rule`), or the answer of Apple Intelligence (`apple`, `docs/19`), Claude
+ * Code (`claude`) or Antigravity (`agy`, `docs/22` section 14.1).
+ */
+export type AutoSource = "rule" | "apple" | "claude" | "agy";
 
-/** Why Apple Auto is not available on this computer (`docs/19` section 1), in the order the conditions are checked. */
+/**
+ * Why a provider is not available on this computer: Apple's nine reasons in the order `docs/19` section 1 checks them, then the seven
+ * of `docs/22` section 3 that the two programs (and the consent) add. `not_consented` is never a provider's own state: only a photo's
+ * (`AppleAuto`) says it, when a cloud provider is chosen and available but the person has not agreed yet.
+ */
 export type AppleAutoReason =
   | "not_a_mac"
   | "intel_mac"
@@ -385,9 +870,16 @@ export type AppleAutoReason =
   | "apple_intelligence_off"
   | "model_not_ready"
   | "unavailable"
-  | "no_image_input";
+  | "no_image_input"
+  | "not_installed"
+  | "too_old"
+  | "signed_out"
+  | "probe_failed"
+  | "unsafe_launcher"
+  | "checking"
+  | "not_consented";
 
-/** Why one request to Apple's model failed (`docs/19` sections 6 and 8). A failed photo uses Yellowmoon's own Auto. */
+/** Why one request to Apple's model failed (`docs/19` sections 6 and 8). A failed photo uses Default Auto. */
 export type AppleAutoFailure =
   | "unavailable"
   | "rate_limited"
@@ -399,15 +891,37 @@ export type AppleAutoFailure =
   | "assets_unavailable"
   | "concurrent_requests"
   | "bad_answer"
+  | "not_signed_in"
+  | "cli_failed"
   | "other";
 
 /** Whether Apple's model read the default instructions or the person's own (`docs/19` section 2). */
 export type AppleAutoInstructions = "default" | "edited";
 
-/** Which model answers: "AFM 3 Core" on macOS "27.0.1 (27A404)", with which instructions (the first 12 hex digits of their SHA-256). */
+/**
+ * Who grades: Default Auto (the rule, `docs/02`), Apple Intelligence (`docs/19`), or Claude Code or Antigravity (the `agy` program),
+ * which the person installed and signed in to themselves (`docs/22` section 1). The order is the dropdown's.
+ */
+export type AutoProvider = "yellowmoon" | "apple" | "claude" | "agy";
+
+/** Whether the person agreed to send photos through a program (`docs/22` section 10.2). Apple and Default Auto need none. */
+export interface AutoConsent {
+  claude: boolean;
+  agy: boolean;
+}
+
+/**
+ * Which model answers: "AFM 3 Core" on macOS "27.0.1 (27A404)", or Claude Code 2.1.310 (`tool_version`) with `claude-sonnet-5-5` (`os` is ""
+ * for the programs), with which prompt and instructions (the first 12 hex digits of their SHA-256). `api` says where Claude Code's
+ * pictures go (`firstParty`: Anthropic).
+ */
 export interface AppleAutoInfo {
+  provider: AutoProvider;
   model: string;
   os: string;
+  tool_version: string | null;
+  api: string | null;
+  prompt: number;
   instructions: AppleAutoInstructions;
   instructions_sha256: string;
 }
@@ -447,10 +961,11 @@ export interface AppleAutoAnswer {
 }
 
 /**
- * Where a photo stands with Apple Auto (`docs/19` sections 6 and 12). `off`: the preference is off, or the app has no advisor (the
- * browser build); `unavailable`: not on this computer; `pending`: asked, or waiting for its turn (Auto is the rule until the answer);
- * `answered`; `failed` (Auto is the rule). The Automatic card shows its Contrast and Saturation rows and its line while the state is
- * `pending`, `answered` or `failed`.
+ * Where a photo stands with the provider that grades it (`docs/19` sections 6 and 12, `docs/22` section 10.4). `off`: Yellowmoon's own
+ * Auto is chosen, or the app has no advisor (the browser build); `unavailable`: the chosen provider cannot answer (`reason`; a program
+ * the person has not agreed to is `not_consented`); `pending`: asked, or waiting for its turn (Auto is the rule until the answer);
+ * `answered` (`info.provider` says who); `failed` (Auto is the rule). The Automatic card shows its rows and its line while the state is
+ * `pending`, `answered` or `failed`, and a line for a program that was chosen and `unavailable`.
  */
 export type AppleAuto =
   | { state: "off" }
@@ -459,25 +974,48 @@ export type AppleAuto =
   | { state: "answered"; answer: AppleAutoAnswer; info: AppleAutoInfo }
   | { state: "failed"; kind: AppleAutoFailure; message: string; info: AppleAutoInfo };
 
-/** How a run decides whether Apple Auto is used; the app always follows the preference (`from_preference`). */
-export type AppleAutoMode = "from_preference" | "on" | "off";
+/** Where one provider stands (`docs/22` section 3.1). */
+export type ProviderState = "available" | "not_installed" | "too_old" | "signed_out" | "unavailable" | "checking";
 
 /**
- * `apple_auto_status()` (addition, `docs/19` sections 1, 2 and 10): whether Apple Auto is available on this computer, read again for
- * the answer, and whether it acts. Preferences shows its row "Auto with Apple Intelligence" only while `available`.
+ * One provider of `auto_status()` (`docs/22` sections 3.1 and 11). `listed`: the dropdown shows it; `selectable`: it can be chosen
+ * (`false` for a listed program that is signed out, too old or not working: shown disabled with a note). `consent` is whether the person
+ * agreed to send photos through it; `experimental` marks Antigravity. `info` is there while it is available.
  */
-export interface AppleAutoStatus {
-  available: boolean;
-  /** Why it is not available; null when it is, and when the app has no advisor (the browser build). */
+export interface ProviderStatus {
+  provider: AutoProvider;
+  state: ProviderState;
+  /** Why it is not available (`null` while it is). */
   reason: AppleAutoReason | null;
   info: AppleAutoInfo | null;
-  /** The `apple_auto` preference. */
-  preference: boolean;
-  mode: AppleAutoMode;
-  /** Apple Auto acts for the session now: available, and the preference on. */
+  /** The version the program printed, also while it is too old or signed out. */
+  tool_version: string | null;
+  consent: boolean;
+  experimental: boolean;
+  listed: boolean;
+  selectable: boolean;
+}
+
+/**
+ * `auto_status()` and `auto_status_cached()` (`docs/22` sections 11 and 12.6; they replace `apple_auto_status()`): the four providers in the
+ * dropdown's order, the saved choice, the one that grades now (`effective`: the chosen one while it is available and agreed to, else
+ * `yellowmoon`) and whether any provider calls for the "Auto grading" row and the instructions (`visible`: Apple Intelligence is available,
+ * or one of the programs is listed). Preferences shows the row while `visible` or while the saved choice is a program (`autoRowShown`).
+ */
+export interface AutoStatus {
+  providers: ProviderStatus[];
+  /** The saved choice (`Preferences.auto_provider`). */
+  preference: AutoProvider;
+  /** The provider the session asks: the saved choice in the app. */
+  chosen: AutoProvider;
+  /** The provider that grades now. */
+  effective: AutoProvider;
+  /** `effective` is not `yellowmoon`. */
   active: boolean;
-  /** The prompt's and the table's versions (`docs/19` sections 4 and 5). */
-  prompt: number;
+  /** A provider is there: Preferences shows its "Auto grading" row and the instructions (also while the saved choice is a program). */
+  visible: boolean;
+  consent: AutoConsent;
+  /** The table's version (`docs/19` section 5). */
   table: number;
   /** Which instructions the model reads: the default or the person's own, and the first 12 hex digits of their SHA-256. */
   instructions: AppleAutoInstructions;
@@ -490,18 +1028,19 @@ export interface AppleAutoStatus {
   instructions_max_chars: number;
 }
 
-/**
- * Per-photo automatic estimates, computed once and recomputed by "Re-run" (`docs/01`
- * `AutoEstimates`; the shape of the `auto` object in `docs/10` `--json` output). With an answer
- * from Apple Auto, the exposure, the Kelvin, the contrast and the saturation are Apple's
- * (`docs/19` section 5).
- */
-export interface AutoEstimates {
+/** What Auto resolves to for the Input (`estimates.input`, `docs/23` section 3.9). */
+export interface InputEstimates {
   exposure_ev: number;
-  /** The automatic white lift in stops, 0 for a photo with nothing above +1 stop to lift (the Automatic card's White row). */
-  white_ev: number;
   kelvin: number;
   tint: number;
+  /** What `sharpen: Auto` resolves to. */
+  sharpen: { amount: number; radius_px: number };
+  /** What `noise_reduction: Auto` resolves to. */
+  noise_reduction: { luminance: number; color: number; detail: number };
+}
+
+/** What Auto resolves to for Main (`estimates.main`). */
+export interface MainEstimates {
   /** What `contrast: Auto` resolves to: 0, or Apple Auto's contrast (the Contrast slider's detent). */
   contrast: number;
   /** What `saturation: Auto` resolves to: 0, or Apple Auto's saturation (the Saturation slider's detent). */
@@ -516,8 +1055,26 @@ export interface AutoEstimates {
   balance_shadows: ColorBalancePoint;
   /** What the highlights wheel's Auto resolves to: `[0, 0]`, or Apple Auto's highlight colour. */
   balance_highlights: ColorBalancePoint;
+}
+
+/**
+ * Per-photo automatic estimates, computed once and recomputed by "Re-run" (`docs/01` `AutoEstimates`; the shape of the `auto` object in
+ * `docs/10` `--json` output), grouped by the node each number is for: `input` and `main` (`docs/23` section 3.9), with what belongs to the
+ * photo beside them. With an answer from Apple Auto, the exposure, the Kelvin, the contrast and the saturation are Apple's (`docs/19`
+ * section 5).
+ */
+export interface AutoEstimates {
+  /** What Auto resolves to for the Input. */
+  input: InputEstimates;
+  /** What Auto resolves to for Main. */
+  main: MainEstimates;
   /** Which Auto made these values. */
   source: AutoSource;
+  /**
+   * The provider `apple` and `apple_steps` belong to (`docs/22` section 14.1): the chosen provider while it acts or is asked about (so
+   * the card can name it while the photo is `pending` or `unavailable`), `yellowmoon` while the state is `off`.
+   */
+  provider: AutoProvider;
   /** Where the photo stands with Apple Auto. */
   apple: AppleAuto;
   /** Apple Auto's steps in effect (the photo's answer, or its burst's), null when Auto is the rule. */
@@ -527,35 +1084,72 @@ export interface AutoEstimates {
   light_confidence: number;
   /** Poisson–Gaussian noise model, `variance = a · signal + b`. */
   noise: { a: number; b: number };
-  /** What `sharpen: Auto` resolves to. */
-  sharpen: { amount: number; radius_px: number };
-  /** What `noise_reduction: Auto` resolves to. */
-  noise_reduction: { luminance: number; color: number; detail: number };
 }
 
-/** `DevelopSettings` with every `Auto` replaced by the number it resolves to. */
-export type ResolvedValues = Omit<
-  DevelopSettings,
-  "exposure" | "contrast" | "highlights" | "shadows" | "black" | "white_balance" | "color_balance" | "saturation" | "sharpen" | "noise_reduction"
-> & {
+/** The Input with every `Auto` replaced by the number it resolves to (`values.input`). */
+export interface ResolvedInput {
+  pos: NodePos;
   exposure_ev: number;
+  light_source: LightSource;
+  kelvin: number;
+  tint: number;
+  sharpen: { amount: number; radius_px: number };
+  noise_reduction: { luminance: number; color: number; detail: number };
+  lens: LensSettings;
+  decode: DecodeOptions;
+  rolloff: Rolloff;
+  crop: Crop | null;
+  orientation: Orientation;
+  white_pick: [x: number, y: number] | null;
+}
+
+/** A corrector's grade with every `Auto` replaced by the number it resolves to. */
+export interface GradeValues {
   /** The contrast in effect: the manual value, or the photo's Auto contrast. */
   contrast: number;
+  brightness: number;
   /** Highlights, shadows and black in effect: the manual value, or the photo's Auto value. */
   highlights: number;
   shadows: number;
+  white: number;
   black: number;
   /** The wheels' points in effect. */
   color_balance: ColorBalancePoints;
   /** The saturation in effect: the manual value, or the photo's Auto saturation. */
   saturation: number;
-  /** The white lift in effect in stops: the automatic amount plus `white_offset_ev`, never below 0. */
-  white_ev: number;
-  kelvin: number;
-  tint: number;
-  sharpen: { amount: number; radius_px: number };
-  noise_reduction: { luminance: number; color: number; detail: number };
-};
+  color_warp: ColorWarp;
+  curve: Curves;
+}
+
+/** A corrector with its grade resolved (`values.main`, `values.nodes[…]`); only Main has Auto. */
+export interface ResolvedCorrector {
+  /** The node's id (Main is 1). */
+  id: number;
+  name: string;
+  bypass: boolean;
+  pos: NodePos;
+  trim: NodeTrim;
+  grade: GradeValues;
+  masks: MaskSettings;
+}
+
+/** The Output (it has no Auto). */
+export interface ResolvedOutput {
+  pos: NodePos;
+  look: LookId;
+  look_intensity: number;
+  output_sharpening: number;
+}
+
+/** The settings with every `Auto` replaced by the number it resolves to, node by node (`docs/23` section 3.9). */
+export interface ResolvedValues {
+  input: ResolvedInput;
+  /** Main, node 1. */
+  main: ResolvedCorrector;
+  /** The other correctors, by id (their values are their fields: they have no Auto). */
+  nodes: ResolvedCorrector[];
+  output: ResolvedOutput;
+}
 
 /** What `get_settings` and `update_settings` return: the panel's whole state for one photo. */
 export interface ResolvedSettings {
@@ -615,9 +1209,7 @@ export interface Look {
 export interface LooksImportResult {
   /** Looks added by this import; empty when everything was already there. */
   added: Look[];
-  /** Display LUTs added (ARRI's display rendering, not looks). */
-  display_luts_added: number;
-  /** Files whose hash matched a look or display LUT that was already imported (a re-import adds nothing, `docs/08`). */
+  /** Files whose hash matched a look that was already imported (a re-import adds nothing, `docs/08`). */
   unchanged: number;
 }
 
@@ -627,16 +1219,13 @@ export interface LooksImportResult {
 // ---------------------------------------------------------------------------
 
 /**
- * The five free packages ARRI publishes (`docs/08` §What users can import). The ids are the ones
+ * The three free look packages ARRI publishes (`docs/08` §What users can import). The ids are the ones
  * of `data/looks/arri-packages.json`, except that the two look libraries that also come as ARRI Look Files
- * (the LogC4 one as `.alf4`, the LogC3 to Rec.709 one as `.aml`) are the same package here.
+ * (the LogC4 one as `.alf4`, the LogC3 to Rec.709 one as `.aml`) are the same package here. ARRI's two display
+ * LUT packages are not offered: Yellowmoon uses its own display rendering, and a display package that is chosen
+ * anyway comes back `unusable` with a sentence that says so.
  */
-export type PackageId =
-  | "look_library_logc4"
-  | "display_luts_logc4"
-  | "look_library_logc3"
-  | "look_library_logc3_to_rec709"
-  | "display_luts_logc3";
+export type PackageId = "look_library_logc4" | "look_library_logc3" | "look_library_logc3_to_rec709";
 
 /** What a chosen source is: a zip, an unpacked folder, or a single `.cube` or look file. */
 export type SourceKind = "zip" | "folder" | "file";
@@ -719,16 +1308,6 @@ export interface LooksImportProgress {
   file: string | null;
 }
 
-/** An imported display LUT (ARRI's display rendering). Looks are `Look`s; these are chosen in Preferences. */
-export interface DisplayLut {
-  /** "arri-display:logc4:rec709-g24". */
-  id: string;
-  name: string;
-  input: "logc4" | "logc3_ei800";
-  /** "rec709-g24", "p3-d65", "rec2020", "hlg", "pq". */
-  target: string;
-}
-
 /** `looks_watch_downloads(enabled)`: whether the watcher is running, and why not when it was asked to. */
 export interface WatchStatus {
   watching: boolean;
@@ -772,6 +1351,29 @@ export type ViewportInput =
 /** Fit to the cell, or a fixed zoom (50, 100, 200 %). */
 export type ViewportMode = { kind: "fit" } | { kind: "percent"; value: number };
 
+/** How the mask view shows a node's mask: tinted over the photo as it is, or alone as grey (`docs/23` §5.8). */
+export type MaskStyle = "overlay" | "mask_only";
+
+/**
+ * The mask view of the viewport (`viewport_set_mode`'s second argument): the mask of a corrector shown in the frame by the core, over
+ * the photo or alone. `null` on the wire is the photo.
+ */
+export interface MaskView {
+  /** The corrector whose mask is shown. */
+  node: number;
+  style: MaskStyle;
+  /**
+   * The row of that corrector whose own mask is shown instead of the corrector's (its place in the list, rows that are off included): the row
+   * as it enters the node's fold, with its own Invert and Opacity (`docs/23` §5.8). Left out, or `null`, for the corrector's mask.
+   */
+  row?: number | null;
+  /**
+   * Show depth (`docs/23` §4.8): with `row` naming a Depth row, the frame shows the photo's depth map as grey, white for near, whole and not cut to the
+   * row's band, whatever `style` says. A row that is not a Depth row shows its own mask. Left out is `false`.
+   */
+  depth?: boolean;
+}
+
 /**
  * `chroma_scatter(photo_id)`: the photo's colours on the colour warp's plane, at the warp's input (after C9, before the pins), for the
  * faint scatter behind the plane. A flat list `[a0, b0, a1, b1, …]` of at most 2048 points.
@@ -780,7 +1382,92 @@ export interface ChromaScatter {
   points: number[];
 }
 
-/** `sample_chroma(x, y)`: the chroma of the pixel under a point of the photo cell, at the warp's input (Pick colour). */
+/** A kind of mask row, as the row's `kind` is written (`docs/23` §3.3). */
+export type MaskKind = MaskItem["kind"];
+
+/**
+ * Which side of `viewport_map_points` the points are given in (`docs/23` §9): `"photo"` (points `[x, y]` in the photo frame, answered as CSS
+ * pixels from the cell's corner, which may lie outside the cell) or `"cell"` (CSS pixels, answered as photo-frame fractions, `null` for a
+ * point on the paper).
+ */
+export type MapFrom = "photo" | "cell";
+
+/**
+ * What the person did on the photo to find an object: `mask_find`'s `prompt` (`docs/23` §9), in the photo frame. A click is `point` (`positive`
+ * for a part of the object, not for a part to take away); a drag with the Box tool is `box`.
+ */
+export type MaskFindPrompt = { kind: "point"; x: number; y: number; positive: boolean } | { kind: "box"; x0: number; y0: number; x1: number; y1: number };
+
+/**
+ * The answer of `mask_find` (`docs/23` §9). `found` carries what the Object row's `points` and `box` become (the click or box added to what the
+ * row had) and the time the decoder took; the page sends it as one `masks.edit` row patch. `nothing` is no object there: the page adds no point and
+ * changes nothing, and the error bar says "Nothing found there. Click another part of the object, or draw a box."
+ */
+export type MaskFindResult = { kind: "found"; points: Array<[number, number, boolean]>; box: [number, number, number, number] | null; took_ms: number } | { kind: "nothing" };
+
+/**
+ * The answer of `sample_depth` (`docs/23` §9, Pick depth): the far limit for the depth under the click, in the photo's depth order (0 is the nearest part of the
+ * photo, 1 the farthest): the depth plus 0.1, at most 1. The page writes it as one `masks.edit` row patch (`far`): one undo step.
+ */
+export interface DepthFar {
+  far: number;
+}
+
+/**
+ * Why `focus_plane` has no far limit (`docs/23` §9): `no_focus_point` (an older body, a panorama, a file that is not from a Sony camera; answered at once, without
+ * waiting for the depth map: the card says "This photo has no focus point." and the button stays off) or `map_failed` (the depth map could not be made).
+ */
+export type FocusReason = "no_focus_point" | "map_failed";
+
+/**
+ * The answer of `focus_plane` (`docs/23` §9, Focus plane): with a limit `far` is set as `sample_depth`'s and `reason` is `null`; without one it is
+ * `null` and `reason` says why. The page writes the limit as one `masks.edit` row patch: one undo step. `exact_centre` is true when the camera's point is exactly
+ * the frame's centre, which Sony also writes when it does not know where it focused: the card says "The camera may not have recorded where it focused. Check
+ * the result."
+ */
+export interface FocusPlaneResult {
+  far: number | null;
+  exact_centre: boolean;
+  reason: FocusReason | null;
+}
+
+/**
+ * `depth_state` (addition): the core's depth worker for a photo has ended (`docs/23` §4.8). `failed` is the plain sentence of the failure ("The Depth mask can't
+ * be made: …") or `null` when the map is ready. The Depth rows with the eye on say "Finding…" while it runs (`viewport_busy.finding`); when it ends the photo is
+ * drawn again with the mask, and a row whose map failed says "Can't be made".
+ */
+export interface DepthState {
+  photo_id: PhotoId;
+  failed: string | null;
+}
+
+/**
+ * `object_state` (addition): SAM's encoder is working for a photo (`preparing`), or has stopped. The Object rows of that photo say "Getting ready…" while
+ * it is (`docs/23` §7.6); when it stops with the features made the photo is drawn again.
+ */
+export interface ObjectState {
+  photo_id: PhotoId;
+  preparing: boolean;
+}
+
+/**
+ * `vision_state` (addition): the core's worker for the Subject and People masks of a photo has ended its work (`docs/23` §4.5). `nothing_found` lists the
+ * kinds whose newest mask for the photo found nothing: their rows say "Nothing found" (§7.6). The rows say "Finding…" while the worker runs
+ * (`viewport_busy.finding`); when it ends the photo is drawn again with the masks. Sent each time the worker ends, with the list as it is then.
+ */
+export interface VisionState {
+  photo_id: PhotoId;
+  nothing_found: MaskKind[];
+}
+
+/**
+ * Where in a node `sample_chroma` reads the colour (`docs/23` §9): `"warp_input"` (left out, or `null`) is the input of the node's colour warp,
+ * after the node's own trim and grade (Pick colour of the Colour warp); `"node_input"` is the picture the node reads, before its trim and
+ * grade, which is what a Colour range selects on (Pick colour of a Colour range).
+ */
+export type ChromaTap = "warp_input" | "node_input";
+
+/** `sample_chroma(x, y, at, tap)`: the chroma of the pixel under a point of the photo cell, in the plane of the colour warp and of a Colour range's centre. */
 export interface ChromaSample {
   a: number;
   b: number;
@@ -822,6 +1509,28 @@ export interface ViewportFrame {
   url: string;
 }
 
+/** One node's picture in `node_thumbnails_ready`: the corrector and the address of its thumbnail. */
+export interface NodeThumbnail {
+  /** The corrector (a card of the node view). */
+  node: number;
+  /**
+   * Where the PNG is (`ym-frame://localhost/<launch>/node-<photo>-<node>-<version>.png`, `http://ym-frame.localhost/…` on Windows):
+   * the picture after the node and then through the Output, about 160 px on its long edge. A new picture has a new address, and an
+   * address names the same picture for as long as the app runs. The mock makes `blob:` ones.
+   */
+  url: string;
+}
+
+/**
+ * `node_thumbnails_ready { photo_id, thumbnails }` (`docs/23` §5.7, §9): the answer to `node_thumbnails(photo_id)`, and only the
+ * thumbnails that changed: a node that is not in the list keeps the address it has. The picture does not cross the bridge, as for
+ * `thumbnail_ready`.
+ */
+export interface NodeThumbnailsReady {
+  photo_id: PhotoId;
+  thumbnails: NodeThumbnail[];
+}
+
 /**
  * `settings_changed` (addition): the core changed a photo's settings by itself: after a `viewport_input` Pick white
  * click, and once for each photo a `paste_settings` changed. Ask `get_settings` again (the webview skips the photos it is
@@ -834,6 +1543,46 @@ export interface SettingsChanged {
 /** `export_busy` (addition): an export is queued or running. "Update ready" waits while this is true. */
 export interface ExportBusy {
   busy: boolean;
+}
+
+/**
+ * `display_options` (addition, `docs/28` A-P12, `docs/11` *Display options*): the system's Reduce Transparency, Reduce Motion and
+ * Increase Contrast settings, as the command `display_options()` answers them and as the event sends them when one changes. The page sets
+ * `data-reduce-transparency`, `data-reduce-motion` and `data-increase-contrast` on `<html>` from them. All false off macOS.
+ */
+export interface DisplayOptions {
+  reduce_transparency: boolean;
+  reduce_motion: boolean;
+  increase_contrast: boolean;
+}
+
+/**
+ * `memory_notice` (addition, `docs/26` H-14): the computer is short of memory. `message` is the sentence the error bar shows as a
+ * notice, or `null` when the level is normal again and the sentence goes. Sent once on the way into the critical level and once when
+ * the level is normal; the core owns the words.
+ */
+export interface MemoryNotice {
+  message: string | null;
+}
+
+/**
+ * `viewport_busy` (addition): whether the viewport is working on a frame of the photo on screen, or on the full-resolution tiles a
+ * frame needs, and whether the raw stages of that photo run on the CPU (no usable graphics card, a device error ended the route, the
+ * device is lost, or a method the device does not run), which can take seconds. Sent when it changes (at most about 30 times a
+ * second); `busy` goes false when the work is done or stopped, and when the cell shows no photo. The photo cell shows "Rendering on
+ * the CPU" while both have held for 250 ms.
+ */
+export interface ViewportBusy {
+  /** A frame, or the tiles a frame needs, is being made. */
+  busy: boolean;
+  /** The raw stages of the photo run on the CPU. */
+  cpu: boolean;
+  /**
+   * The core makes the photo's first blur map for a Background mask in the round, or its Subject and People masks in the background (`docs/23`
+   * §7.6): the Background, Subject and People rows say "Finding…" until `busy` goes false. While the Subject and People worker runs, `busy` and
+   * `finding` stay true after the round that asked for the masks has ended. False otherwise, and once the photo has its map and its masks.
+   */
+  finding: boolean;
 }
 
 /**
@@ -867,6 +1616,12 @@ export interface RenderStats {
   zoom_percent: number | null;
   /** The zoom at which the whole final image fits the cell, in percent and not rounded; `null` as `zoom_percent`. */
   fit_percent: number | null;
+  /**
+   * What the lens's bokeh reshaping did for the photo (`docs/21` §10), once the photo's planes exist: `reshaped`, and when it was not,
+   * why (`not_asked`: no slider asks for it; `little_blur`: the photo has little out-of-focus background). `null` without a lens;
+   * optional so that a sender with no lens to report (the mock) leaves it out.
+   */
+  lens?: { reshaped: boolean; reason: "not_asked" | "little_blur" | null } | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -882,7 +1637,7 @@ export type IfExists = "skip" | "replace" | "keep_both";
 export type ExportSize = { kind: "full" } | { kind: "long_edge"; px: number };
 
 /**
- * The options of `docs/09`. Defaults: JPEG, quality 92, 16-bit, LZW, sRGB, full size,
+ * The options of `docs/09`. Defaults: JPEG, quality 92, 16-bit, ZIP, sRGB, full size,
  * `{name}_{look}`, keep both. Colour space and size don't apply to DNG.
  */
 export interface ExportOptions {
@@ -920,10 +1675,23 @@ export interface ExportEstimate {
   adjusted_photos: number;
   /**
    * A DNG of this job is close to, not the same as, the picture in the app: a photo in the job uses a look
-   * with its own display rendering (LogC3 to Rec.709) at an intensity above 0, or ARRI's display rendering is
-   * chosen. The panel then adds one sentence to the DNG note (addition, `docs/09` §What a DNG carries).
+   * with its own display rendering (LogC3 to Rec.709) at an intensity above 0. The panel then adds one sentence
+   * to the DNG note (addition, `docs/09` §What a DNG carries).
    */
   dng_approximate: boolean;
+  /**
+   * Bytes available on the volume of the destination folder, read when the estimate is asked for
+   * (`docs/26-hardening.md` P2-3); null when it cannot be read.
+   */
+  free_bytes: number | null;
+  /** The destination folder `free_bytes` was read for, by its last component; null with it. */
+  folder: string | null;
+  /**
+   * `free_bytes` is under 1.35 times `bytes` (the estimate's documented 90th-percentile error): the panel says
+   * "This export needs about {size} and {free} is free in {folder}. It may stop part way." under the button.
+   * A warning only; the export is never refused.
+   */
+  low_space: boolean;
 }
 
 /** `export_progress` event payload. */
@@ -943,14 +1711,16 @@ export interface ExportProgress {
   error: string | null;
   /** `file` already existed and "If it exists" is Skip: it counts in `done` but was not written (addition). */
   skipped: boolean;
+  /**
+   * `file` failed because of the destination (the disk is full, the folder is read-only or gone) and the job stopped
+   * there: this is the job's last event and the files after `done` were not tried (`docs/26` P2-2).
+   */
+  stopped: boolean;
 }
 
 // ---------------------------------------------------------------------------
 // Preferences (docs/01 §Persistence)
 // ---------------------------------------------------------------------------
-
-/** Display rendering: our ACES 2 transform, or an imported ARRI display LUT. */
-export type DisplayRendering = { kind: "aces2" } | { kind: "arri_display"; id: string };
 
 /** Folders remembered between runs. */
 export interface LastUsedFolders {
@@ -962,20 +1732,29 @@ export interface LastUsedFolders {
 /** Everything that persists besides imported looks. The list is exhaustive (hard rule 4). */
 export interface Preferences {
   default_look: LookId;
-  display_rendering: DisplayRendering;
   /** Export defaults: format, quality, bits, compression, colour space, size, destination, name template, if-exists. */
   export_defaults: ExportOptions;
   remove_location_from_exports: boolean;
   check_for_updates_automatically: boolean;
   watch_downloads_during_import: boolean;
   last_used_folders: LastUsedFolders;
-  /** Auto with Apple Intelligence (`docs/19` section 2): on by default; it acts only where Apple Auto is available. */
-  apple_auto: boolean;
   /**
-   * Instructions for Apple Intelligence (`docs/19` section 2): the person's own instructions for Apple Auto's model, at most 2000
-   * characters; "" (the default) means `AppleAutoStatus.default_instructions`.
+   * Who grades (`docs/22` section 10.1): Apple Intelligence by default. A provider that is not available, or a program the person has not
+   * agreed to yet, acts as `yellowmoon`; the choice stays saved.
+   */
+  auto_provider: AutoProvider;
+  /** Whether the person agreed to send photos through Claude Code and through Antigravity (`docs/22` section 10.2). */
+  auto_consent: AutoConsent;
+  /**
+   * Instructions for the grading model (`docs/19` section 2, `docs/22` D1): the person's own instructions, at most 2000 characters, one
+   * text for every provider; "" (the default) means `AutoStatus.default_instructions`.
    */
   apple_auto_instructions: string;
+  /**
+   * Single-key shortcuts (`docs/28` A-P11): on by default. Off, P, Z, C, W, N, F, B, M, A, `\`, 1 to 9, Delete and Backspace do nothing
+   * outside a text box, and every action stays in the menu bar.
+   */
+  single_key_shortcuts: boolean;
 }
 
 /** A partial update of the preferences. */
@@ -1034,6 +1813,7 @@ export type ErrorScope =
   | "looks"
   | "preferences"
   | "viewport"
+  | "mask"
   | "app";
 
 /**
@@ -1053,12 +1833,51 @@ export interface CliLinkResult {
 /** What `open_dialog` offers. */
 export type OpenKind = "files" | "folder";
 
+/** One camera film of the Film node's picker (`docs/24` section 4.1); the list is `names.json` through the core. */
+export interface FilmStockInfo {
+  /** The profile id ("kodak_portra_400"). */
+  id: string;
+  /** The name shown to the person ("Kodak Portra 400"). */
+  name: string;
+  /** The group of the picker: `colour_negative`, `cine_negative` or `slide` (see `FILM_GROUPS`). */
+  kind: string;
+  /** The maker. */
+  group: string;
+  iso: number | null;
+  /** The profile id of the paper "Matching paper" means for it; null for a slide. */
+  matching_paper: string | null;
+}
+
+/** One still paper of the Film node's paper picker. */
+export interface FilmPaperInfo {
+  id: string;
+  name: string;
+}
+
+/** `film_catalogue`: what the Film node's pickers list, and the credit lines (`docs/24` sections 4.6, 6.2 and 6.5). */
+export interface FilmCatalogue {
+  /** The 20 camera films in the order of the picker. */
+  stocks: FilmStockInfo[];
+  /** The 6 still papers (the cine print films are not listed). */
+  papers: FilmPaperInfo[];
+  /** The version of the film data ("0.3.2"). */
+  profile_version: string;
+  /** The credit line of the film data (`docs/24` section 6.2); the Film tab and About show it with its link. */
+  credit: string;
+  /** "Modelled on published data. Not affiliated with Kodak or Fujifilm." */
+  disclaimer: string;
+  /** "Kodak, Portra, Ektar, Vision3, Ektachrome, Kodachrome, Fujifilm, Velvia and the other film and paper names shown are trademarks of their owners." */
+  trademarks: string;
+}
+
 /** What the app knows about itself, for About (addition). */
 export interface AppInfo {
   /** The app and CLI version: "0.1.0". */
   version: string;
   /** The pipeline version written into exports (`docs/01` §Versions written into outputs). */
   pipeline_version: string;
+  /** The operating system the app runs on, as Rust names it (`std::env::consts::OS`): "macos", "windows" or "linux" (`docs/22` section 12.3). */
+  os: string;
 }
 
 /** `cli_link_status`: whether "Install Command-Line Tool…" has been done (addition, Preferences). */
@@ -1087,6 +1906,7 @@ export type MenuAction =
   | "pick_all"
   | "clear_picks"
   | "before_after"
+  | "nodes"
   | "fit"
   | "zoom_100"
   | "zoom_in"
@@ -1098,7 +1918,22 @@ export type MenuAction =
   | "make_default_look"
   | "copy_settings"
   | "paste_settings"
-  | "paste_settings_to_picked";
+  | "paste_settings_to_picked"
+  | "crop"
+  | "auto_crop"
+  | "pick_white"
+  | "remove_photo"
+  | "bypass_node"
+  | "mask_view"
+  | "look_1"
+  | "look_2"
+  | "look_3"
+  | "look_4"
+  | "look_5"
+  | "look_6"
+  | "look_7"
+  | "look_8"
+  | "look_9";
 
 /**
  * `set_menu_state(state)` (addition, 2026-10-16): which of the Edit menu's settings items are available. The webview knows (a developed
@@ -1121,10 +1956,16 @@ export interface MenuActionEvent {
 /** Event name → payload type, for the typed `on()`. `looks_changed` carries no data. */
 export interface ApiEvents {
   photo_progress: PhotoProgress;
+  /** Files of an open read so far (`open_paths`, `open_dialog`). */
+  open_progress: OpenProgress;
   thumbnail_ready: ThumbnailReady;
+  /** The thumbnails of a photo's nodes that changed (answers `node_thumbnails`; `docs/23` §5.7). */
+  node_thumbnails_ready: NodeThumbnailsReady;
   render_stats: RenderStats;
   export_progress: ExportProgress;
   looks_changed: null;
+  /** A provider's availability changed (a program found, signed in or out, a probe ended): read `auto_status_cached()` again (`docs/22` section 12.6). */
+  auto_status_changed: null;
   update_state: UpdateState;
   error: AppError;
   /** Files of one source copied so far during `looks_import` (the wizard's Import step). */
@@ -1139,6 +1980,18 @@ export interface ApiEvents {
   settings_changed: SettingsChanged;
   /** An export is queued or running, or the queue has just gone quiet. */
   export_busy: ExportBusy;
+  /** The viewport is working on a frame (and whether on the CPU), or has stopped. */
+  viewport_busy: ViewportBusy;
+  /** SAM's encoder started or stopped working for a photo (`docs/23` §7.6: the Object rows say "Getting ready…"). */
+  object_state: ObjectState;
+  /** The Subject and People worker ended its work for a photo, and which kinds found nothing (`docs/23` §7.6: those rows say "Nothing found"). */
+  vision_state: VisionState;
+  /** The depth worker ended its work for a photo, and whether the map failed (`docs/23` §7.6: a failed row says "Can't be made"). */
+  depth_state: DepthState;
+  /** The computer is short of memory and background work is paused (the sentence), or it is not any more (`null`). */
+  memory_notice: MemoryNotice;
+  /** One of the system's display options changed (Reduce Transparency, Reduce Motion, Increase Contrast; macOS only). */
+  display_options: DisplayOptions;
 }
 
 /** Names of the events the core emits. */

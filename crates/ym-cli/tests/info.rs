@@ -22,7 +22,8 @@ fn ym() -> Command {
             std::env::temp_dir().join("ym-cli-info-tests-no-such-home"),
         )
         .env_remove("RUST_LOG")
-        .env(common::NO_APPLE_AUTO.0, common::NO_APPLE_AUTO.1);
+        .env(common::NO_APPLE_AUTO.0, common::NO_APPLE_AUTO.1)
+        .env(common::NO_AUTO_PROVIDERS.0, common::NO_AUTO_PROVIDERS.1);
     cmd
 }
 
@@ -322,7 +323,7 @@ fn a_folder_is_reported_as_an_error_not_read() {
         .arg(dir.path())
         .assert()
         .code(1)
-        .stderr(predicate::str::contains("folder"));
+        .stderr(predicate::str::contains("This isn't an ARW file."));
 }
 
 #[test]
@@ -490,6 +491,36 @@ fn optional_fields_are_null_or_absent_when_the_file_lacks_them() {
     assert!(out.contains("none"), "{out}");
 }
 
+/// The NEX-7 carries its lens tables only in the SR2 sub-IFD; `info` lists them instead of "none".
+/// Needs the local real file (`tools/fetch/real-eval.sh`); skipped without it.
+#[test]
+fn a_nex_7_shows_its_lens_data_from_the_sr2_sub_ifd() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../testdata/real/files/NEX-7.ARW");
+    if !path.is_file() {
+        assert!(
+            std::env::var_os("YM_REQUIRE_REAL_FILES").is_none(),
+            "YM_REQUIRE_REAL_FILES is set but {} is missing",
+            path.display()
+        );
+        eprintln!("SKIPPED: {} is not on this machine", path.display());
+        return;
+    }
+    let text = ym().arg("info").arg(&path).assert().success();
+    let out = String::from_utf8_lossy(&text.get_output().stdout).into_owned();
+    let line = out
+        .lines()
+        .find(|l| l.contains("Lens data"))
+        .expect("a Lens data line");
+    assert!(
+        line.contains("vignetting")
+            && line.contains("chromatic aberration")
+            && line.contains("distortion"),
+        "{line}"
+    );
+    assert!(!line.contains("none"), "{line}");
+}
+
 #[test]
 fn gps_location_is_shown_when_the_file_has_a_fix() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -585,6 +616,7 @@ fn a_reader_that_goes_away_ends_the_run_quietly() {
         .args(["info", "--json"])
         .args(&files)
         .env(common::NO_APPLE_AUTO.0, common::NO_APPLE_AUTO.1)
+        .env(common::NO_AUTO_PROVIDERS.0, common::NO_AUTO_PROVIDERS.1)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -595,4 +627,101 @@ fn a_reader_that_goes_away_ends_the_run_quietly() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.is_empty(), "stderr: {stderr}");
     assert_eq!(output.status.code(), Some(0), "status {:?}", output.status);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Auto crop (`docs/20-auto-crop.md` §8)
+// ---------------------------------------------------------------------------------------------
+
+/// A body that writes the camera's focus point, with the point a third in from the left.
+fn focused(dir: &Path) -> PathBuf {
+    write(
+        dir,
+        "DSC00002.ARW",
+        &ArwBuilder::new("ILCE-7RM4", 192, 128)
+            .focus_location([6000, 4000, 2000, 1500])
+            .focus_frame_size([300, 300, 257]),
+        192,
+        128,
+    )
+}
+
+#[test]
+fn without_the_flag_there_is_no_auto_crop() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = focused(dir.path());
+    let assert = ym().arg("info").arg(&path).assert().success();
+    let out = String::from_utf8_lossy(&assert.get_output().stdout).into_owned();
+    assert!(!out.contains("Auto crop"), "{out}");
+    let assert = ym().args(["info", "--json"]).arg(&path).assert().success();
+    let line = &json_lines(&assert.get_output().stdout)[0];
+    assert!(line.get("auto_crop").is_none(), "{line}");
+}
+
+#[test]
+fn the_auto_crop_row_says_the_angle_the_frame_and_the_subject() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = focused(dir.path());
+    let assert = ym()
+        .args(["info", "--suggest-crop"])
+        .arg(&path)
+        .assert()
+        .success();
+    let out = String::from_utf8_lossy(&assert.get_output().stdout).into_owned();
+    let row = out
+        .lines()
+        .find(|l| l.trim_start().starts_with("Auto crop"))
+        .unwrap_or_else(|| panic!("no Auto crop row in\n{out}"));
+    // The file carries the camera's focus point, but the crop model reads the picture alone.
+    assert!(row.contains("(from the picture)"), "{row}");
+    assert!(
+        ["Levelled by", "Already level", "No horizon found"]
+            .iter()
+            .any(|a| row.contains(a)),
+        "{row}"
+    );
+}
+
+#[test]
+fn the_json_proposal_is_the_sessions_answer() {
+    use std::sync::Arc;
+    use ym_core::pipeline::{AdvisorPictures, RenderOptions};
+    use ym_core::session::{OpenOptions, Session, SessionEnv};
+    use ym_core::settings::{CropAspect, Orientation};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = focused(dir.path());
+    let assert = ym()
+        .args(["info", "--json", "--suggest-crop=4:5"])
+        .arg(&path)
+        .assert()
+        .success();
+    let line = &json_lines(&assert.get_output().stdout)[0];
+    let from_ym = line.get("auto_crop").expect("auto_crop").clone();
+
+    // The app's session on the same file: the same picture renderer, the same answer.
+    let env = SessionEnv::load(&common::data_dir()).expect("data");
+    let pictures = AdvisorPictures::new(env.reference_look.clone(), &RenderOptions::default())
+        .expect("pictures");
+    let session = Session::new(env.with_pictures(Arc::new(pictures)));
+    let id = session
+        .open(std::slice::from_ref(&path), OpenOptions::default())
+        .added[0];
+    assert!(session.wait_idle(std::time::Duration::from_secs(60)));
+    let answer = session
+        .suggest_crop(id, CropAspect::FourByFive, Orientation::Deg0)
+        .expect("suggestion");
+    assert_eq!(from_ym, serde_json::to_value(&answer).unwrap());
+    assert_eq!(from_ym["subject"], "picture");
+}
+
+#[test]
+fn an_unknown_aspect_is_a_usage_error() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = focused(dir.path());
+    ym().args(["info", "--suggest-crop=3:7"])
+        .arg(&path)
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("3:7 is not an aspect"));
 }

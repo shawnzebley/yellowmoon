@@ -7,13 +7,24 @@
 //!   noise-regularised ratio, green refinement with the optional CA weighting, chroma, shadow
 //!   sharpening and shadow colour matching), eleven pipelines of `adaptive_ratio.wgsl`, f32 planes in
 //!   every storage mode, GPU against `cpu::demosaic::adaptive_ratio`.
+//! * [`bm_dct`]: R6's single-frame denoise by method A (block matching and 3D DCT hard
+//!   thresholding, `docs/algorithms/05`): a prep pass, one dispatch per pass of A.5 in the CPU's
+//!   order and an output pass, GPU against `cpu::frame_denoise::FrameDenoise::apply`.
+//! * [`false_color`]: R6's false-colour suppression after method A, R7's colour guided filter where the
+//!   luma alternates (the guided filter's four passes and a gate of four), GPU against
+//!   `cpu::false_color::suppress`.
+//! * [`coarse_chroma`]: R6's coarse colour pass after the false-colour suppression, a bilateral filter
+//!   of the colour of 4 x 4 cells within the photo's noise (three passes), GPU against
+//!   `cpu::coarse_chroma::CoarseChroma::apply`.
 //! * [`color`]: the whole per-pixel colour chain C1 to C13 as one compute pass (fused matrix, C7
-//!   highlight range and toe, C8 LogC4, C9 grade, C10 CDL and tetrahedral LUT, C11 curves, C12 ACES 2
-//!   or an ARRI display LUT, C13 encode and dither), mirroring `ym_color::display::ColorChain` stage
+//!   highlight range and toe, C8 LogC4, C9 grade, C10 CDL and tetrahedral LUT, C11 curves, C12 the cine rendering,
+//!   C13 encode and dither), mirroring `ym_color::display::ColorChain` stage
 //!   by stage.
 //! * [`diffraction`]: the R8 diffraction deconvolution (nine passes of `diffraction.wgsl`,
 //!   f32 planes in every storage mode, the planner stays on the CPU), GPU against
 //!   `cpu::sharpen::diffraction`.
+//! * [`film`]: the Film node's passes P1 to P5 (colour in, the Gaussians, develop with the coupler step, grain, colour out
+//!   with the per-pixel return of the cine rendering's inverse), GPU against `ym-film`'s CPU code.
 //! * [`log_guided`]: the log-guided fast demosaic (all-float form, four dispatches), GPU
 //!   against `cpu::demosaic::log_guided::demosaic_float`.
 //! * [`output_sharpen`]: the output sharpening stage (luma unsharp mask with three threshold
@@ -36,16 +47,27 @@
 pub mod adaptive_ratio;
 pub mod bilateral;
 pub mod bin;
+pub mod bm_dct;
+pub mod coarse_chroma;
 pub mod color;
 pub mod copy;
 pub mod detail;
 pub mod diffraction;
 pub mod encode;
+pub mod false_color;
+pub mod film;
+pub mod film_stack;
 pub mod guided;
 pub mod highlights;
 pub mod lens;
+pub mod lens_field;
+pub mod lens_flare;
+pub mod lens_light;
+pub mod lens_reshape;
+pub mod level_draft;
 pub mod log_guided;
 pub mod magnify;
+pub mod mask_raster;
 pub mod mosaic_ca;
 pub mod output_sharpen;
 pub mod prep;
@@ -56,8 +78,8 @@ pub mod richardson_lucy;
 pub mod sampler;
 pub mod sigma;
 pub mod spike;
+pub mod tint;
 
-mod aces;
 mod shader;
 pub(crate) mod util;
 
@@ -107,6 +129,7 @@ impl Kernels {
             return Ok(p.clone());
         }
         ctx.fault().on_pipeline(id.name())?;
+        let started = std::time::Instant::now();
         let source = shader_source(self.mode, id);
         let scope = ctx.device.push_error_scope(wgpu::ErrorFilter::Validation);
         let module = ctx
@@ -128,6 +151,8 @@ impl Kernels {
         if let Some(err) = pollster::block_on(scope.pop()) {
             return Err(GpuError::Shader(format!("{}: {err}", id.name())));
         }
+        ctx.counters_shared()
+            .count_pipeline(started.elapsed().as_micros() as u64);
         self.pipelines.borrow_mut().insert(id, pipeline.clone());
         Ok(pipeline)
     }

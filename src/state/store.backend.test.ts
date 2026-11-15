@@ -1,14 +1,15 @@
 /**
  * The store against the real core's behaviour (M3-02, M3-03 frontend side): the viewport backend and its frames, Pick white through the
- * core, `settings_changed`, `export_busy`, and a new photo opening at Fit with Before off. The mock stands in for the core and sends
- * the same events.
+ * core, `settings_changed`, `export_busy`, `viewport_busy`, and a new photo opening at Fit with Before off. The mock stands in for the
+ * core and sends the same events.
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createMockApi } from "../api.mock";
 import type { MockApi, MockOptions } from "../api.mock";
-import type { ViewportFrame } from "../api/types";
+import type { ViewportBusy, ViewportFrame } from "../api/types";
 import { createStore } from "./store";
 import type { AppStore } from "./store";
+import { inputOf, inputPatch, mainGradeOf, mainGradePatch } from "./settingsGraph";
 
 /** A manual contrast or saturation (`docs/19` section 5: Auto or a value). */
 const manual = (value: number) => ({ kind: "manual", value }) as const;
@@ -173,12 +174,12 @@ describe("Pick white", () => {
     expect(input).toHaveBeenCalledWith({ kind: "pick_white", x: 450, y: 150 });
     expect(update).not.toHaveBeenCalled();
     const rs = store.currentSettings()!;
-    expect(rs.settings.white_pick).toEqual([0.5, 0.25]);
-    expect(rs.settings.white_balance.kind).toBe("manual");
+    expect(inputOf(rs.settings).white_pick).toEqual([0.5, 0.25]);
+    expect(inputOf(rs.settings).white_balance.kind).toBe("manual");
     expect(store.getState().canUndo).toBe(true);
     await store.undo();
-    expect(store.currentSettings()!.settings.white_pick).toBeNull();
-    expect(store.currentSettings()!.auto.white_balance).toBe(true);
+    expect(inputOf(store.currentSettings()!.settings).white_pick).toBeNull();
+    expect(store.currentSettings()!.auto.input.white_balance).toBe(true);
     expect(store.getState().canRedo).toBe(true);
   });
 
@@ -186,10 +187,10 @@ describe("Pick white", () => {
     const { api, store } = await opened();
     store.setViewportRect({ x: 0, y: 75, width: 900, height: 600, scale: 2 });
     await vi.waitFor(() => expect(api.viewport.rect?.width).toBe(900));
-    await store.update({ orientation: 90 });
+    await store.update(inputPatch({ orientation: 90 }));
     const undoDepth = store.getState().canUndo;
     await store.pickWhite(10, 300);
-    expect(store.currentSettings()!.settings.white_pick).toBeNull();
+    expect(inputOf(store.currentSettings()!.settings).white_pick).toBeNull();
     expect(store.getState().canUndo).toBe(undoDepth);
   });
 
@@ -198,18 +199,18 @@ describe("Pick white", () => {
     api.failNext("viewportInput", { scope: "render", message: "That spot is too dark to be a white. Click something lighter." });
     await store.pickWhite(450, 300);
     expect(store.getState().error).toEqual({ scope: "render", message: "That spot is too dark to be a white. Click something lighter." });
-    expect(store.currentSettings()!.settings.white_pick).toBeNull();
+    expect(inputOf(store.currentSettings()!.settings).white_pick).toBeNull();
   });
 
   it("waits for the patches in flight, so the undo step starts from the settings the core has", async () => {
     const { store } = await opened();
-    const done = store.update({ contrast: manual(10) }, true);
+    const done = store.update(mainGradePatch({ contrast: manual(10) }), true);
     const pick = store.pickWhite(450, 300);
     await Promise.all([done, pick]);
     await store.undo();
     // The pick is undone; the contrast change before it is still there.
-    expect(store.currentSettings()!.settings.white_pick).toBeNull();
-    expect(store.currentSettings()!.settings.contrast).toEqual(manual(10));
+    expect(inputOf(store.currentSettings()!.settings).white_pick).toBeNull();
+    expect(mainGradeOf(store.currentSettings()!.settings).contrast).toEqual(manual(10));
   });
 });
 
@@ -218,10 +219,10 @@ describe("settings_changed", () => {
     const { api, store } = await opened();
     const id = store.currentPhoto()!.id;
     // The core sets the pick on its own (another window, a menu): the mirror asks.
-    await api.updateSettings(id, { contrast: manual(25) });
-    expect(store.currentSettings()!.values.contrast).toBe(0);
+    await api.updateSettings(id, mainGradePatch({ contrast: manual(25) }));
+    expect(store.currentSettings()!.values.main.grade.contrast).toBe(0);
     api.emitEvent("settings_changed", { photo_id: id });
-    await vi.waitFor(() => expect(store.currentSettings()!.values.contrast).toBe(25));
+    await vi.waitFor(() => expect(store.currentSettings()!.values.main.grade.contrast).toBe(25));
   });
 
   it("is ignored for a photo the screen has not asked about", async () => {
@@ -232,6 +233,29 @@ describe("settings_changed", () => {
     await Promise.resolve();
     expect(spy).not.toHaveBeenCalled();
     expect(Object.keys(store.getState().settings)).toHaveLength(1);
+  });
+});
+
+describe("memory_notice", () => {
+  const SENTENCE = "Your Mac is short of memory, so Yellowmoon paused background work. Close other apps to speed it up again.";
+
+  it("shows the core's sentence when it says it and takes it away when the core says null", async () => {
+    const { api, store } = await connected();
+    expect(store.getState().memoryNotice).toBeNull();
+    api.emitEvent("memory_notice", { message: SENTENCE });
+    expect(store.getState().memoryNotice).toBe(SENTENCE);
+    api.emitEvent("memory_notice", { message: null });
+    expect(store.getState().memoryNotice).toBeNull();
+  });
+
+  it("is hidden by Dismiss until the core says it again, and is not the session's: closing the session leaves it", async () => {
+    const { api, store } = await opened();
+    api.emitEvent("memory_notice", { message: SENTENCE });
+    store.dismissMemoryNotice();
+    expect(store.getState().memoryNotice).toBeNull();
+    api.emitEvent("memory_notice", { message: SENTENCE });
+    await store.closeSession();
+    expect(store.getState().memoryNotice).toBe(SENTENCE);
   });
 });
 
@@ -276,5 +300,62 @@ describe("export_busy", () => {
     api.emitEvent("export_busy", { busy: true });
     await store.closeSession();
     expect(store.getState().exportBusy).toBe(true);
+  });
+});
+
+describe("viewport_busy", () => {
+  it("starts not busy and follows the event, the CPU flag included", async () => {
+    const { api, store } = await connected();
+    expect(store.getState().viewportBusy).toEqual({ busy: false, cpu: false, finding: false });
+    api.emitEvent("viewport_busy", { busy: true, cpu: true, finding: false });
+    expect(store.getState().viewportBusy).toEqual({ busy: true, cpu: true, finding: false });
+    api.emitEvent("viewport_busy", { busy: false, cpu: true, finding: false });
+    expect(store.getState().viewportBusy).toEqual({ busy: false, cpu: true, finding: false });
+    api.emitEvent("viewport_busy", { busy: true, cpu: false, finding: false });
+    expect(store.getState().viewportBusy).toEqual({ busy: true, cpu: false, finding: false });
+  });
+
+  it("does not tell the screens again when the core repeats itself", async () => {
+    const { api, store } = await connected();
+    api.emitEvent("viewport_busy", { busy: true, cpu: true, finding: false });
+    const before = store.getState();
+    const listener = vi.fn();
+    stops.push(store.subscribe(listener));
+    api.emitEvent("viewport_busy", { busy: true, cpu: true, finding: false });
+    expect(listener).not.toHaveBeenCalled();
+    expect(store.getState()).toBe(before);
+  });
+
+  it("is not busy once the session closes, as the core says when it stops drawing", async () => {
+    const { api, store } = await opened();
+    api.emitEvent("viewport_busy", { busy: true, cpu: true, finding: false });
+    await store.closeSession();
+    expect(store.getState().viewportBusy.busy).toBe(false);
+  });
+
+  it("is sent by the mock with mockCpu around each frame, and never without it", async () => {
+    // Speed 10: a frame "rendered" on the CPU takes 60 ms.
+    const cpu = await opened({ cpu: true, speed: 10 });
+    // The frames of opening the photo are done first.
+    await vi.waitFor(() => expect(cpu.store.getState().viewportBusy.busy).toBe(false));
+    const heard: ViewportBusy[] = [];
+    stops.push(cpu.api.on("viewport_busy", (e) => heard.push(e)));
+    await cpu.store.update(mainGradePatch({ brightness: 12 }));
+    await vi.waitFor(() =>
+      expect(heard).toEqual([
+        { busy: true, cpu: true, finding: false },
+        { busy: false, cpu: true, finding: false },
+      ]),
+    );
+    expect(cpu.store.getState().viewportBusy).toEqual({ busy: false, cpu: true, finding: false });
+
+    // Without the option the mock is a graphics card: nothing is said.
+    const gpu = await opened({ speed: 10 });
+    const none = vi.fn();
+    stops.push(gpu.api.on("viewport_busy", none));
+    await gpu.store.update(mainGradePatch({ brightness: 12 }));
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    expect(none).not.toHaveBeenCalled();
+    expect(gpu.store.getState().viewportBusy).toEqual({ busy: false, cpu: false, finding: false });
   });
 });

@@ -102,14 +102,15 @@ fn gpu_and_cpu_frames_agree_within_the_parity_tolerance() {
         (
             "graded",
             edit(&src, |s| {
-                s.contrast = ym_core::settings::PercentSetting::manual_value(30.0);
-                s.brightness = 10.0;
-                s.saturation = ym_core::settings::PercentSetting::manual_value(20.0);
-                s.color_balance.highlights =
+                s.main_grade_mut().contrast = ym_core::settings::PercentSetting::manual_value(30.0);
+                s.main_grade_mut().brightness = 10.0;
+                s.main_grade_mut().saturation =
+                    ym_core::settings::PercentSetting::manual_value(20.0);
+                s.main_grade_mut().color_balance.highlights =
                     ym_core::settings::BalanceSetting::manual_point([0.4, -0.3]);
-                s.curve.luma = vec![[0.0, 0.0], [0.4, 0.5], [1.0, 1.0]];
-                s.curve.blue = vec![[0.0, 0.05], [1.0, 0.95]];
-                s.crop = Some(ym_core::settings::Crop {
+                s.main_grade_mut().curve.luma = vec![[0.0, 0.0], [0.4, 0.5], [1.0, 1.0]];
+                s.main_grade_mut().curve.blue = vec![[0.0, 0.05], [1.0, 0.95]];
+                s.input_mut().crop = Some(ym_core::settings::Crop {
                     rect: ym_core::settings::NormRect {
                         x: 0.05,
                         y: 0.05,
@@ -118,6 +119,7 @@ fn gpu_and_cpu_frames_agree_within_the_parity_tolerance() {
                     },
                     angle_deg: 4.0,
                     aspect: ym_core::settings::CropAspect::Free,
+                    auto: false,
                 });
             }),
         ),
@@ -368,10 +370,11 @@ fn the_renders_of_a_dng_have_no_capture_sharpening_on_the_device_and_match_the_c
     let Some(gpu) = gpu() else { return };
     let src = scene();
     let off = edit(&src, |s| {
-        s.sharpen = ym_core::settings::AutoOr::Manual(ym_core::settings::SharpenValue {
-            amount: 0.0,
-            radius_px: 1.0,
-        });
+        s.input_mut().sharpen =
+            ym_core::settings::AutoOr::Manual(ym_core::settings::SharpenValue {
+                amount: 0.0,
+                radius_px: 1.0,
+            });
     });
     // Every stage but the export tail: with `GpuStages::EXPORT_TAIL` the colour stage of the DNG's
     // two renders runs on the device too (`tests/gpu_export.rs` compares it with the CPU's),
@@ -428,9 +431,11 @@ fn the_renders_of_a_dng_have_no_capture_sharpening_on_the_device_and_match_the_c
         "DNG preview, device against CPU: worst {worst:e}, share over 1e-3 {over:e}, mean {mean:e}"
     );
     // Twice the first measured values (worst 8.3e-4, no sample over 1e-3, mean 4.5e-8): a tie flip of
-    // the demosaic and what the later stages make of it.
+    // the demosaic and what the later stages make of it. With method A as R6's denoise (2026-10-20) its
+    // own threshold decisions flip too (f32 against f64): worst 1.5e-3, share over 1e-3 1.4e-6, mean
+    // 2.5e-7, so the worst bound is twice that.
     assert!(
-        worst < 2e-3 && over <= 2e-5 && mean < 1e-6,
+        worst < 3.1e-3 && over <= 2e-5 && mean < 1e-6,
         "{worst} {over} {mean}"
     );
     let cpu_raw = full(&cpu, &src, FullTarget::DngLinearAwg4);
@@ -439,9 +444,10 @@ fn the_renders_of_a_dng_have_no_capture_sharpening_on_the_device_and_match_the_c
         "DNG pixels, device against CPU: worst {worst:e}, share over 1e-3 {over:e}, mean {mean:e}"
     );
     // The pixels are scene-linear (a wider range than the display's): twice the first measured values
-    // (worst 1.7e-3, share over 1e-3 8.5e-7, mean 7.7e-8).
+    // (worst 1.7e-3, share over 1e-3 8.5e-7, mean 7.7e-8), and with method A's threshold decisions
+    // (2026-10-20) twice worst 6.8e-3, share over 1e-3 7.8e-5, mean 6.2e-7.
     assert!(
-        worst < 4e-3 && over <= 2e-5 && mean < 1e-6,
+        worst < 1.4e-2 && over <= 1.6e-4 && mean < 1.3e-6,
         "{worst} {over} {mean}"
     );
 }
@@ -498,6 +504,44 @@ fn the_device_runs_the_raw_chain_only_when_the_stage_and_the_method_allow_it() {
     assert!(b.report.ranges.is_empty());
     assert_eq!(b.rgb, cpu.rgb);
     assert_eq!(StageRange::DEMOSAIC.label(), "R6");
+}
+
+/// `Renderer::raw_on_cpu` (what makes the app say "Rendering on the CPU") says where the route of a
+/// render puts the raw chain: on the device with the stage on and the method the device runs; on the
+/// CPU without a device, with the stage off and with a forced method. A device that is lost and a
+/// photo whose route a device error ended are in `faults` below (they need the fault injection).
+#[test]
+fn the_raw_chain_is_said_to_be_on_the_cpu_exactly_where_the_route_puts_it() {
+    let Some(gpu) = gpu() else { return };
+    let src = scene();
+    let id = src.id;
+    let dev = on_device(&gpu);
+    assert!(!dev.raw_on_cpu(id));
+    let a = render_full(&dev, &src).expect("render");
+    assert_eq!(
+        device_of(&a.report),
+        vec![("R1..R9".to_owned(), ComputeDevice::Gpu)]
+    );
+    assert!(
+        !dev.raw_on_cpu(id),
+        "a render on the device leaves it there"
+    );
+    assert!(on_cpu().raw_on_cpu(id));
+    let off = renderer_with(
+        Some(Arc::clone(&gpu)),
+        GpuStages::COLOR,
+        false,
+        Method::AdaptiveRatio,
+    );
+    assert!(off.raw_on_cpu(id), "the raw chain is off");
+    let forced = renderer_with(Some(Arc::clone(&gpu)), GpuStages::ALL, false, Method::Menon);
+    assert!(forced.raw_on_cpu(id), "a method the device does not run");
+    // A device attached later and taken away again.
+    let late = on_cpu();
+    late.set_gpu(Some(Arc::clone(&gpu)), GpuStages::ALL);
+    assert!(!late.raw_on_cpu(id));
+    late.set_gpu(None, GpuStages::NONE);
+    assert!(late.raw_on_cpu(id));
 }
 
 /// Small and odd photos through the whole render: a frame below one export tile, odd sides (a device
@@ -785,7 +829,7 @@ mod view {
     }
 
     fn with_amount(src: &PhotoSource, pct: f64) -> PhotoSource {
-        edit(src, |s| s.output_sharpening = pct)
+        edit(src, |s| s.output_mut().output_sharpening = pct)
     }
 
     /// The comparison of the golden runner (`tools/golden/src/image.rs`): CIEDE2000 per pixel on a
@@ -857,7 +901,7 @@ mod view {
     }
 
     fn crop_and_straighten(s: &mut DevelopSettings) {
-        s.crop = Some(Crop {
+        s.input_mut().crop = Some(Crop {
             rect: NormRect {
                 x: 0.05,
                 y: 0.08,
@@ -866,6 +910,7 @@ mod view {
             },
             angle_deg: 5.0,
             aspect: CropAspect::Free,
+            auto: false,
         });
     }
 
@@ -888,13 +933,13 @@ mod view {
                 crop_and_straighten(s);
             }),
             ("rotated", cell(300.0, 200.0, 1.0), |s| {
-                s.orientation = Orientation::Deg90;
+                s.input_mut().orientation = Orientation::Deg90;
             }),
             ("amount 200", cell(300.0, 200.0, 1.0), |s| {
-                s.output_sharpening = 200.0;
+                s.output_mut().output_sharpening = 200.0;
             }),
             ("amount 0", cell(300.0, 200.0, 1.0), |s| {
-                s.output_sharpening = 0.0;
+                s.output_mut().output_sharpening = 0.0;
             }),
             (
                 "magnified",
@@ -947,9 +992,9 @@ mod view {
             // the white lift alongside the range, 1.214e-5 at 100 % on lavapipe against the 1e-5 of
             // every other frame, 4.3e-6 with the lift off.
             let (worst_allowed, over_allowed) = if (worst > CODE_BOUND || over > 1e-5)
-                && src.settings.output_sharpening > 0.0
+                && src.settings.output().output_sharpening > 0.0
             {
-                let unsharpened = edit(&src, |s| s.output_sharpening = 0.0);
+                let unsharpened = edit(&src, |s| s.output_mut().output_sharpening = 0.0);
                 let (bare, bare_over, _) = codes(
                     &frame(&cpu, &unsharpened, &st),
                     &frame(&dev, &unsharpened, &st),
@@ -1108,14 +1153,6 @@ mod view {
                 )),
             }
         }
-
-        fn display_transform(
-            &self,
-            id: &ym_looks::library::LookId,
-        ) -> Result<(ym_color::display::DisplayTransform, String), ym_core::pipeline::LookProblem>
-        {
-            NeutralOnly.display_transform(id)
-        }
     }
 
     #[test]
@@ -1133,7 +1170,7 @@ mod view {
         )
         .expect("render thread");
         let look = ym_looks::library::LookId::parse("user:cube").expect("id");
-        let src = edit(&picture(600, 400), |s| s.look = look.clone());
+        let src = edit(&picture(600, 400), |s| s.output_mut().look = look.clone());
         let st = cell(300.0, 200.0, 1.0);
         let c0 = gpu.counters();
         let cold = frame(&r, &src, &st);
@@ -1154,17 +1191,28 @@ mod view {
         let edits: Vec<(&str, Edit)> = vec![
             (
                 "contrast",
-                Box::new(|s| s.contrast = ym_core::settings::PercentSetting::manual_value(30.0)),
+                Box::new(|s| {
+                    s.main_grade_mut().contrast =
+                        ym_core::settings::PercentSetting::manual_value(30.0)
+                }),
             ),
             (
                 "saturation",
-                Box::new(|s| s.saturation = ym_core::settings::PercentSetting::manual_value(-25.0)),
+                Box::new(|s| {
+                    s.main_grade_mut().saturation =
+                        ym_core::settings::PercentSetting::manual_value(-25.0)
+                }),
             ),
             (
                 "curve",
-                Box::new(|s| s.curve.luma = vec![[0.0, 0.0], [0.5, 0.6], [1.0, 1.0]]),
+                Box::new(|s| {
+                    s.main_grade_mut().curve.luma = vec![[0.0, 0.0], [0.5, 0.6], [1.0, 1.0]]
+                }),
             ),
-            ("look intensity", Box::new(|s| s.look_intensity = 60.0)),
+            (
+                "look intensity",
+                Box::new(|s| s.output_mut().look_intensity = 60.0),
+            ),
         ];
         for (name, change) in edits {
             let edited = edit(&src, |s| change(s));
@@ -1538,7 +1586,7 @@ mod view {
         ];
         for (angle, (w, h), bytes) in cases {
             let tilted = edit(&src, |s| {
-                s.crop = Some(Crop {
+                s.input_mut().crop = Some(Crop {
                     rect: NormRect {
                         x: 0.0,
                         y: 0.0,
@@ -1547,6 +1595,7 @@ mod view {
                     },
                     angle_deg: angle,
                     aspect: CropAspect::Free,
+                    auto: false,
                 });
             });
             let cut = small_binding(&gpu, VIEW, bytes);
@@ -2092,6 +2141,50 @@ mod faults {
         assert_eq!(f.rgba, baseline.rgba);
         assert_eq!(
             device_of(&f.report),
+            vec![("R1..R9".to_owned(), ComputeDevice::Cpu)]
+        );
+    }
+
+    /// After a device error ended the photo's route, `Renderer::raw_on_cpu` says the CPU for that
+    /// photo and the device for another; once the device is lost, the CPU for every photo.
+    #[test]
+    fn the_raw_chain_is_said_to_be_on_the_cpu_once_an_error_ended_the_route() {
+        let Some(gpu) = gpu() else { return };
+        let src = scene();
+        let other = PhotoId(src.id.0 + 1);
+        let dev = on_device(&gpu);
+        let mut st = ViewportState::new(ViewportRect::cell(700.0, 500.0, 1.0));
+        st.set_mode(ViewportMode::Percent { value: 100.0 }, (1300, 900));
+        assert!(!dev.raw_on_cpu(src.id));
+        gpu.set_fault(Some(GpuFault::FailTile(1)));
+        let f = dev
+            .viewport_frame(&src, &st, &FrameOptions::default(), &CancelToken::new())
+            .expect("the frame is made");
+        gpu.set_fault(None);
+        assert_eq!(
+            device_of(&f.report),
+            vec![("R1..R9".to_owned(), ComputeDevice::Cpu)]
+        );
+        assert!(dev.raw_on_cpu(src.id), "the photo's route was ended");
+        assert!(!dev.raw_on_cpu(other), "another photo's route is open");
+        // The device is lost: every photo, and the next frame of the other photo is the CPU's too.
+        gpu.set_fault(Some(GpuFault::Lost));
+        let _ = gpu.run(
+            ym_gpu::queue::JobSpec::new(ym_gpu::queue::Priority::Viewport),
+            |_, _| Ok(()),
+        );
+        assert!(gpu.is_lost(), "the fault lost the device");
+        assert!(dev.raw_on_cpu(src.id));
+        assert!(dev.raw_on_cpu(other));
+        let moved = PhotoSource {
+            id: other,
+            ..src.clone()
+        };
+        let g = dev
+            .viewport_frame(&moved, &st, &FrameOptions::default(), &CancelToken::new())
+            .expect("the frame is made");
+        assert_eq!(
+            device_of(&g.report),
             vec![("R1..R9".to_owned(), ComputeDevice::Cpu)]
         );
     }

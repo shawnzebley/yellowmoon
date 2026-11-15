@@ -4,28 +4,60 @@ published CCT-dependent native -> ACES AP0 matrices, and run diagnostics.
 The numerics are those of the published estimate (research/alexa-ssf/README.md); the
 inputs come from testdata/sources (tools/fetch/spectral.sh) and the outputs go to
 testdata/out/alexa/estimate/ (git-ignored), not over the committed data/alexa/ files.
-Compare with ``python3 -m training.alexa.compare_estimate``. ~10 min on 4 cores.
+Compare with ``python3 -m training.alexa.compare_estimate``. ~20 min on 4 cores.
 
-    python3 -m training.alexa.estimate_alexa
+    python3 -m training.alexa.estimate_alexa                   # the shipped curve: estimate + hue push of 4.5 degrees
+    python3 -m training.alexa.estimate_alexa --push-deg 1.5    # the estimate of 2026-10-25 (push of 1.5 degrees)
+    python3 -m training.alexa.estimate_alexa --no-push         # the estimate of 2026-10-11 (before any push)
 
-Outputs (testdata/out/alexa/estimate/):
-  alexa_alev3_estimate_380_780_5.csv   recommended curve + ensemble band
-  alexa_alev3_estimate_380_780_5.json  same, rawtoaces-data schema
-  variants.csv                         every ensemble member's curve
+The hue push (owner decisions 2026-10-25, "Move ALEXA estimate", and 2026-10-26, "4.5")
+---------------------------------------------------------------------------------------
+Yellowmoon rendered photographs of ochre walls, oranges and reds more crimson than the camera's own
+picture. The ALEXA curve is a place where a part of that gap can be closed: ARRI's matrices fix
+the curve only up to what a 4-component prior and 17 matrices can tell, and the family of curves that
+agree with them about equally well moves the hue of warm colours by more than a degree. The push picks
+the curve that renders orange, red and ochre reflectances ``PUSH["deg"]`` degrees of CIELAB hue toward
+yellow (less crimson):
+
+* the reflectances: the training reflectances whose Lab hue is between 25 and 95 degrees with
+  chroma above 12 under the un-pushed estimate (47 of 190), rendered at 5200 K (the rawtoaces
+  illuminant) through ARRI's matrix at 5200 K;
+* the residual: ``weight * (median hue shift of those reflectances - deg)`` is added to the
+  estimator's residuals (consistency with the 17 matrices, the prior's penalty, non-negativity);
+* the stopping rule: a push stays within the 24-variant ensemble's maximum matrix RMS (0.0093 per
+  coefficient; the un-pushed estimate has 0.0067). Steps of 0.5, 1.0, 1.5, 2.0, 3.0 and 4.5 degrees give
+  0.0070, 0.0081, 0.0092, 0.0112, 0.0166 and 0.0241 (docs/03). The push of 1.5 degrees (2026-10-25) is the
+  largest step inside the limit. The push of 4.5 degrees is **past it, by the owner's decision of 2026-10-26**
+  (``training/alexa/push_decisions.py``: the record ``beyond_matrix_limit`` names the decision and the matrix
+  RMS it accepted, 0.0241). The run writes that record into the curve's description and ``diagnostics.json``
+  (``build_target`` writes it into ``data/alexa/target.json``) and refuses any other push past the limit, and the
+  same push if it reaches a larger matrix RMS (nothing is written);
+* seeded and offline: ``Estimator.fit`` draws its extra start from a generator seeded with 0.
+
+Outputs (testdata/out/alexa/estimate/; estimate_nopush/ with ``--no-push``, estimate_push_<deg>/ with another
+``--push-deg``):
+  alexa_alev3_estimate_380_780_5.csv   recommended curve + ensemble band (the band is that of the
+                                       24 variants, which are all un-pushed)
+  alexa_alev3_estimate_380_780_5.json  the recommended curve, rawtoaces-data schema
+  variants.csv                         every ensemble member's curve (un-pushed)
   diagnostics.json                     all numbers quoted in the README
 """
 
+import argparse
 import csv
 import json
 import os
+import sys
 from multiprocessing import Pool
 
 import numpy as np
 
+from training.alexa import push_decisions as pd
 from training.alexa import ssf_core as sc
 from training.common import paths
 
 OUT = str(paths.OUT / "alexa" / "estimate")
+OUT_NOPUSH = str(paths.OUT / "alexa" / "estimate_nopush")
 paths.require_sources()
 CAMS = sc.load_cameras()
 NAMES = list(CAMS)
@@ -55,6 +87,117 @@ def matrix_rms(S, mats, conv="rta"):
     """RMS per coefficient between the matrices S would get and `mats`."""
     own = sc.camera_matrices(S, CCTS, R_TRAIN, convention=conv)
     return float(np.sqrt(np.mean((own - mats) ** 2)))
+
+
+# --------------------------------------------------------------------------
+# Hue push (owner decision 2026-10-25, "Move ALEXA estimate")
+# --------------------------------------------------------------------------
+PUSH = {
+    "deg": pd.DEFAULT_PUSH_DEG,   # median Lab hue shift asked for on the warm reflectances (toward yellow)
+    "scene_cct_k": 5200.0,        # light (rawtoaces illuminant) and ARRI matrix of the measurement
+    "hue_window_deg": (25.0, 95.0),  # Lab hue of the un-pushed rendering: red, orange, ochre
+    "min_chroma": 12.0,           # Lab chroma of the un-pushed rendering
+    "weight": 10.0,               # weight of the hue residual against the matrix residuals
+    "n_starts": 2,                # least-squares starts: zero and one seeded draw (Estimator.fit, seed 0)
+}
+DATE_NOPUSH = pd.DATE_NOPUSH
+DESCRIPTION = (
+    "Estimated camera spectral sensitivity, NOT a measurement. Fitted so that "
+    "the IDT matrices these curves would receive (Academy P-2013-001-style "
+    "CIE Lab fit, rawtoaces 190-patch training set) reproduce ARRI's 2013 "
+    "ALEXA native->ACES AP0 matrices at 17 CCTs, under a 4-component PCA "
+    "prior built from the 52 Apache-2.0 curves in rawtoaces-data. Each "
+    "channel normalised to peak 1; relative channel gains are not "
+    "identifiable from white-balanced matrices and are not needed for "
+    "white-balanced emulation. See README for accuracy and caveats."
+)
+DESCRIPTION_PUSH = (
+    DESCRIPTION[:DESCRIPTION.index(" See README")]
+    + " The curves are moved by a hue push (owner decision {date}): inside the family of "
+    "curves that agree with ARRI's matrices, the one that renders orange, red and ochre "
+    "reflectances {deg} degrees of CIELAB hue toward yellow, with matrix RMS {rms:.4f} per "
+    "coefficient (the 24-variant ensemble spans {lo:.4f} to {hi:.4f}; without the push "
+    "{unpushed:.4f}). See README for accuracy and caveats."
+)
+#: The description of a push past the matrix limit: it says so, and names the decision.
+DESCRIPTION_PUSH_BEYOND = (
+    DESCRIPTION[:DESCRIPTION.index(" See README")]
+    + " The curves are moved by a hue push of {deg} degrees (beyond_matrix_limit, {decision}): the curve "
+    "that renders orange, red and ochre reflectances {deg} degrees of CIELAB hue toward yellow, with "
+    "matrix RMS {rms:.4f} per coefficient, past the 24-variant ensemble ({lo:.4f} to {hi:.4f}; without "
+    "the push {unpushed:.4f}), so it agrees with ARRI's matrices less well than the ensemble does. "
+    "It is a choice, not a fit that ARRI's matrices ask for. See README for accuracy and caveats."
+)
+DESCRIPTION_PUSH_EXPLORATORY = (
+    DESCRIPTION[:DESCRIPTION.index(" See README")]
+    + " Exploratory hue push of {deg} degrees (no owner decision, not shipped), matrix RMS {rms:.4f} per "
+    "coefficient. See README for accuracy and caveats."
+)
+
+
+def describe_push(deg, rms, lo, hi, unpushed):
+    """The JSON header's description and creation date for a push, from the owner's record of it."""
+    rec = pd.decision(deg)
+    nums = dict(deg=deg, rms=rms, lo=lo, hi=hi, unpushed=unpushed)
+    if rec is None:
+        return DESCRIPTION_PUSH_EXPLORATORY.format(**nums), "exploratory"
+    if rms > hi:
+        return DESCRIPTION_PUSH_BEYOND.format(decision=rec["beyond_matrix_limit"]["decision"], **nums), rec["date"]
+    return DESCRIPTION_PUSH.format(date=rec["date"], **nums), rec["date"]
+
+
+def _lab_hue_chroma(S, ref):
+    """Lab hue (deg) and chroma of the training reflectances rendered through S, for the push's light."""
+    S = np.clip(S, 0, None)
+    S = S / S.max(axis=0, keepdims=True)
+    lab = sc.ap0_to_Lab(sc.camera_rgb_wb(S, ref["E"], R_TRAIN) @ ref["M_arri"].T)
+    return np.degrees(np.arctan2(lab[:, 2], lab[:, 1])) % 360, np.hypot(lab[:, 1], lab[:, 2])
+
+
+def push_reference(S0, push=PUSH):
+    """The warm reflectances, the light and ARRI's matrix of the push, from the un-pushed estimate S0."""
+    ref = {"E": sc.illuminant(push["scene_cct_k"], "rta"),
+           "M_arri": sc.interpolate_matrix(CCTS, ARRI, push["scene_cct_k"])}
+    ref["h0"], ref["C0"] = _lab_hue_chroma(S0, ref)
+    lo, hi = push["hue_window_deg"]
+    ref["sel"] = (ref["h0"] > lo) & (ref["h0"] < hi) & (ref["C0"] > push["min_chroma"])
+    return ref
+
+
+def hue_shift(S, ref):
+    """Median Lab hue shift (deg, positive toward yellow) and chroma shift of the warm reflectances."""
+    h, C = _lab_hue_chroma(S, ref)
+    dh = (h - ref["h0"] + 180) % 360 - 180
+    return float(np.median(dh[ref["sel"]])), float(np.median((C - ref["C0"])[ref["sel"]]))
+
+
+class PushedEstimator(sc.Estimator):
+    """The estimator's residuals plus ``weight * (median hue shift - deg)`` on the warm reflectances."""
+
+    def __init__(self, *args, ref, deg, weight, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.ref, self.deg, self.weight = ref, deg, weight
+
+    def residuals(self, a):
+        r = super().residuals(a)
+        dh, _ = hue_shift(self.prior.curves(a), self.ref)
+        return np.concatenate([r, [self.weight * (dh - self.deg)]])
+
+
+def estimate_pushed(S0, prior_names, K, lam, conv, push=PUSH):
+    """The recommended estimate with the hue push; ``S0`` is the same estimate without it.
+
+    Returns (curve, info) where info holds the achieved shifts, the matrix RMS and the number of
+    reflectances in the push.
+    """
+    ref = push_reference(S0, push)
+    prior = sc.Prior([CAMS[n] for n in prior_names], K)
+    est = PushedEstimator(prior, CCTS, ARRI, R_TRAIN, convention=conv, objective="consistency", lam=lam,
+                          ref=ref, deg=push["deg"], weight=push["weight"])
+    S, _ = est.fit(n_starts=push["n_starts"])
+    dh, dC = hue_shift(S, ref)
+    return S, {"reflectances": int(ref["sel"].sum()), "hue_shift_deg": dh, "chroma_shift": dC,
+               "matrix_rms": matrix_rms(S, ARRI, conv)}
 
 
 def run_variant(args):
@@ -125,10 +268,12 @@ def mapping_check(S_sony, S_alexa):
     return out
 
 
-def colorimetric_ranking(S_est):
+def colorimetric_ranking(S_est, S_unpushed=None):
     """Mean ΔE00 to scene colour when ARRI's matrices are applied to each camera."""
     cams = dict(CAMS)
     cams["ALEXA estimate (this work)"] = S_est
+    if S_unpushed is not None:
+        cams["ALEXA estimate before the hue push"] = S_unpushed
     mean_cam = np.mean(np.stack(list(CAMS.values())), axis=0)
     cams["Mean of 52 cameras"] = mean_cam / mean_cam.max(axis=0)
     out = {}
@@ -138,9 +283,9 @@ def colorimetric_ranking(S_est):
     return dict(sorted(out.items(), key=lambda kv: kv[1]))
 
 
-def write_outputs(rec, ens, variants, diag):
+def write_outputs(rec, ens, variants, diag, out_dir, description, date):
     wl = sc.WL.astype(int)
-    with open(os.path.join(OUT, "alexa_alev3_estimate_380_780_5.csv"), "w", newline="") as fh:
+    with open(os.path.join(out_dir, "alexa_alev3_estimate_380_780_5.csv"), "w", newline="") as fh:
         w = csv.writer(fh)
         w.writerow(["wavelength_nm", "R", "G", "B",
                     "R_min", "G_min", "B_min", "R_max", "G_max", "B_max",
@@ -153,18 +298,9 @@ def write_outputs(rec, ens, variants, diag):
             "schema_version": "0.1.0",
             "manufacturer": "ARRI",
             "model": "ALEXA (ALEV III, SUP 3.x) - ESTIMATE",
-            "description": (
-                "Estimated camera spectral sensitivity, NOT a measurement. Fitted so that "
-                "the IDT matrices these curves would receive (Academy P-2013-001-style "
-                "CIE Lab fit, rawtoaces 190-patch training set) reproduce ARRI's 2013 "
-                "ALEXA native->ACES AP0 matrices at 17 CCTs, under a 4-component PCA "
-                "prior built from the 52 Apache-2.0 curves in rawtoaces-data. Each "
-                "channel normalised to peak 1; relative channel gains are not "
-                "identifiable from white-balanced matrices and are not needed for "
-                "white-balanced emulation. See README for accuracy and caveats."
-            ),
+            "description": description,
             "document_creator": "alexa-ssf-estimate",
-            "document_creation_date": "2026-10-11",
+            "document_creation_date": date,
             "measurement_equipment": None,
             "license": "Apache-2.0 (see NOTICE: derived from AMPAS-licensed aces-dev data)",
         },
@@ -175,9 +311,9 @@ def write_outputs(rec, ens, variants, diag):
                               for i, l in enumerate(wl)}},
         },
     }
-    with open(os.path.join(OUT, "alexa_alev3_estimate_380_780_5.json"), "w") as fh:
-        json.dump(doc, fh, indent=2)
-    with open(os.path.join(OUT, "variants.csv"), "w", newline="") as fh:
+    with open(os.path.join(out_dir, "alexa_alev3_estimate_380_780_5.json"), "w", encoding="utf-8") as fh:
+        json.dump(doc, fh, indent=2, ensure_ascii=False)
+    with open(os.path.join(out_dir, "variants.csv"), "w", newline="") as fh:
         w = csv.writer(fh)
         head = ["prior", "K", "lam", "conv", "matrix_rms", "channel"] + [str(l) for l in wl]
         w.writerow(head)
@@ -185,16 +321,37 @@ def write_outputs(rec, ens, variants, diag):
             for c, ch in enumerate("RGB"):
                 w.writerow([v["prior"], v["K"], v["lam"], v["conv"],
                             round(v["matrix_rms"], 6), ch, *np.round(v["curve"][:, c], 6)])
-    with open(os.path.join(OUT, "diagnostics.json"), "w") as fh:
-        json.dump(diag, fh, indent=2)
+    with open(os.path.join(out_dir, "diagnostics.json"), "w", encoding="utf-8") as fh:
+        json.dump(diag, fh, indent=2, ensure_ascii=False)
 
 
 def peak_nm(S):
     return {ch: int(sc.WL[np.argmax(S[:, c])]) for c, ch in enumerate("RGB")}
 
 
-if __name__ == "__main__":
-    os.makedirs(OUT, exist_ok=True)
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--no-push", action="store_true",
+                    help="write the estimate of 2026-10-11, without the hue push (to estimate_nopush/)")
+    ap.add_argument("--push-deg", type=float, default=PUSH["deg"],
+                    help="hue push in degrees toward yellow (default %(default)s, the owner's decision of "
+                         "2026-10-26; 1.5 gives the estimate of 2026-10-25). A push whose matrix RMS exceeds the "
+                         "ensemble's maximum is written only if training/alexa/push_decisions.py records the owner's "
+                         "decision for it (beyond_matrix_limit)")
+    ap.add_argument("--out", default=None, help="output folder (default testdata/out/alexa/estimate[_nopush|_push_DEG])")
+    args = ap.parse_args(argv)
+    push_on = not args.no_push
+    push = dict(PUSH, deg=args.push_deg)
+    if args.out:
+        out_dir = args.out
+    elif not push_on:
+        out_dir = OUT_NOPUSH
+    elif abs(push["deg"] - PUSH["deg"]) < 1e-9:
+        out_dir = OUT
+    else:
+        out_dir = f"{OUT}_push_{push['deg']:g}"
+    os.makedirs(out_dir, exist_ok=True)
+
     grid = [(p, K, lam, conv) for p in PRIORS for K in (3, 4)
             for lam in (0.1, 1.0) for conv in ("rta", "planck")]
     with Pool(min(4, os.cpu_count() or 1)) as pool:
@@ -204,12 +361,38 @@ if __name__ == "__main__":
     rec_v = next(v for v in variants if v["prior"] == RECOMMENDED["prior"]
                  and v["K"] == RECOMMENDED["K"] and v["lam"] == RECOMMENDED["lam"]
                  and v["conv"] == RECOMMENDED["conv"])
-    rec = rec_v["curve"]
+    unpushed = rec_v["curve"]
     ens = np.stack([v["curve"] for v in variants])
-    spread = [sc.rfse(v["curve"], rec) for v in variants]
+    ens_rms = [v["matrix_rms"] for v in variants]
+    spread = [sc.rfse(v["curve"], unpushed) for v in variants]
+
+    rec, push_info, description, date = unpushed, None, DESCRIPTION, DATE_NOPUSH
+    if push_on:
+        rec, info = estimate_pushed(unpushed, PRIORS[RECOMMENDED["prior"]], RECOMMENDED["K"],
+                                    RECOMMENDED["lam"], RECOMMENDED["conv"], push)
+        limit = max(ens_rms)
+        print(f"hue push {push['deg']} deg: achieved {info['hue_shift_deg']:+.2f} deg, chroma "
+              f"{info['chroma_shift']:+.2f}, {info['reflectances']} reflectances, matrix RMS "
+              f"{info['matrix_rms']:.4f} (ensemble {min(ens_rms):.4f} to {limit:.4f})", flush=True)
+        if not pd.accepts(push["deg"], info["matrix_rms"], limit):
+            raise SystemExit(f"stopping rule: matrix RMS {info['matrix_rms']:.4f} exceeds the ensemble's maximum "
+                             f"{limit:.4f} and the owner has not decided on this push (push_decisions.py "
+                             f"beyond_matrix_limit); use a smaller --push-deg (nothing written)")
+        record = pd.decision(push["deg"])
+        push_info = {**push, **info, "ensemble_matrix_rms_min": min(ens_rms), "ensemble_matrix_rms_max": limit,
+                     "unpushed_matrix_rms": rec_v["matrix_rms"],
+                     "decision": record["decision"] if record else None,
+                     "beyond_matrix_limit": record["beyond_matrix_limit"] if record and info["matrix_rms"] > limit else None,
+                     "rfse_pushed_vs_unpushed_pct": sc.rfse(rec, unpushed),
+                     "max_abs_difference_per_channel": [float(x) for x in np.abs(rec - unpushed).max(axis=0)],
+                     "outside_ensemble_band": {
+                         ch: int(np.sum((np.round(rec[:, c], 6) < np.round(ens.min(0)[:, c], 6) - 1e-9)
+                                        | (np.round(rec[:, c], 6) > np.round(ens.max(0)[:, c], 6) + 1e-9)))
+                         for c, ch in enumerate("RGB")}}
+        description, date = describe_push(push["deg"], info["matrix_rms"], min(ens_rms), limit, rec_v["matrix_rms"])
 
     typ_rms = np.array([t["matrix_rms"] for t in typ])
-    arri_rms = rec_v["matrix_rms"]
+    arri_rms = matrix_rms(rec, ARRI, RECOMMENDED["conv"])
     pct = float(100 * np.mean(typ_rms <= arri_rms))
     similar = sorted(typ, key=lambda t: abs(t["matrix_rms"] - arri_rms))[:5]
 
@@ -217,12 +400,13 @@ if __name__ == "__main__":
     d21 = CAMS["ARRI D21"]
     diag = {
         "recommended_variant": RECOMMENDED,
+        "hue_push": push_info,
         "peaks_nm": {"estimate": peak_nm(rec), "Sony ILCE-7RM4": peak_nm(sony),
                      "ARRI D21": peak_nm(d21)},
         "ensemble": {
             "n_variants": len(variants),
-            "rfse_vs_recommended_pct": {"median": float(np.median(spread)),
-                                        "max": float(np.max(spread))},
+            "rfse_vs_unpushed_recommended_pct": {"median": float(np.median(spread)),
+                                                 "max": float(np.max(spread))},
             "matrix_rms_per_variant": [
                 {k: v[k] for k in ("prior", "K", "lam", "conv", "matrix_rms")}
                 for v in variants],
@@ -240,10 +424,10 @@ if __name__ == "__main__":
             "held_out_cameras_with_most_similar_residual": similar,
             "all_held_out": typ,
         },
-        "colorimetric_mean_dE00_with_ARRI_matrices": colorimetric_ranking(rec),
+        "colorimetric_mean_dE00_with_ARRI_matrices": colorimetric_ranking(rec, unpushed if push_on else None),
         "sony_7rm4_to_alexa_estimate_mapping_dE00": mapping_check(sony, rec),
     }
-    write_outputs(rec, ens, variants, diag)
+    write_outputs(rec, ens, variants, diag, out_dir, description, date)
     print(json.dumps({k: diag[k] for k in ("peaks_nm", "ensemble", "rfse_between_curves_pct")}, indent=1)[:3000])
     t = diag["typicality"]
     print("typicality:", {k: t[k] for k in list(t)[:4]})
@@ -253,3 +437,9 @@ if __name__ == "__main__":
         if i < 5 or "ALEXA" in k or "D21" in k or "7RM4" in k or "Mean" in k:
             print(i + 1, k, round(v, 2))
     print(json.dumps(diag["sony_7rm4_to_alexa_estimate_mapping_dE00"], indent=1)[:4000])
+    print("wrote", out_dir)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

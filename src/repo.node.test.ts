@@ -3,6 +3,7 @@
 // tsconfig (see tsconfig.node.json).
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
+import { GRAPH_TEXT } from "./fixtures/graph";
 
 const root = new URL("../", import.meta.url);
 const read = (path: string): string => readFileSync(new URL(path, root), "utf8");
@@ -53,7 +54,8 @@ describe("design tokens", () => {
     expect(css).toMatch(/font-family:\s*var\(--font\)/);
     expect(css).toMatch(/background:\s*var\(--paper\)/);
     expect(css).toMatch(/color:\s*var\(--ink\)/);
-    expect(css).toMatch(/outline:\s*3px solid var\(--focus\)/);
+    // 3 px, or 4 px under Increase Contrast (docs/28 A-P12): the width is --ym-focus-width, 3 px by default.
+    expect(css).toMatch(/outline:\s*var\(--ym-focus-width, 3px\) solid var\(--focus\)/);
     expect(css).toMatch(/outline-offset:\s*2px/);
     expect(css).not.toMatch(/outline:\s*(none|0)\b/);
   });
@@ -85,6 +87,29 @@ describe("copy (docs/11 Range card, owner's decision of 2026-10-17)", () => {
     expect(read("src/screens/tools/RawTab.tsx")).toContain(`"${NOTE}"`);
     expect(read("docs/11-ui.md")).toContain(`"${NOTE}"`);
     expect(read("src/screens/tools/RawTab.tsx")).toContain('<Card title="Range"');
+  });
+});
+
+describe("the Lens card (docs/21 section 1)", () => {
+  const ids = ["default", "classic", "vintage", "petzval", "triplet", "sonnar", "detuned"];
+  const lens = (id: string): { name: string; line: string; start: { flares: number; edges: number } } =>
+    JSON.parse(read(`data/lenses/${id}/lens.json`)) as { name: string; line: string; start: { flares: number; edges: number } };
+
+  it("lists the lenses of data/lenses/ in the browser mock with the names, lines and starting amounts of the spec and the data", () => {
+    const spec = read("docs/21-lens-character.md");
+    // The mock's table is wrapped by the formatter where a row is long (Detuned's).
+    const mock = read("src/api.mock.ts").replace(/\s+/g, " ");
+    for (const id of ids) {
+      const { name, line, start } = lens(id);
+      expect(spec, id).toContain(`| ${name} | "${line}" |`);
+      expect(mock, id).toContain(`"${name}", "${line}", ${start.flares}, ${start.edges},`);
+    }
+  });
+
+  it("says in the same words in the component and docs/11 that the lens data are missing", () => {
+    const NOTE = "Lens data are missing, so lenses can't be used.";
+    expect(read("src/screens/tools/LensCard.tsx")).toContain(`"${NOTE}"`);
+    expect(read("docs/11-ui.md")).toContain(`"${NOTE}"`);
   });
 });
 
@@ -131,5 +156,67 @@ describe("the docs agree on the dark glass decision (owner, 2026-10-16)", () => 
     expect(read("docs/STATUS.md")).not.toMatch(/native layer's clear colour/);
     // The native viewport's pass is recorded in present.rs (shared with its test since 2026-10-19).
     expect(read("src-tauri/src/present.rs")).toMatch(/wgpu::Color::BLACK/);
+  });
+});
+
+describe("the mock's rules for the graph (docs/23 section 9)", () => {
+  const rust = read("crates/ym-core/src/settings/graph.rs");
+  /** The sentence of a `#[error("...")]` of the core, as the source writes it. */
+  const sentence = (text: string): string => `#[error("${text}")]`;
+
+  it("say what the core says, word for word", () => {
+    for (const text of [
+      GRAPH_TEXT.missingFixed,
+      GRAPH_TEXT.linkDirection,
+      GRAPH_TEXT.linkPortTypes,
+      GRAPH_TEXT.outputLink,
+      GRAPH_TEXT.mainInput,
+      GRAPH_TEXT.cycle,
+      GRAPH_TEXT.tooManyNodes,
+      GRAPH_TEXT.tooManyMasks,
+      GRAPH_TEXT.tooManyBrushPoints,
+      GRAPH_TEXT.tooManyObjectPoints,
+      GRAPH_TEXT.cannotRemove,
+      GRAPH_TEXT.tooManyMixerInputs,
+    ]) {
+      expect(rust, text).toContain(sentence(text));
+    }
+    // The sentences with a hole in them: the mock fills the hole as the core does.
+    expect(rust).toContain(sentence(GRAPH_TEXT.unknownNode("{0}" as never)));
+    expect(rust).toContain(sentence(GRAPH_TEXT.duplicateId("{0}" as never)));
+    expect(rust).toContain(sentence(GRAPH_TEXT.patchUnknownNode("{0}" as never)));
+    expect(rust).toContain(sentence("{node} has no port called “{port}”."));
+    expect(GRAPH_TEXT.unknownPort(7, "mask")).toBe("Node 7 has no port called “mask”.");
+    expect(rust).toContain(sentence("An input can have one link. {node} has two on its {port} input."));
+    expect(GRAPH_TEXT.twoLinks(3, "picture")).toBe("An input can have one link. Node 3 has two on its picture input.");
+    expect(rust).toContain(sentence("{node} is {actual}, not {given}."));
+    expect(GRAPH_TEXT.patchWrongKind(7, "corrector", "input")).toBe("Node 7 is a corrector, not an input.");
+    expect(rust).toContain(sentence("{kind} has no field called “{field}”."));
+    expect(GRAPH_TEXT.unknownField("corrector", "exposure")).toBe("A corrector has no field called “exposure”.");
+    // The mixers' rules (`docs/25` section 2.3): the gap sentence is written over three lines in the source, so its text is looked up whole.
+    expect(rust).toContain('"{node} has a link on input {linked} and none on input {missing}. A mixer\'s inputs are numbered from 1 with no gap."');
+    expect(GRAPH_TEXT.mixerGap(7, 3, 2)).toBe("Node 7 has a link on input 3 and none on input 2. A mixer's inputs are numbered from 1 with no gap.");
+    // The kinds in sentences (`NodeKind::with_article`).
+    expect(GRAPH_TEXT.unknownField("parallel", "masks")).toBe("A parallel mixer has no field called “masks”.");
+    expect(GRAPH_TEXT.unknownField("splitter", "bypass")).toBe("A splitter has no field called “bypass”.");
+    expect(GRAPH_TEXT.patchWrongKind(7, "layer", "corrector")).toBe("Node 7 is a layer mixer, not a corrector.");
+    expect(GRAPH_TEXT.patchWrongKind(7, "combiner", "film")).toBe("Node 7 is a combiner, not a film node.");
+    for (const text of ['"a parallel mixer"', '"a layer mixer"', '"a splitter"', '"a combiner"', '"A parallel mixer"', '"A layer mixer"', '"A splitter"', '"A combiner"']) {
+      expect(rust, text).toContain(`=> ${text}`);
+    }
+  });
+
+  it("are the sentences of docs/23 section 3.5", () => {
+    const doc = read("docs/23-nodes.md");
+    for (const text of [GRAPH_TEXT.missingFixed, GRAPH_TEXT.linkDirection, GRAPH_TEXT.linkPortTypes, GRAPH_TEXT.outputLink, GRAPH_TEXT.mainInput, GRAPH_TEXT.cycle, GRAPH_TEXT.tooManyNodes]) {
+      expect(doc, text).toContain(`"${text}"`);
+    }
+  });
+
+  it("are the sentences of docs/25 section 2.3", () => {
+    const doc = read("docs/25-mixers.md");
+    for (const text of [GRAPH_TEXT.tooManyMixerInputs, GRAPH_TEXT.mixerGap(7, 3, 2), GRAPH_TEXT.unknownPort(7, "picture"), GRAPH_TEXT.tooManyNodes]) {
+      expect(doc, text).toContain(`"${text}"`);
+    }
   });
 });

@@ -1,13 +1,15 @@
-import { useMemo } from "react";
+import { useMemo, useRef } from "react";
 import { Aurora } from "@/components/glass/aurora";
 import { Item, ItemActions, ItemContent, ItemDescription, ItemGroup, ItemMedia, ItemTitle } from "@/components/glass/item";
 import { Button, DevelopList, DropZone, LinkButton, ProgressBar, useWindowDrop } from "../components";
 import type { DevelopItem } from "../components";
+import { gradedByNote, gradingHint, gradingTitle } from "../state/autoProviders";
 import { useAppState, useStore } from "../state/context";
 import { lookLabeller } from "../state/looks";
 import { developFraction, folderSubline, isReady, photoName } from "../state/photo";
 import { ExportCell, Header } from "./Header";
 import { Menu } from "./Menu";
+import { OpenReading } from "./OpenReading";
 
 const STEPS = [
   { n: "1", title: "Open", text: "Drop ARW files or a whole folder." },
@@ -27,8 +29,11 @@ export function Start() {
   const store = useStore();
   const session = useAppState((s) => s.session);
   const looks = useAppState((s) => s.looks);
+  // The provider that grades the waiting photos: the saved choice, which the app follows (a photo only waits while it acts).
+  const grader = useAppState((s) => s.preferences?.auto_provider ?? "apple");
   const notice = useAppState((s) => s.dropNotice);
   const opening = useAppState((s) => s.opening);
+  const reading = useAppState((s) => s.openProgress !== null);
   const { dragging } = useWindowDrop({ onDrop: (paths) => void store.openPaths(paths) });
 
   const busy = session !== null && session.photos.length > 0;
@@ -36,29 +41,52 @@ export function Start() {
   const total = photos.length;
   const ready = photos.filter(isReady).length;
   const skipped = photos.filter((p) => p.status.kind === "skipped").length;
-  const finished = busy && ready + skipped === total;
-  const progress = total === 0 ? 0 : Math.round((photos.reduce((sum, p) => sum + developFraction(p.status), 0) / total) * 100);
+  // With a provider acting (Apple Intelligence, Claude Code or Antigravity), it grades each photo after it is developed; its values are
+  // only final then (`docs/19` section 6, `docs/22` section 12.5), so the screen waits for it too. A photo counts half when it is developed and whole when it is graded.
+  const grading = photos.filter((p) => p.apple_pending && p.status.kind !== "skipped").length;
+  const appleActs = grading > 0;
+  const developed = ready + skipped === total;
+  const finished = busy && developed && !appleActs;
+  const fraction = (p: (typeof photos)[number]): number => {
+    const f = developFraction(p.status);
+    return appleActs && p.status.kind !== "skipped" ? f / 2 + (p.apple_pending ? 0 : 0.5) : f;
+  };
+  const progress = total === 0 ? 0 : Math.round((photos.reduce((sum, p) => sum + fraction(p), 0) / total) * 100);
 
+  // A photo that did not change (the same object) gives the list the same item as before, so only the rows that changed are drawn again.
+  const made = useRef({ grader, items: new WeakMap<(typeof photos)[number], DevelopItem>() });
+  if (made.current.grader !== grader) made.current = { grader, items: new WeakMap() };
   const items: DevelopItem[] = useMemo(
     () =>
-      photos.map((p) => ({
-        id: p.id,
-        name: photoName(p.file_name),
-        state: p.status.kind,
-        note: p.status.kind === "skipped" ? p.status.reason : undefined,
-      })),
-    [photos],
+      photos.map((p) => {
+        const known = made.current.items.get(p);
+        if (known) return known;
+        const waitsForApple = p.status.kind === "ready" && p.apple_pending;
+        const item: DevelopItem = {
+          id: p.id,
+          name: photoName(p.file_name),
+          state: waitsForApple ? "developing" : p.status.kind,
+          note: p.status.kind === "skipped" ? p.status.reason : waitsForApple ? gradedByNote(grader) : undefined,
+        };
+        made.current.items.set(p, item);
+        return item;
+      }),
+    [photos, grader],
   );
 
   const title = !busy
     ? "Drop files or a folder"
-    : !finished
+    : !developed
       ? `Developing ${total} ${plural(total, "photo", "photos")}`
-      : ready === 0
-        ? "No photos ready"
-        : `${ready} ${plural(ready, "photo", "photos")} ready`;
+      : appleActs
+        ? gradingTitle(grading, grader)
+        : ready === 0
+          ? "No photos ready"
+          : `${ready} ${plural(ready, "photo", "photos")} ready`;
   const hint = !finished
-    ? "You can start looking while the rest finishes."
+    ? developed
+      ? gradingHint(grader)
+      : "You can start looking while the rest finishes."
     : ready === 0
       ? `${skipped} ${plural(skipped, "file", "files")} skipped. Start over and open other files.`
       : skipped > 0
@@ -128,12 +156,18 @@ export function Start() {
       <main aria-label="Drop files" className="ym-drop">
         {!busy ? (
           <DropZone title="Drop files or a folder" hint="ARW only, as many as you like" notice={notice ?? undefined} active={dragging}>
-            <Button disabled={opening} onClick={() => void store.openDialog("files")}>
-              Open files…
-            </Button>
-            <Button variant="secondary" disabled={opening} onClick={() => void store.openDialog("folder")}>
-              Open folder…
-            </Button>
+            {reading ? (
+              <OpenReading />
+            ) : (
+              <>
+                <Button disabled={opening} onClick={() => void store.openDialog("files")}>
+                  Open files…
+                </Button>
+                <Button variant="secondary" disabled={opening} onClick={() => void store.openDialog("folder")}>
+                  Open folder…
+                </Button>
+              </>
+            )}
           </DropZone>
         ) : (
           <div className="ym-develop" data-active={dragging || undefined}>
@@ -151,7 +185,7 @@ export function Start() {
               </Item>
             ) : null}
             <div className="ym-develop__foot">
-              <span role="status">{hint}</span>
+              {reading ? <OpenReading /> : <span role="status">{hint}</span>}
               <Button
                 disabled={ready === 0}
                 title={ready === 0 ? "Available when the first photo is ready" : undefined}

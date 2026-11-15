@@ -1,5 +1,5 @@
 /** The zoom steps of the Fit menu, from smallest to largest (`docs/11-ui.md` §Photos). */
-import type { PhotoSummary, RenderStats, ResolvedValues, ViewportMode, ViewportRect } from "../api/types";
+import type { PhotoSummary, RenderStats, ResolvedInput, ViewportMode, ViewportRect } from "../api/types";
 
 export const ZOOMS: ReadonlyArray<{ key: string; label: string; mode: ViewportMode }> = [
   { key: "fit", label: "Fit", mode: { kind: "fit" } },
@@ -48,7 +48,7 @@ export const MAX_ZOOM_PERCENT = 800;
 export function fitZoomExact(
   cell: Pick<ViewportRect, "width" | "height" | "scale">,
   photo: Pick<PhotoSummary, "width_px" | "height_px">,
-  values: Pick<ResolvedValues, "orientation" | "crop"> | null,
+  values: Pick<ResolvedInput, "orientation" | "crop"> | null,
 ): number | null {
   const turned = (values?.orientation ?? 0) % 180 !== 0;
   const crop = values?.crop?.rect;
@@ -72,7 +72,7 @@ export function fitZoomOf(stats: Pick<RenderStats, "fit_percent"> | null | undef
 export function fitZoomPercent(
   cell: Pick<ViewportRect, "width" | "height" | "scale">,
   photo: Pick<PhotoSummary, "width_px" | "height_px">,
-  values: Pick<ResolvedValues, "orientation" | "crop"> | null,
+  values: Pick<ResolvedInput, "orientation" | "crop"> | null,
 ): number | null {
   const exact = fitZoomExact(cell, photo, values);
   return exact === null ? null : Math.round(exact);
@@ -95,4 +95,33 @@ export function zoomAfter(mode: ViewportMode, factor: number, fit: number | null
   if (next <= (fit ?? 0) * FIT_TOLERANCE) return { kind: "fit" };
   // Two decimals keep a run of small steps from stalling on rounding; the header rounds for display.
   return { kind: "percent", value: Math.min(MAX_ZOOM_PERCENT, Math.max(1, Math.round(next * 100) / 100)) };
+}
+
+/** How far an arrow key pans a zoomed photo, as a share of the view (`docs/28` A-10). */
+export const PAN_STEP = 0.05;
+
+/** How far an arrow key with Shift pans, as a share of the view. */
+export const PAN_STEP_SHIFT = 0.25;
+
+/**
+ * The pan an arrow key makes, as the `pan` input of the viewport takes it: how far the picture moves, in CSS pixels. The view moves the way the
+ * arrow points (→ shows more of the right, so the picture slides left), by 5 % of the view's width or height, and by 25 % with Shift. Null for
+ * any other key. The core clamps the pan so the cell never shows beyond the picture (`ViewportState::input`), and so this does not: a step
+ * past an edge stops there, the same as a drag does.
+ */
+export function panKeyDelta(key: string, shift: boolean, view: { width: number; height: number }): { dx: number; dy: number } | null {
+  const share = shift ? PAN_STEP_SHIFT : PAN_STEP;
+  // `|| 0` keeps a negative zero out of the answer.
+  switch (key) {
+    case "ArrowLeft":
+      return { dx: view.width * share || 0, dy: 0 };
+    case "ArrowRight":
+      return { dx: -view.width * share || 0, dy: 0 };
+    case "ArrowUp":
+      return { dx: 0, dy: view.height * share || 0 };
+    case "ArrowDown":
+      return { dx: 0, dy: -view.height * share || 0 };
+    default:
+      return null;
+  }
 }

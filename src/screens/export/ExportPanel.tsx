@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef } from "react";
+import { Item, ItemContent } from "@/components/glass/item";
 import { Button, ExportQueueList, ProgressBar, TitleBlock } from "../../components";
-import { estimateTitle, formatEstimate, photoCount } from "../../export/format";
+import { estimateTitle, formatEstimate, lowSpaceWarning, photoCount } from "../../export/format";
 import { exportModel } from "../../export/model";
 import { queueItems, runBlurb, runNote, runTitle, summarise } from "../../export/run";
 import { useAppState } from "../../state/context";
@@ -33,6 +34,7 @@ export function ExportPanel({ store }: ExportPanelProps) {
   const key = model.photos.map((p) => p.id).join(",");
   const preview = useExportPreview(store, job, key, run === null && model.count > 0);
   const { estimate } = preview;
+  const spaceWarning = lowSpaceWarning(estimate);
 
   const blocker =
     model.count === 0
@@ -64,16 +66,13 @@ export function ExportPanel({ store }: ExportPanelProps) {
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [run, store]);
 
-  // When the view changes (options, queue, finished) focus moves to its main button, so the keyboard is not left on nothing.
+  // When the panel opens, and when its view changes (options, queue, finished), the focus moves to the view's main button, so the keyboard
+  // is never left on nothing: ⌘E drew the panel in place of the header's controls, which dropped the focus to `body`. The panel gives it
+  // back when it closes (`Photos`, `focusMemory.ts`).
   const root = useRef<HTMLElement>(null);
   const phase = run === null ? "options" : run.phase;
-  const first = useRef(true);
   useEffect(() => {
-    if (first.current) {
-      first.current = false;
-      return;
-    }
-    root.current?.querySelector<HTMLElement>("[data-autofocus]")?.focus();
+    root.current?.querySelector<HTMLElement>("[data-autofocus]")?.focus({ preventScroll: true });
   }, [phase]);
 
   const folder = session?.folder_name ?? "this folder";
@@ -97,6 +96,11 @@ export function ExportPanel({ store }: ExportPanelProps) {
         ) : (
           <div className="ym-export__queue">
             <ProgressBar value={summarise(run).percent} label="Exporting" />
+            {run.stopped !== undefined ? (
+              <Item variant="muted" size="sm" role="alert" className="ym-export__banner">
+                <ItemContent>{run.stopped}</ItemContent>
+              </Item>
+            ) : null}
             <div className="ym-export__list">
               <ExportQueueList items={queueItems(run)} />
             </div>
@@ -104,18 +108,26 @@ export function ExportPanel({ store }: ExportPanelProps) {
           </div>
         )}
       </div>
-      <div className="ym-tools__footer">
+      <div className={spaceWarning !== null && run === null ? "ym-tools__footer ym-export__footer--warned" : "ym-tools__footer"}>
         {run === null ? (
-          <Button
-            block
-            size="lg"
-            disabled={blocker !== null}
-            title={blocker ?? (estimate ? estimateTitle(estimate) : undefined)}
-            aside={`${estimate ? formatEstimate(estimate.bytes) : "…"} · ⌘↩`}
-            onClick={() => void start()}
-          >
-            {model.count > 0 ? `Export ${photoCount(model.count)}` : "Export"}
-          </Button>
+          <>
+            <Button
+              block
+              size="lg"
+              data-autofocus=""
+              disabled={blocker !== null}
+              title={blocker ?? (estimate ? estimateTitle(estimate) : undefined)}
+              aside={`${estimate ? formatEstimate(estimate.bytes) : "…"} · ⌘↩`}
+              onClick={() => void start()}
+            >
+              {model.count > 0 ? `Export ${photoCount(model.count)}` : "Export"}
+            </Button>
+            {spaceWarning !== null ? (
+              <p role="status" className="ym-row-note ym-export__space">
+                {spaceWarning}
+              </p>
+            ) : null}
+          </>
         ) : run.phase === "running" ? (
           <Button variant="secondary" size="lg" block data-autofocus="" onClick={() => void store.cancelExport()}>
             Cancel

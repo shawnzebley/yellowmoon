@@ -27,7 +27,10 @@ use ym_gpu::device::{Gpu, GpuConfig, GpuError, GpuInfo};
 use ym_gpu::kernels::KernelId;
 use ym_gpu::queue::{JobHandle, JobSpec, Priority};
 
-use crate::pipeline::RenderOptions;
+use super::metal::{
+    METAL_WORKING_SET_FACTOR, MetalDevices, NoMetalDevices, gpu_budget_bytes, metal_limit_of,
+};
+use crate::pipeline::{GpuReopener, RenderOptions};
 use crate::scheduler::{MemoryBudget, total_ram_bytes};
 
 /// The environment variable that sets the policy when no flag does.
@@ -67,8 +70,14 @@ impl GpuStages {
     /// `k x k` binning, the denoise and R9 at 1/k) that never builds a full-resolution frame on the
     /// host. Signed off on 2026-10-15 ([`GpuStages::SIGNED_OFF`]).
     pub const RAW_FRONT: Self = Self(1 << 6);
+    /// The lens character stages L1 to L3 (`docs/21`): the bokeh reshaping (L1), the field optics (L2) and the
+    /// highlight optics (L3) of the raw group, run per tile between the raw group and the sampler, with the
+    /// lens's per-photo planes uploaded once (the blur detector, the ball list and the blur map stay on the host,
+    /// once per photo). **Not yet in [`GpuStages::SIGNED_OFF`]**: its parity, tile and determinism suites have
+    /// run on Mesa lavapipe and still wait for the Metal CI runners.
+    pub const LENS: Self = Self(1 << 7);
     /// Every stage.
-    pub const ALL: Self = Self(0b111_1111);
+    pub const ALL: Self = Self(0b1111_1111);
 
     /// What `Auto` runs on the device: the stages signed off, that is, the ones whose parity, tile
     /// and determinism suites pass on the Metal CI runners (`.github/workflows/mac-gpu.yml`), the
@@ -91,12 +100,13 @@ impl GpuStages {
 
     /// The stages of an export that run on the device in this version: the raw chain (R6 to R8 of
     /// every full-resolution tile: demosaic, denoise, R7 and capture sharpening) and the
-    /// raw front (R1 to R5b and R9 of every tile), and the export tail: the sampler, the colour
+    /// raw front (R1 to R5b and R9 of every tile), the lens (L1 to L3 of every tile of a photo with
+    /// one) and the export tail: the sampler, the colour
     /// chain, the Lanczos-3 resize, output sharpening and C13 of the written picture, which the CPU
     /// writers pull as encoded bands. Decides whether `ym` warms the kernels up while photos
     /// decode; **a stage that exports run on the device is added here**.
     pub const USED_BY_EXPORTS: Self =
-        Self(Self::RAW_CHAIN.0 | Self::RAW_FRONT.0 | Self::EXPORT_TAIL.0);
+        Self(Self::RAW_CHAIN.0 | Self::RAW_FRONT.0 | Self::EXPORT_TAIL.0 | Self::LENS.0);
 
     /// Whether every stage of `other` is in this set.
     #[must_use]
@@ -116,6 +126,12 @@ impl GpuStages {
         Self(self.0 | other.0)
     }
 
+    /// The stages of this set that are not in `other`.
+    #[must_use]
+    pub const fn difference(self, other: Self) -> Self {
+        Self(self.0 & !other.0)
+    }
+
     /// Whether there is no stage.
     #[must_use]
     pub const fn is_empty(self) -> bool {
@@ -123,7 +139,7 @@ impl GpuStages {
     }
 
     /// The names of the stages in the set, in the order of the members (`raw`, `sampler`,
-    /// `colour`, `sharpening`, `encode`, `export`, `raw front`): what `ym doctor` prints.
+    /// `colour`, `sharpening`, `encode`, `export`, `raw front`, `lens`): what `ym doctor` prints.
     #[must_use]
     pub fn names(self) -> Vec<&'static str> {
         [
@@ -134,6 +150,7 @@ impl GpuStages {
             (Self::ENCODE, "encode"),
             (Self::EXPORT_TAIL, "export"),
             (Self::RAW_FRONT, "raw front"),
+            (Self::LENS, "lens"),
         ]
         .into_iter()
         .filter(|(stage, _)| self.contains(*stage))
@@ -466,6 +483,9 @@ pub struct GpuSlot<D: GpuDevice = Gpu> {
     adapter: Option<GpuInfo>,
     budget: MemoryBudget,
     shared_memory: bool,
+    /// What the device was opened with, for a reopen after a loss ([`GpuSlot::reopener`]).
+    pipeline_cache_dir: Option<PathBuf>,
+    timestamps: bool,
 }
 
 impl<D: GpuDevice> fmt::Debug for GpuSlot<D> {
@@ -489,6 +509,8 @@ impl<D: GpuDevice> GpuSlot<D> {
             adapter: None,
             budget,
             shared_memory: false,
+            pipeline_cache_dir: None,
+            timestamps: false,
         }
     }
 
@@ -589,6 +611,39 @@ impl GpuSlot<Gpu> {
         options.gpu = self.gpu.clone();
         options.gpu_stages = self.stages();
         options.gpu_strict = self.policy.is_strict();
+        options.gpu_reopener = self.reopener();
+    }
+
+    /// How to open the device again after it is lost: the real graphics stack ([`SystemProbe`], the one call that
+    /// creates a device) with the memory budget this slot ended with (already split on a unified-memory machine, so it
+    /// is not split again), the pipeline cache and the timestamps it had, refusing a software adapter where the
+    /// policy does (a machine whose hardware adapter went away must not come back as Mesa under `Auto`). The new
+    /// device compiles every kernel in the background, one `Export`-priority job each, as the application's first one
+    /// did. `None` when this slot uses no device.
+    #[must_use]
+    pub fn reopener(&self) -> Option<GpuReopener> {
+        if !self.is_using() {
+            return None;
+        }
+        let (policy, gpu_bytes) = (self.policy, self.budget.gpu_bytes);
+        let (cache, timestamps) = (self.pipeline_cache_dir.clone(), self.timestamps);
+        Some(GpuReopener(Arc::new(move || {
+            let device = SystemProbe
+                .open(GpuConfig {
+                    memory_budget_bytes: Some(gpu_bytes),
+                    pipeline_cache_dir: cache.clone(),
+                    timestamps,
+                    ..GpuConfig::default()
+                })
+                .map_err(|e| e.to_string())?;
+            if device.info().is_software && !policy.accepts_software() {
+                device.close();
+                return Err("only a software adapter is left".to_owned());
+            }
+            let device = Arc::new(device);
+            drop(warm_up_each(&device));
+            Ok(device)
+        })))
     }
 
     /// Starts the kernel compile on the device as an `Export`-priority job, cancellable between
@@ -606,6 +661,34 @@ impl GpuSlot<Gpu> {
         let gpu = self.gpu.as_ref()?;
         self.stages().intersects(used).then(|| warm_up(gpu))
     }
+
+    /// Starts the compile of every kernel for the viewer, one `Export`-priority job a kernel in
+    /// [`KernelId::ALL`] order ([`warm_up_each`]), so that a viewport frame queued meanwhile runs between two
+    /// kernels instead of behind all of them. Empty when no device is used. The application calls it when it
+    /// opens the device; no frame then builds a pipeline (`docs/17-gpu.md` section 7).
+    #[must_use]
+    pub fn warm_up_for_viewer(&self) -> Vec<JobHandle<Result<usize, GpuError>>> {
+        match (&self.gpu, self.is_using()) {
+            (Some(gpu), true) => warm_up_each(gpu),
+            _ => Vec::new(),
+        }
+    }
+}
+
+/// [`warm_up`] as one job a kernel, queued at once in [`KernelId::ALL`] order. Viewport, tile and thumbnail
+/// jobs outrank `Export` ones, so a frame that arrives while the kernels compile waits for the kernel in
+/// progress, not for the rest. Each job resolves to 1.
+pub fn warm_up_each(gpu: &Gpu) -> Vec<JobHandle<Result<usize, GpuError>>> {
+    KernelId::ALL
+        .into_iter()
+        .map(|id| {
+            gpu.submit(JobSpec::new(Priority::Export), move |ctx, token| {
+                token.check()?;
+                ctx.kernels().pipeline(ctx, id)?;
+                Ok(1)
+            })
+        })
+        .collect()
 }
 
 /// Compiles every kernel on the device thread, as a job of `Export` priority (it queues behind
@@ -642,6 +725,8 @@ pub struct GpuOpener<P: AdapterProbe = SystemProbe> {
     pipeline_cache_dir: Option<PathBuf>,
     ram_bytes: Option<u64>,
     timestamps: bool,
+    /// Where the Metal working-set limit comes from ([`MetalDevices`]); none by default.
+    metal: Arc<dyn MetalDevices>,
     probe: P,
 }
 
@@ -657,6 +742,7 @@ impl GpuOpener<SystemProbe> {
             pipeline_cache_dir: None,
             ram_bytes: total_ram_bytes(),
             timestamps: false,
+            metal: Arc::new(NoMetalDevices),
             probe: SystemProbe,
         }
     }
@@ -672,8 +758,18 @@ impl<P: AdapterProbe> GpuOpener<P> {
             pipeline_cache_dir: self.pipeline_cache_dir,
             ram_bytes: self.ram_bytes,
             timestamps: self.timestamps,
+            metal: self.metal,
             probe,
         }
+    }
+
+    /// Where the Metal working-set limit comes from. The app and `ym` both hand over
+    /// `ym_apple::system_metal_devices()` (through `ym_apple::gpu_opener`), so their budgets are the
+    /// same; with the default (none) the rule of the budget stands.
+    #[must_use]
+    pub fn with_metal_devices(mut self, metal: Arc<dyn MetalDevices>) -> Self {
+        self.metal = metal;
+        self
     }
 
     /// The folder of the wgpu pipeline cache (the application passes
@@ -751,25 +847,32 @@ impl<P: AdapterProbe> GpuOpener<P> {
             return slot;
         }
 
+        // The budget after the rules: the unified-memory rule where the adapter shares the RAM, then
+        // the cap from Metal's working-set limit of this very adapter (`docs/17` section 8).
         let shared_memory = is_unified_memory(&info);
         let mut info = info;
+        let mut target = budget;
         if shared_memory {
-            let unified = budget.for_unified_memory(self.ram_bytes);
-            if unified.gpu_bytes != budget.gpu_bytes {
-                // Closed *and dropped* before the second is asked for: the device thread is gone
-                // after `close`, but the wgpu device lives as long as the value does, and on an
-                // 8 GB Mac two of them must not exist at once.
-                device.close();
-                drop(device);
-                budget = unified;
-                device = match self.probe.open(self.config(&budget)) {
-                    Ok(device) => device,
-                    Err(e) => return self.without_device(budget, &e),
-                };
-                info = device.info().clone();
-            } else {
-                budget = unified;
-            }
+            target = target.for_unified_memory(self.ram_bytes);
+        }
+        let limit = metal_limit_of(&info, &self.metal.devices());
+        target.gpu_bytes =
+            gpu_budget_bytes(target.gpu_bytes, limit.bytes(), METAL_WORKING_SET_FACTOR);
+        if target.gpu_bytes != budget.gpu_bytes {
+            // The pool is sized when the device is created, so the device is opened again with
+            // the new budget. Closed *and dropped* before the second is asked for: the device
+            // thread is gone after `close`, but the wgpu device lives as long as the value does,
+            // and on an 8 GB Mac two of them must not exist at once.
+            device.close();
+            drop(device);
+            budget = target;
+            device = match self.probe.open(self.config(&budget)) {
+                Ok(device) => device,
+                Err(e) => return self.without_device(budget, &e),
+            };
+            info = device.info().clone();
+        } else {
+            budget = target;
         }
         tracing::info!(
             adapter = %info.name,
@@ -786,6 +889,8 @@ impl<P: AdapterProbe> GpuOpener<P> {
             adapter: Some(info),
             budget,
             shared_memory,
+            pipeline_cache_dir: self.pipeline_cache_dir.clone(),
+            timestamps: self.timestamps,
         }
     }
 }
@@ -1103,6 +1208,132 @@ mod tests {
         }
     }
 
+    fn metal_device(name: &str, limit: u64) -> crate::app::metal::MetalDevice {
+        crate::app::metal::MetalDevice {
+            name: name.to_owned(),
+            recommended_max_working_set_bytes: limit,
+            has_unified_memory: false,
+            is_low_power: false,
+            is_removable: false,
+        }
+    }
+
+    #[test]
+    fn the_metal_limit_of_the_opened_adapter_caps_the_budget_after_the_unified_rule() {
+        use crate::app::metal::FixedMetalDevices;
+        // (adapter, RAM in GiB, Metal devices, opens, the GPU budget)
+        let other = metal_device("Some other GPU", 64 * GIB);
+        let cases = [
+            // A GPU with its own memory: 0.75 of 2 GiB is 1.5 GiB, below the 4 GiB rule: a second open.
+            (
+                Adapter::Hardware,
+                16,
+                vec![other.clone(), metal_device("Test discrete GPU", 2 * GIB)],
+                vec![Some(4 * GIB), Some(3 * GIB / 2)],
+                3 * GIB / 2,
+            ),
+            // A limit above the rule: nothing changes, one open.
+            (
+                Adapter::Hardware,
+                16,
+                vec![metal_device("Test discrete GPU", 16 * GIB)],
+                vec![Some(4 * GIB)],
+                4 * GIB,
+            ),
+            // Unified, 16 GB (rule 4 GiB), limit 3 GiB: 2.25 GiB, a second open.
+            (
+                Adapter::Unified,
+                16,
+                vec![metal_device("Test Apple GPU", 3 * GIB)],
+                vec![Some(4 * GIB), Some(9 * GIB / 4)],
+                9 * GIB / 4,
+            ),
+            // Unified, 8 GB (rule 2 GiB), limit 12 GiB: the rule, as before the cap.
+            (
+                Adapter::Unified,
+                8,
+                vec![metal_device("Test Apple GPU", 12 * GIB)],
+                vec![Some(4 * GIB), Some(2 * GIB)],
+                2 * GIB,
+            ),
+            // No device of the adapter's name, and Metal silent: the rule.
+            (
+                Adapter::Hardware,
+                16,
+                vec![other.clone()],
+                vec![Some(4 * GIB)],
+                4 * GIB,
+            ),
+            (Adapter::Hardware, 16, vec![], vec![Some(4 * GIB)], 4 * GIB),
+            // The name twice: no limit.
+            (
+                Adapter::Hardware,
+                16,
+                vec![
+                    metal_device("Test discrete GPU", GIB),
+                    metal_device("Test discrete GPU", 2 * GIB),
+                ],
+                vec![Some(4 * GIB)],
+                4 * GIB,
+            ),
+            // A zero limit: none.
+            (
+                Adapter::Hardware,
+                16,
+                vec![metal_device("Test discrete GPU", 0)],
+                vec![Some(4 * GIB)],
+                4 * GIB,
+            ),
+        ];
+        for (adapter, ram, devices, opens, gpu) in cases {
+            let probe = FakeProbe::new(adapter);
+            let slot = GpuOpener::new(GpuPolicy::On, MemoryBudget::for_ram(Some(ram * GIB)))
+                .with_ram_bytes(Some(ram * GIB))
+                .with_metal_devices(Arc::new(FixedMetalDevices(devices.clone())))
+                .with_probe(probe.clone())
+                .open();
+            assert_eq!(
+                *probe.budgets.lock().expect("b"),
+                opens,
+                "{adapter:?} {devices:?}"
+            );
+            assert_eq!(slot.budget().gpu_bytes, gpu, "{adapter:?} {devices:?}");
+            assert_eq!(probe.alive.load(Ordering::SeqCst), 1, "one device is left");
+            assert_eq!(
+                probe.most_alive.load(Ordering::SeqCst),
+                1,
+                "never two at once"
+            );
+        }
+    }
+
+    #[test]
+    fn an_adapter_that_is_not_metal_is_never_capped() {
+        use crate::app::metal::FixedMetalDevices;
+        // The Vulkan backend with a device of the same name in the list: the list is Metal's, not its.
+        #[derive(Clone)]
+        struct VulkanProbe(FakeProbe);
+        impl AdapterProbe for VulkanProbe {
+            type Device = FakeDevice;
+            fn open(&self, config: GpuConfig) -> Result<FakeDevice, GpuError> {
+                let mut device = self.0.open(config)?;
+                device.info.backend = "Vulkan".to_owned();
+                Ok(device)
+            }
+        }
+        let probe = FakeProbe::new(Adapter::Hardware);
+        let slot = GpuOpener::new(GpuPolicy::On, MemoryBudget::for_ram(Some(16 * GIB)))
+            .with_ram_bytes(Some(16 * GIB))
+            .with_metal_devices(Arc::new(FixedMetalDevices(vec![metal_device(
+                "Test discrete GPU",
+                GIB,
+            )])))
+            .with_probe(VulkanProbe(probe.clone()))
+            .open();
+        assert_eq!(*probe.budgets.lock().expect("b"), vec![Some(4 * GIB)]);
+        assert_eq!(slot.budget().gpu_bytes, 4 * GIB);
+    }
+
     #[test]
     fn a_second_open_that_fails_leaves_no_device_and_follows_the_policy() {
         // 8 GB: the first device is closed for the second, which then finds nothing.
@@ -1283,7 +1514,9 @@ mod tests {
                 "raw front"
             ]
         );
-        assert_eq!(GpuStages::SIGNED_OFF, GpuStages::ALL);
+        // The lens (L1, L2 and L3 kernels) waits for the Metal CI runners.
+        assert_eq!(GpuStages::SIGNED_OFF.union(GpuStages::LENS), GpuStages::ALL);
+        assert!(!GpuStages::SIGNED_OFF.contains(GpuStages::LENS));
     }
 
     #[test]
@@ -1296,6 +1529,7 @@ mod tests {
             GpuStages::ENCODE,
             GpuStages::EXPORT_TAIL,
             GpuStages::RAW_FRONT,
+            GpuStages::LENS,
         ];
         let mut union = GpuStages::NONE;
         for (i, a) in all.iter().enumerate() {
@@ -1310,7 +1544,7 @@ mod tests {
         assert_eq!(GpuStages::NONE.to_string(), "none");
         assert_eq!(
             GpuStages::ALL.to_string(),
-            "raw, sampler, colour, sharpening, encode, export, raw front"
+            "raw, sampler, colour, sharpening, encode, export, raw front, lens"
         );
         assert!(GpuStages::ALL.contains(GpuStages::NONE));
     }
@@ -1324,6 +1558,8 @@ mod tests {
         // The export tail: the sampler, colour chain, resize, sharpening and C13 of the written
         // picture.
         assert!(GpuStages::USED_BY_EXPORTS.contains(GpuStages::EXPORT_TAIL));
+        // The lens: L1 to L3 of every tile of a photo with one.
+        assert!(GpuStages::USED_BY_EXPORTS.contains(GpuStages::LENS));
     }
 
     // --- the real stack -----------------------------------------------------------------------

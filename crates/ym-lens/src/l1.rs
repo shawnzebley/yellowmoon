@@ -1,0 +1,596 @@
+//! L1: bokeh reshaping and the bokeh detector that feeds it (`docs/21` section 4, L1, and section 7).
+//!
+//! L1 never adds bokeh. It reshapes the blur the photo already holds: out-of-focus areas are stretched into
+//! taller ovals across the anamorphic axis and along the tangent (the lens's swirl, which grows with the blur, and
+//! its astigmatism, which does not), with the lens's cat's-eye cut, and bright balls are stretched as they are
+//! (their own light, read where it was before the stretch). All of it is the Anamorphic slider's: the attachment
+//! brings the lens's own swirl and cat's-eye with its vertical stretch, and Edges has none of it. Pixels in focus
+//! are never changed, and where the detector is unsure nothing happens.
+//!
+//! * [`BokehPlanes`] is the per-photo data, made once by [`LensPlanes::build`](crate::LensPlanes::build) on the
+//!   lens plane: the blur map and its confidence, and the ball list. The detector is classical image analysis
+//!   (no depth model, no learned model): [`detector`], [`balls`], [`spread`], [`disc`].
+//! * [`apply`] is the per-tile pass ([`tile`], [`draw`]); [`halo`] is its reach.
+//!
+//! With nothing to reshape [`halo`] is 0 and [`apply`] hands back its input.
+
+mod balls;
+mod detector;
+mod disc;
+mod draw;
+mod gpu;
+mod ladder;
+mod spread;
+mod tile;
+
+pub(crate) use gpu::{device_pass, plane_data, scale_data};
+
+use crate::consts::B_CAP;
+use crate::error::LensError;
+use crate::image::{ImageRef, PixelRect};
+use crate::plan::LensPlan;
+use crate::planes::{LensPlanes, ReshapeReason, ReshapeReport};
+
+/// A bright ball: a defocused light found on the lens plane (`docs/21` section 4, L1, step 2).
+///
+/// Lengths are in half-diagonals of the lens plane's frame and positions are fractions of the frame, so the
+/// ball is the same at every scale.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Ball {
+    /// Centre as a fraction of the frame, `x` then `y`, in the buffer's orientation.
+    pub x: f64,
+    /// See [`Ball::x`].
+    pub y: f64,
+    /// Radius in half-diagonals.
+    pub radius: f64,
+    /// Radius of the disc that is replaced by the ring's fit before the stretch, in half-diagonals.
+    pub take_out_radius: f64,
+    /// Per channel, the light above the ring's fit, as a fraction of the frame's area times linear value (so
+    /// the sum of the ball's pixels over a view of `n` pixels is `energy * n`).
+    pub energy: [f64; 3],
+    /// Per channel, the ring's plane fit: the value at the centre and the slopes along `x` and `y` per
+    /// half-diagonal.
+    pub fit: [[f64; 3]; 3],
+    /// The 90th percentile of the ball's luminance.
+    pub peak: f64,
+    /// True when the edges around the ball agree with its size.
+    pub supported: bool,
+    /// Width of the ball's rim, from 80 % to 20 % of its brightness, over its radius: 0.1 to 0.2 for a disc with
+    /// a sharp rim, 0.5 and more for a soft blob. The redrawn oval has a rim of the same softness.
+    pub softness: f64,
+    /// True when the ball passes the strict rules (a calm ring, a rim of at most 0.9 radii, no sharp ground around
+    /// it). Only such balls count towards "the scene is one of lights" (the gate); the others, which needed the
+    /// relaxed rules where the blur around them says the ground is out of focus, are drawn in a photo that is
+    /// reshaped but do not make one.
+    pub clear: bool,
+}
+
+/// A blur map made by another source than the classical detector (the learned model, `ym_ml::bokeh_net`): one cell
+/// per `OUTPUT_STRIDE` x `OUTPUT_STRIDE` (2 x 2) pixels of the plane the source saw, `plane_width x plane_height`.
+///
+/// `b` is the blur radius per cell in half-diagonals (at least a pixel), and `p` the source's probability that the
+/// cell is out of focus (`b >= 2 b_min`): a cell is blurred when `p >= 0.7` and weighs `max(p, 1 - p)`, and the
+/// photo has bokeh by the cells with `p >= 0.9`. Cells are row-major.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BlurMapInput {
+    /// Columns of the map.
+    pub width: usize,
+    /// Rows of the map.
+    pub height: usize,
+    /// Width in pixels of the plane the cells tile (twice the columns, or one less).
+    pub plane_width: usize,
+    /// Height in pixels of that plane.
+    pub plane_height: usize,
+    /// The radius per cell, in half-diagonals.
+    pub b: Vec<f32>,
+    /// The probability per cell that it is out of focus, from 0 to 1.
+    pub p: Vec<f32>,
+}
+
+impl BlurMapInput {
+    /// The map at `width x height` pixels of the same plane (any size), `(b, p)`: bilinear between the cells'
+    /// centres, held at the edge beyond the outer ones.
+    pub(crate) fn resample(&self, width: usize, height: usize) -> (Vec<f32>, Vec<f32>) {
+        let cells = self.width * self.height;
+        let mut b = vec![0.0f32; width * height];
+        let mut prob = vec![0.5f32; width * height];
+        if cells == 0 || self.b.len() != cells || self.p.len() != cells {
+            return (b, prob);
+        }
+        let axis = |t: f64, plane: usize, count: usize| {
+            let p = (t * plane as f64 / 2.0 - 0.5).clamp(0.0, (count - 1) as f64);
+            let i0 = (p.floor() as usize).min(count - 1);
+            (i0, (i0 + 1).min(count - 1), (p - i0 as f64) as f32)
+        };
+        for y in 0..height {
+            let (y0, y1, fy) = axis(
+                (y as f64 + 0.5) / height as f64,
+                self.plane_height,
+                self.height,
+            );
+            for x in 0..width {
+                let (x0, x1, fx) = axis(
+                    (x as f64 + 0.5) / width as f64,
+                    self.plane_width,
+                    self.width,
+                );
+                let lerp = |m: &[f32]| {
+                    let top = (1.0 - fx) * m[y0 * self.width + x0] + fx * m[y0 * self.width + x1];
+                    let bottom =
+                        (1.0 - fx) * m[y1 * self.width + x0] + fx * m[y1 * self.width + x1];
+                    (1.0 - fy) * top + fy * bottom
+                };
+                b[y * width + x] = lerp(&self.b);
+                prob[y * width + x] = lerp(&self.p);
+            }
+        }
+        (b, prob)
+    }
+}
+
+/// The classical detector's blur map as a [`BlurMapInput`], for a use that has no learned model (the Background mask
+/// of `docs/23` section 4.6 when the network cannot run): the detector of `docs/21` section 7 on the lens plane
+/// (`focus` anchors the subject as in the lens), its work plane pooled 2 x 2 into cells like the network's.
+///
+/// `p` is the detector's confidence where it calls the cell out of focus (`b >= 2 b_min`, the network's own
+/// definition of the probability) and 0 everywhere else, so an evenly sharp plane is all 0; `b` is the radius in
+/// half-diagonals.
+///
+/// # Errors
+///
+/// [`LensError::Cancelled`], or a plane the detector refuses.
+pub fn classical_blur_map(
+    lens_plane: &ImageRef,
+    focus: Option<(f64, f64)>,
+    cancel: &dyn Fn() -> bool,
+) -> Result<BlurMapInput, LensError> {
+    lens_plane.validate()?;
+    let d = detector::detect(lens_plane, focus, cancel)?;
+    let (w, h) = (d.w, d.h);
+    let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+    let decide = 2.0 * crate::consts::B_MIN;
+    let mut b = vec![0.0f32; cw * ch];
+    let mut p = vec![0.0f32; cw * ch];
+    for cy in 0..ch {
+        for cx in 0..cw {
+            let (mut sb, mut sp, mut n) = (0.0f32, 0.0f32, 0.0f32);
+            for dy in 0..2 {
+                for dx in 0..2 {
+                    let (x, y) = (2 * cx + dx, 2 * cy + dy);
+                    if x < w && y < h {
+                        let i = y * w + x;
+                        sb += d.b[i];
+                        if f64::from(d.b[i]) >= decide {
+                            sp += d.conf[i];
+                        }
+                        n += 1.0;
+                    }
+                }
+            }
+            b[cy * cw + cx] = sb / n;
+            p[cy * cw + cx] = (sp / n).clamp(0.0, 1.0);
+        }
+    }
+    Ok(BlurMapInput {
+        width: cw,
+        height: ch,
+        plane_width: w,
+        plane_height: h,
+        b,
+        p,
+    })
+}
+
+/// One level of the blur map's reductions: the mean of weight times blur, of weight, and of the cells known to be
+/// in focus (a subject).
+#[derive(Clone, Debug)]
+pub(crate) struct MapLevel {
+    pub(crate) w: usize,
+    pub(crate) h: usize,
+    pub(crate) a: Vec<f32>,
+    pub(crate) c: Vec<f32>,
+    pub(crate) s: Vec<f32>,
+}
+
+/// The per-photo data of L1: the blur map and the ball list (`docs/21` section 3).
+#[derive(Clone, Debug)]
+pub struct BokehPlanes {
+    w: usize,
+    h: usize,
+    reduce: usize,
+    b: Vec<f32>,
+    conf: Vec<f32>,
+    balls: Vec<Ball>,
+    active: bool,
+    edges: usize,
+    fraction: f64,
+    b_max: f64,
+    noise_v: f64,
+    levels: Vec<MapLevel>,
+    /// Cells known to be in focus: the subject anchor, the places next to a sharp edge, where a learned map is
+    /// sure ([`detector::Detected::subject`]).
+    subject: Vec<bool>,
+    /// Summed-area table (`(w + 1) x (h + 1)`) of the cells with a blur.
+    nonzero: Vec<u32>,
+}
+
+impl BokehPlanes {
+    /// Runs the detector on the lens plane.
+    pub(crate) fn build(
+        _plan: &LensPlan,
+        lens_plane: &ImageRef,
+        focus: Option<(f64, f64)>,
+        map: Option<&BlurMapInput>,
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<Self, LensError> {
+        let d = match map {
+            Some(map) => detector::detect_with_map(lens_plane, focus, map, cancel)?,
+            None => detector::detect(lens_plane, focus, cancel)?,
+        };
+        let fraction = detector::blurred_fraction(&d);
+        let active = detector::enough(&d);
+        let (w, h) = (d.w, d.h);
+        let b_max =
+            d.b.iter()
+                .fold(0.0f64, |m, v| m.max(f64::from(*v)))
+                .min(B_CAP);
+        let balls: Vec<Ball> = d
+            .balls
+            .iter()
+            .map(|b| Ball {
+                x: b.cx / w as f64,
+                y: b.cy / h as f64,
+                radius: b.r / d.hd,
+                take_out_radius: b.r_out / d.hd,
+                energy: [
+                    b.energy[0] / (w * h) as f64,
+                    b.energy[1] / (w * h) as f64,
+                    b.energy[2] / (w * h) as f64,
+                ],
+                fit: [
+                    [b.fit[0][0], b.fit[0][1] * d.hd, b.fit[0][2] * d.hd],
+                    [b.fit[1][0], b.fit[1][1] * d.hd, b.fit[1][2] * d.hd],
+                    [b.fit[2][0], b.fit[2][1] * d.hd, b.fit[2][2] * d.hd],
+                ],
+                peak: b.peak,
+                supported: b.supported,
+                softness: b.softness,
+                clear: b.clear,
+            })
+            .collect();
+        let mut planes = BokehPlanes {
+            w,
+            h,
+            reduce: d.reduce,
+            b: d.b,
+            conf: d.conf,
+            balls,
+            active,
+            edges: d.edges,
+            fraction,
+            b_max,
+            noise_v: d.noise_v,
+            levels: Vec::new(),
+            subject: d.subject,
+            nonzero: Vec::new(),
+        };
+        if active {
+            planes.build_levels();
+        }
+        Ok(planes)
+    }
+
+    /// The mean-pooled reductions of the blur map for tiles at coarser scales, and the table of blurred cells.
+    fn build_levels(&mut self) {
+        let (w, h) = (self.w, self.h);
+        // Weight of a cell: its confidence where it is out of focus or confidently in focus, else 0.
+        let weight = |i: usize| -> f32 {
+            let (b, c) = (self.b[i], self.conf[i]);
+            if b > 0.0 || f64::from(c) >= 0.3 {
+                c
+            } else {
+                0.0
+            }
+        };
+        let mut a = Vec::with_capacity(w * h);
+        let mut c = Vec::with_capacity(w * h);
+        let mut s = Vec::with_capacity(w * h);
+        for i in 0..w * h {
+            let wt = weight(i);
+            a.push(wt * self.b[i]);
+            c.push(wt);
+            s.push(f32::from(u8::from(self.subject[i])));
+        }
+        let mut levels = vec![MapLevel { w, h, a, c, s }];
+        while levels.len() < 6 {
+            let last = levels.last().expect("one level");
+            if last.w < 2 || last.h < 2 {
+                break;
+            }
+            let (w2, h2) = (last.w.div_ceil(2), last.h.div_ceil(2));
+            let mut a2 = vec![0.0f32; w2 * h2];
+            let mut c2 = vec![0.0f32; w2 * h2];
+            let mut s2 = vec![0.0f32; w2 * h2];
+            for y in 0..h2 {
+                for x in 0..w2 {
+                    let (mut sa, mut sc, mut ss, mut n) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+                    for dy in 0..2 {
+                        for dx in 0..2 {
+                            let (sx, sy) = (2 * x + dx, 2 * y + dy);
+                            if sx < last.w && sy < last.h {
+                                sa += last.a[sy * last.w + sx];
+                                sc += last.c[sy * last.w + sx];
+                                ss += last.s[sy * last.w + sx];
+                                n += 1.0;
+                            }
+                        }
+                    }
+                    a2[y * w2 + x] = sa / n;
+                    c2[y * w2 + x] = sc / n;
+                    s2[y * w2 + x] = ss / n;
+                }
+            }
+            levels.push(MapLevel {
+                w: w2,
+                h: h2,
+                a: a2,
+                c: c2,
+                s: s2,
+            });
+        }
+        self.levels = levels;
+        // Summed-area table of the cells with a blur.
+        let stride = w + 1;
+        let mut sat = vec![0u32; stride * (h + 1)];
+        for y in 0..h {
+            let mut row = 0u32;
+            for x in 0..w {
+                row += u32::from(self.b[y * w + x] > 0.0);
+                sat[(y + 1) * stride + x + 1] = sat[y * stride + x + 1] + row;
+            }
+        }
+        self.nonzero = sat;
+    }
+
+    /// What the reshaping does for this photo.
+    pub(crate) fn report(&self) -> ReshapeReport {
+        if self.active {
+            ReshapeReport {
+                reshaped: true,
+                reason: None,
+            }
+        } else {
+            ReshapeReport {
+                reshaped: false,
+                reason: Some(ReshapeReason::LittleBlur),
+            }
+        }
+    }
+
+    /// Size of the maps in cells: the lens plane, or its half when the plane is large.
+    #[must_use]
+    pub fn size(&self) -> (usize, usize) {
+        (self.w, self.h)
+    }
+
+    /// How many pixels of the lens plane one cell of the maps covers per side (1 or 2).
+    #[must_use]
+    pub fn reduce(&self) -> usize {
+        self.reduce
+    }
+
+    /// The blur radius `b` of every cell, in half-diagonals, row-major; 0 where nothing is reshaped (in
+    /// focus, unsure, or below `b_min`).
+    #[must_use]
+    pub fn blur(&self) -> &[f32] {
+        &self.b
+    }
+
+    /// The confidence `c` (0 to 1) of every cell's value, `b` or 0.
+    #[must_use]
+    pub fn confidence(&self) -> &[f32] {
+        &self.conf
+    }
+
+    /// The balls, brightest first.
+    #[must_use]
+    pub fn balls(&self) -> &[Ball] {
+        &self.balls
+    }
+
+    /// True when the photo has enough out-of-focus background to reshape.
+    #[must_use]
+    pub fn active(&self) -> bool {
+        self.active
+    }
+
+    /// Edges measured (readings of the blur at edges, plus the perimeters of the balls).
+    #[must_use]
+    pub fn edge_count(&self) -> usize {
+        self.edges
+    }
+
+    /// The fraction of the frame at `b >= 2 b_min` with confidence.
+    #[must_use]
+    pub fn blurred_fraction(&self) -> f64 {
+        self.fraction
+    }
+
+    /// The largest blur of the map, held at `b_cap`, in half-diagonals.
+    #[must_use]
+    pub fn max_blur(&self) -> f64 {
+        self.b_max
+    }
+
+    /// Noise of the square-root luminance per cell.
+    pub(crate) fn noise_v(&self) -> f64 {
+        self.noise_v
+    }
+
+    /// Number of reduction levels (0 when the planes are inactive).
+    pub(crate) fn levels(&self) -> usize {
+        self.levels.len()
+    }
+
+    /// Level `i` of the reductions.
+    pub(crate) fn level(&self, i: usize) -> &MapLevel {
+        &self.levels[i.min(self.levels.len() - 1)]
+    }
+
+    /// Cells with a blur in the inclusive cell ranges `[i0, i1] x [j0, j1]` (clamped to the maps).
+    pub(crate) fn count_blurred(&self, i0: usize, i1: usize, j0: usize, j1: usize) -> u32 {
+        if self.nonzero.is_empty() || i0 > i1 || j0 > j1 || i0 >= self.w || j0 >= self.h {
+            return 0;
+        }
+        let (i1, j1) = (i1.min(self.w - 1), j1.min(self.h - 1));
+        let s = self.w + 1;
+        let t = &self.nonzero;
+        t[(j1 + 1) * s + i1 + 1] + t[j0 * s + i0] - t[j0 * s + i1 + 1] - t[(j1 + 1) * s + i0]
+    }
+
+    /// Bytes the planes hold.
+    pub(crate) fn bytes(&self) -> usize {
+        let levels: usize = self
+            .levels
+            .iter()
+            .map(|l| 4 * (l.a.len() + l.c.len() + l.s.len()))
+            .sum();
+        std::mem::size_of::<Self>()
+            + 4 * (self.b.len() + self.conf.len() + self.nonzero.len())
+            + self.subject.len()
+            + levels
+            + self.balls.len() * std::mem::size_of::<Ball>()
+    }
+}
+
+/// A picture a stage hands to the next: the caller's input, borrowed, or a new buffer over a rectangle.
+pub(crate) enum Stage<'a> {
+    /// The stage changed nothing.
+    Same(ImageRef<'a>),
+    /// The stage's result over `rect` of a `frame` pixels frame.
+    New {
+        rect: PixelRect,
+        frame: (usize, usize),
+        data: Vec<f32>,
+    },
+}
+
+impl Stage<'_> {
+    /// The picture.
+    pub(crate) fn image(&self) -> ImageRef<'_> {
+        match self {
+            Stage::Same(i) => *i,
+            Stage::New { rect, frame, data } => ImageRef {
+                width: rect.w,
+                height: rect.h,
+                x0: rect.x,
+                y0: rect.y,
+                frame_width: frame.0,
+                frame_height: frame.1,
+                data,
+            },
+        }
+    }
+}
+
+/// The error for planes built without the blur map that a plan now needs.
+fn missing_map() -> LensError {
+    LensError::Frame(
+        "the planes were built without the blur map; build them again for this lens setting (LensPlanes::serves)"
+            .into(),
+    )
+}
+
+/// The pass of a plan over a frame, or `None` when L1 leaves the picture alone.
+fn pass<'a>(
+    plan: &'a LensPlan,
+    planes: &'a LensPlanes,
+    k: usize,
+    fw: usize,
+    fh: usize,
+) -> Result<Option<tile::Pass<'a>>, LensError> {
+    if !plan.needs_blur_map() {
+        return Ok(None);
+    }
+    let Some(bp) = planes.bokeh() else {
+        return Err(missing_map());
+    };
+    Ok(tile::Pass::new(plan, bp, k, fw, fh))
+}
+
+/// Context L1 needs around a rectangle of a `fw x fh` frame at scale `k`.
+pub(crate) fn halo(plan: &LensPlan, planes: &LensPlanes, k: usize, fw: usize, fh: usize) -> usize {
+    // A plan whose planes lack the map has no halo here; `apply` reports the mismatch.
+    match pass(plan, planes, k, fw, fh) {
+        Ok(Some(p)) => p.halo(),
+        _ => 0,
+    }
+}
+
+/// L1 over `want` (L2's receptive field). `input` covers `want` grown by [`halo`].
+pub(crate) fn apply<'a>(
+    plan: &LensPlan,
+    planes: &LensPlanes,
+    k: usize,
+    input: &ImageRef<'a>,
+    want: PixelRect,
+) -> Result<Stage<'a>, LensError> {
+    let (fw, fh) = (input.frame_width, input.frame_height);
+    let Some(p) = pass(plan, planes, k, fw, fh)? else {
+        return Ok(Stage::Same(*input));
+    };
+    let data = p.run(input, want)?;
+    Ok(Stage::New {
+        rect: want,
+        frame: (fw, fh),
+        data,
+    })
+}
+
+/// L1 on its own over `want` (frame coordinates at scale `k`): the planar picture the field optics (L2) would
+/// read, `3 * want.w * want.h` samples. `input` must cover `want` grown by [`reshape_halo`], clamped to the
+/// frame. For tests and diagnostics; [`apply`](crate::apply) runs L1 as part of the lens.
+///
+/// # Errors
+///
+/// [`LensError::Frame`] for planes built without the blur map that the plan needs,
+/// [`LensError::InputTooSmall`] when the input does not cover the halo.
+pub fn reshape(
+    plan: &LensPlan,
+    planes: &LensPlanes,
+    k: usize,
+    input: &ImageRef,
+    want: PixelRect,
+) -> Result<Vec<f32>, LensError> {
+    input.validate()?;
+    if !input.rect().contains(&want) {
+        return Err(LensError::InputTooSmall {
+            needed: want.to_string(),
+            have: input.rect().to_string(),
+        });
+    }
+    let stage = apply(plan, planes, k, input, want)?;
+    let img = stage.image();
+    let plane = img.width * img.height;
+    let mut out = Vec::with_capacity(3 * want.w * want.h);
+    for c in 0..3 {
+        for y in want.y..want.y1() {
+            let row = c * plane + (y - img.y0) * img.width + (want.x - img.x0);
+            out.extend_from_slice(&img.data[row..row + want.w]);
+        }
+    }
+    Ok(out)
+}
+
+/// The context [`reshape`] needs around a rectangle at scale `k`, in pixels at that scale.
+#[must_use]
+pub fn reshape_halo(plan: &LensPlan, planes: &LensPlanes, k: usize) -> usize {
+    let f = plan.frame();
+    halo(
+        plan,
+        planes,
+        k,
+        f.width.div_ceil(k.max(1)),
+        f.height.div_ceil(k.max(1)),
+    )
+}

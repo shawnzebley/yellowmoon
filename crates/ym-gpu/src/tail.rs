@@ -59,13 +59,44 @@ use crate::device::{Gpu, GpuContext, GpuError};
 use crate::image::GpuImage;
 use crate::kernels::color::{PreparedChain, Stop, release_tables};
 use crate::kernels::encode::{C13, Encoding, band_bytes, encode_c13, row_words};
+use crate::kernels::film_stack::{FilmPictures, FilmRasters, FilmStack};
+use crate::kernels::mask_raster::{RasterJob, encode_raster_planes, grown_tile};
 use crate::kernels::output_sharpen::PreparedSharpen;
 use crate::kernels::resize::{PreparedTaps, Taps, encode_resize_h, encode_resize_v};
-use crate::kernels::sampler::encode_sample;
+use crate::kernels::sampler::encode_sample_at;
 use crate::kernels::util::STORAGE_OUT;
 use crate::queue::{CancelToken, JobSpec};
 use crate::stream::PassList;
 use crate::tiles::DESIGN_BINDING_BYTES;
+
+/// The rendered picture of one chunk of an export, handed to a test's probe (feature `tail-probe`).
+#[cfg(feature = "tail-probe")]
+#[derive(Debug, Clone)]
+pub struct ProbeBand {
+    /// The picture row the window starts at.
+    pub first_row: usize,
+    /// Width of the window in pixels.
+    pub width: usize,
+    /// Height of the window in rows.
+    pub rows: usize,
+    /// The window's planes (the picture's three and the letterbox mask), planar f32.
+    pub data: Vec<f32>,
+}
+
+#[cfg(feature = "tail-probe")]
+type PictureProbe = Arc<dyn Fn(ProbeBand) + Send + Sync>;
+
+#[cfg(feature = "tail-probe")]
+static PICTURE_PROBE: std::sync::Mutex<Option<PictureProbe>> = std::sync::Mutex::new(None);
+
+/// Sets (or clears) the probe that receives every output-sharpening or encoding window of the exports that follow, as the
+/// colour pass wrote it. Feature `tail-probe`, for tests.
+#[cfg(feature = "tail-probe")]
+pub fn set_picture_probe(probe: Option<PictureProbe>) {
+    if let Ok(mut slot) = PICTURE_PROBE.lock() {
+        *slot = probe;
+    }
+}
 
 /// The largest storage binding of one piece of the tail: the design binding (128 MiB,
 /// `docs/17-gpu.md` section 4), a constant and not the device's limit, so that the cut does not
@@ -138,6 +169,9 @@ pub struct TailSpec {
     pub space: OutputSpace,
     /// 8 or 16 bits.
     pub format: BandFormat,
+    /// The Film nodes of the chain, when it has a live one: their pictures are made on the device for each tile, from
+    /// the tile grown by their halos (`docs/24` section 3.9c). The tiles the host hands in must be grown the same.
+    pub films: Option<Arc<FilmStack>>,
 }
 
 /// The device, the queue priority and owner, and the cancel token every job of a tail carries.
@@ -389,12 +423,113 @@ struct TileData {
     region: TileSource,
     origin: (usize, usize),
     grid: SamplerGrid,
+    /// The size of the whole rendered picture: the frame the raster planes' window sums are cut to.
+    frame: (usize, usize),
     off: (usize, usize),
     w: usize,
     h: usize,
     chain: Arc<ColorChain>,
+    films: Option<Arc<FilmStack>>,
     targets: Vec<SlabTarget>,
 }
+
+/// A chain prepared for a sampled picture of `grown`, with the raster planes of the tile at `off` when the chain
+/// has raster rows (`docs/23` section 5.5): the sampler's image covers the tile grown by the planes' receptive
+/// field, the planes are made over it and cut to the tile, and the colour pass reads the tile's part of the
+/// picture. Returns the chain and where the tile starts in the sampled image.
+#[allow(clippy::too_many_arguments)] // the tile's own pieces
+fn prepare_tile(
+    ctx: &GpuContext,
+    passes: &mut PassList<'_>,
+    chain: &Arc<ColorChain>,
+    films: Option<&FilmStack>,
+    grid: &SamplerGrid,
+    frame: (usize, usize),
+    off: (usize, usize),
+    (w, h): (usize, usize),
+    sampled: &GpuImage,
+) -> Result<PreparedTile, GpuError> {
+    let grown = grown_tile(
+        &FilmStack::schedule_of(chain, grid, films),
+        frame,
+        off,
+        w,
+        h,
+    );
+    let mut prepared = PreparedChain::new(ctx, chain)?;
+    if sampled.planes == 6 {
+        prepared = prepared.with_photo_frame(grid.photo_frame());
+    }
+    // The Film nodes of the plan: their pictures over the tile, from the sampled picture (which holds what the first node
+    // reads), made before the colour pass.
+    let pictures = if prepared.live_films().is_empty() {
+        None
+    } else {
+        let Some(stack) = films else {
+            return Err(GpuError::InvalidInput(
+                "the plan runs a Film node and the tail has no Film passes for it".to_owned(),
+            ));
+        };
+        let tile = ym_color::mask_raster::Area {
+            x: off.0 as i64,
+            y: off.1 as i64,
+            w,
+            h,
+        };
+        let photo = (sampled.planes == 6).then(|| grid.photo_frame());
+        let rasters = Some(FilmRasters {
+            frame: ym_color::mask_raster::Area::whole(frame.0, frame.1),
+            key: None,
+        });
+        Some(stack.encode(ctx, passes, sampled, grown, tile, photo, rasters)?)
+    };
+    let at = (
+        (off.0 as i64 - grown.x) as usize,
+        (off.1 as i64 - grown.y) as usize,
+    );
+    let tile = ym_color::mask_raster::Area {
+        x: off.0 as i64,
+        y: off.1 as i64,
+        w,
+        h,
+    };
+    let planes = if chain.uses_rasters() {
+        // The guide of Refine edges is a stage of the chain, which wants its Film pictures too (the window is the sampled
+        // picture, whose first pixel is `grown`'s).
+        let guide_chain = match &pictures {
+            Some(p) => prepared.with_film(Arc::clone(p), (grown.x, grown.y)),
+            None => prepared.clone(),
+        };
+        Some(encode_raster_planes(
+            passes,
+            &guide_chain,
+            chain,
+            sampled,
+            &RasterJob {
+                frame: ym_color::mask_raster::Area::whole(frame.0, frame.1),
+                grown,
+                window: tile,
+                extent: tile,
+                photo: grid.photo_frame(),
+            },
+        )?)
+    } else {
+        None
+    };
+    Ok((prepared, planes, at, pictures))
+}
+
+/// The raster planes of a tile.
+type RasterPlanesOf = crate::kernels::mask_raster::RasterPlanes;
+
+/// A tile ready to be coloured: the prepared chain, its raster planes (`None` for a chain with no raster row), where the
+/// tile starts in the sampled image, and the pictures of its Film nodes (`None` for a chain with none).
+type PreparedTile = (
+    PreparedChain,
+    Option<RasterPlanesOf>,
+    (usize, usize),
+    Option<Arc<FilmPictures>>,
+);
 
 /// Uploads a tile's camera RGB, samples it, colours it to C12 and writes it into its slabs.
 fn tile_job(ctx: &GpuContext, token: &CancelToken, d: &TileData) -> Result<(), GpuError> {
@@ -408,13 +543,53 @@ fn tile_job(ctx: &GpuContext, token: &CancelToken, d: &TileData) -> Result<(), G
         }
         TileSource::Device(image) => image,
     };
-    let sampled = encode_sample(&mut passes, src, d.origin, &d.grid, d.off, d.w, d.h)?;
-    let prepared = PreparedChain::new(ctx, &d.chain)?;
+    // The mask shapes and the raster masks of the nodes read the pixels' places in the photo: the sampler writes
+    // them, over the tile grown by the raster planes' receptive field.
+    let positions = d.chain.uses_photo_position();
+    let grown = grown_tile(
+        &FilmStack::schedule_of(&d.chain, &d.grid, d.films.as_deref()),
+        d.frame,
+        d.off,
+        d.w,
+        d.h,
+    );
+    let sampled = encode_sample_at(
+        &mut passes,
+        src,
+        d.origin,
+        &d.grid,
+        (grown.x as usize, grown.y as usize),
+        grown.w,
+        grown.h,
+        positions,
+    )?;
+    let (prepared, planes, at, pictures) = prepare_tile(
+        ctx,
+        &mut passes,
+        &d.chain,
+        d.films.as_deref(),
+        &d.grid,
+        d.frame,
+        d.off,
+        (d.w, d.h),
+        &sampled,
+    )?;
     for t in &d.targets {
-        prepared.encode_stage(
+        let mut chain = match &planes {
+            Some(p) => prepared.with_rasters(p.rows(t.tile_row0, t.rows)),
+            None => prepared.clone(),
+        };
+        if let Some(p) = &pictures {
+            // The slab's rows start `tile_row0` rows into the tile.
+            chain = chain.with_film(
+                Arc::clone(p),
+                (d.off.0 as i64, (d.off.1 + t.tile_row0) as i64),
+            );
+        }
+        chain.encode_stage(
             &mut passes,
             &sampled,
-            Rect::new(0, t.tile_row0, d.w, t.rows),
+            Rect::new(at.0, at.1 + t.tile_row0, d.w, t.rows),
             Stop::C12,
             &t.image,
             (t.dst_x, t.dst_y),
@@ -544,8 +719,23 @@ fn band_job(ctx: &GpuContext, token: &CancelToken, d: &BandData2) -> Result<Vec<
         encode_c13(&mut passes, &win, rect, encoding, c13, &dst, 0, 0)?;
     }
     let read = passes.read(&dst, 0, bytes)?;
+    #[cfg(feature = "tail-probe")]
+    let probe = PICTURE_PROBE
+        .lock()
+        .ok()
+        .and_then(|slot| slot.clone())
+        .map(|p| (p, win.encode_read(&mut passes)));
     token.check()?;
     let mut done = passes.submit()?.finish()?;
+    #[cfg(feature = "tail-probe")]
+    if let Some((probe, Ok(window))) = probe {
+        probe(ProbeBand {
+            first_row: d.window.start,
+            width: win.width,
+            rows: win.height,
+            data: win.take(&done, window)?,
+        });
+    }
     Ok(done.take(read))
 }
 
@@ -824,10 +1014,12 @@ impl<'a> ExportTail<'a> {
             region,
             origin,
             grid: self.spec.grid,
+            frame: self.spec.rendered,
             off,
             w,
             h,
             chain: Arc::clone(&self.spec.chain),
+            films: self.spec.films.clone(),
             targets,
         };
         self.run(data, tile_job)
@@ -986,10 +1178,13 @@ struct HostTileData {
     region: TileSource,
     origin: (usize, usize),
     grid: SamplerGrid,
+    /// The size of the whole output: the frame the raster planes' window sums are cut to.
+    frame: (usize, usize),
     off: (usize, usize),
     w: usize,
     h: usize,
     chain: Arc<ColorChain>,
+    films: Option<Arc<FilmStack>>,
     stop: Stop,
 }
 
@@ -1008,8 +1203,45 @@ fn host_tile_job(
         }
         TileSource::Device(image) => image,
     };
-    let sampled = encode_sample(&mut passes, src, d.origin, &d.grid, d.off, d.w, d.h)?;
-    let prepared = PreparedChain::new(ctx, &d.chain)?;
+    // The mask shapes and the raster masks of the nodes read the pixels' places in the photo: the sampler writes
+    // them, over the tile grown by the raster planes' receptive field.
+    let positions = d.chain.uses_photo_position();
+    let grown = grown_tile(
+        &FilmStack::schedule_of(&d.chain, &d.grid, d.films.as_deref()),
+        d.frame,
+        d.off,
+        d.w,
+        d.h,
+    );
+    let sampled = encode_sample_at(
+        &mut passes,
+        src,
+        d.origin,
+        &d.grid,
+        (grown.x as usize, grown.y as usize),
+        grown.w,
+        grown.h,
+        positions,
+    )?;
+    let (prepared, planes, at, pictures) = prepare_tile(
+        ctx,
+        &mut passes,
+        &d.chain,
+        d.films.as_deref(),
+        &d.grid,
+        d.frame,
+        d.off,
+        (d.w, d.h),
+        &sampled,
+    )?;
+    let prepared = match planes {
+        Some(p) => prepared.with_rasters(p),
+        None => prepared,
+    };
+    let prepared = match pictures {
+        Some(p) => prepared.with_film(p, (d.off.0 as i64, d.off.1 as i64)),
+        None => prepared,
+    };
     let out = GpuImage::alloc(
         ctx,
         "tail host tile",
@@ -1021,7 +1253,7 @@ fn host_tile_job(
     prepared.encode_stage(
         &mut passes,
         &sampled,
-        Rect::new(0, 0, d.w, d.h),
+        Rect::new(at.0, at.1, d.w, d.h),
         d.stop,
         &out,
         (0, 0),
@@ -1058,10 +1290,12 @@ pub fn colour_tile_to_host(
     region: Arc<RgbImage>,
     origin: (usize, usize),
     grid: SamplerGrid,
+    frame: (usize, usize),
     off: (usize, usize),
     w: usize,
     h: usize,
     chain: Arc<ColorChain>,
+    films: Option<Arc<FilmStack>>,
     stop: Stop,
 ) -> Result<Vec<f32>, GpuError> {
     route.run(
@@ -1069,10 +1303,12 @@ pub fn colour_tile_to_host(
             region: TileSource::Host(region),
             origin,
             grid,
+            frame,
             off,
             w,
             h,
             chain,
+            films,
             stop,
         },
         host_tile_job,
@@ -1092,10 +1328,12 @@ pub fn colour_device_tile_to_host(
     region: Arc<GpuImage>,
     origin: (usize, usize),
     grid: SamplerGrid,
+    frame: (usize, usize),
     off: (usize, usize),
     w: usize,
     h: usize,
     chain: Arc<ColorChain>,
+    films: Option<Arc<FilmStack>>,
     stop: Stop,
 ) -> Result<Vec<f32>, GpuError> {
     if region.planes != 3 {
@@ -1109,10 +1347,12 @@ pub fn colour_device_tile_to_host(
             region: TileSource::Device(region),
             origin,
             grid,
+            frame,
             off,
             w,
             h,
             chain,
+            films,
             stop,
         },
         host_tile_job,
