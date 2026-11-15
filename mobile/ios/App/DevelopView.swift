@@ -67,7 +67,7 @@ struct DevelopView: View {
             }
             .fileImporter(
                 isPresented: $picking,
-                allowedContentTypes: [UTType(filenameExtension: "arw") ?? .rawImage]
+                allowedContentTypes: [UTType(filenameExtension: "arw"), .rawImage].compactMap { $0 }
             ) { result in
                 switch result {
                 case .success(let url): open(url)

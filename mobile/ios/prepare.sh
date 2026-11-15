@@ -25,5 +25,7 @@ mkdir -p "$here/.build/$sdk" "$here/.build/Resources"
 cp "$repo/target/$target/release/libym_mobile.a" "$here/.build/$sdk/"
 rsync -a --delete "$repo/data/" "$here/.build/Resources/data/"
 cp LICENSE NOTICE "$here/.build/Resources/"
+cargo fetch --locked
+python3 "$here/licences.py" "$target" "$here/.build/Resources/THIRD-PARTY.md"
 cd "$here"
 xcodegen generate

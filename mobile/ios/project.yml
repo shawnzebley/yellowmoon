@@ -13,8 +13,13 @@ targets:
       - App
       - path: .build/Resources/data
         type: folder
+        buildPhase: resources
       - path: .build/Resources/LICENSE
+        buildPhase: resources
       - path: .build/Resources/NOTICE
+        buildPhase: resources
+      - path: .build/Resources/THIRD-PARTY.md
+        buildPhase: resources
     settings:
       base:
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon

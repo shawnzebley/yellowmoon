@@ -15,7 +15,8 @@ non-Sony RAW formats are outside this preview.
 ## Build and run
 
 Use a Mac with Xcode and an installed iOS simulator, Rustup (the repository
-pins Rust), Homebrew, and XcodeGen (`brew install xcodegen`).
+pins Rust), Homebrew, XcodeGen (`brew install xcodegen`), Python 3, and
+`cargo-about` 0.9.2 (`cargo install --locked cargo-about --version 0.9.2`).
 
 From the repository root:
 

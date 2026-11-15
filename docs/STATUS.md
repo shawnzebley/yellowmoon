@@ -13,8 +13,9 @@ The current state of Yellowmoon: release, milestone, what is built, gate results
 ## iPhone preview (Windows fork)
 
 Added a native iOS 17 preview for on-device Sony RAW develop, look and exposure
-adjustments, and JPEG sharing. The simulator CI compiles the Rust bridge and
-SwiftUI app. Physical iPhone import, export, memory and speed are release
+adjustments, and JPEG sharing. The Rust synthetic RAW test passed on Linux,
+and the bridge passed Rust type checking for the arm64 iOS simulator. The
+GitHub simulator workflow checks the SwiftUI build and launch. Physical iPhone import, export, memory and speed are release
 checks still to be run. [Build guide](../mobile/ios/README.md).
 
 ## Windows fork upstream sync (2026-11-15)
